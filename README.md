@@ -19,7 +19,7 @@ Helium, Chromium, Google Chrome, Brave, and Microsoft Edge are auto-detected. He
 
 ## Install
 
-The npm package is `@mirsella/opencode-browser-mcp`. Its first release is pending. After publication, add it to `opencode.json`:
+Add the npm package to `opencode.json`:
 
 ```json
 {
