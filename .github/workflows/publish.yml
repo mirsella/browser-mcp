@@ -1,0 +1,62 @@
+name: publish
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Run npm publish in dry-run mode
+        required: true
+        default: true
+        type: boolean
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+          targets: x86_64-unknown-linux-musl
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - run: cargo fmt --check
+      - run: cargo test --all-targets
+      - run: cargo clippy --all-targets -- -D warnings
+
+      - id: package
+        run: |
+          echo "name=$(node -p 'require(\"./package.json\").name')" >> "$GITHUB_OUTPUT"
+          echo "version=$(node -p 'require(\"./package.json\").version')" >> "$GITHUB_OUTPUT"
+
+      - if: github.event_name == 'release' && github.event.release.tag_name != format('v{0}', steps.package.outputs.version)
+        run: |
+          echo "::error::Release tag ${{ github.event.release.tag_name }} does not match package version v${{ steps.package.outputs.version }}"
+          exit 1
+
+      - id: published
+        run: |
+          package="${{ steps.package.outputs.name }}@${{ steps.package.outputs.version }}"
+          if npm view "$package" version >/dev/null 2>&1; then
+            echo "Package $package is already published; skipping npm publish."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: github.event_name == 'workflow_dispatch' && inputs.dry_run
+        run: npm pack --dry-run
+
+      - if: (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run)) && steps.published.outputs.exists != 'true'
+        run: npm publish --access public
