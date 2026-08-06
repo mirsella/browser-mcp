@@ -6,7 +6,10 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -22,12 +25,17 @@ use rmcp::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, copy},
     net::{UnixListener, UnixStream},
+    sync::Notify,
     task::JoinSet,
     time::{Instant, interval, sleep, sleep_until, timeout},
 };
 use tracing::{error, info, warn};
+use uuid::Uuid;
 
-use super::{BrowserProxy, Config, persistence::OwnershipPersistence, validate_config};
+use super::{
+    BrowserProxy, Config, MAX_SESSION_ID_BYTES, RoutingMode, SESSION_KEY,
+    persistence::OwnershipPersistence, validate_config,
+};
 
 const SOCKET_NAME: &str = "daemon.sock";
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -35,21 +43,27 @@ const LAST_CLIENT_GRACE: Duration = Duration::from_secs(2);
 const DAEMON_TRANSITION_TIMEOUT: Duration = Duration::from_secs(360);
 const START_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-const HANDSHAKE_MAGIC: &[u8] = b"opencode-browser-mcp\0v1\n";
+const HANDSHAKE_MAGIC: &[u8] = b"opencode-browser-mcp\0v2\n";
 const MAX_IDENTITY_BYTES: usize = 8 * 1024;
 const STOP_HANDSHAKE: u32 = u32::MAX;
+const RELEASE_HANDSHAKE: u32 = u32::MAX - 1;
+const OPENCODE_PREFIX: &str = "opencode:";
+const MAX_OPENCODE_SESSION_ID_BYTES: usize = MAX_SESSION_ID_BYTES - OPENCODE_PREFIX.len();
 
 pub(super) async fn run(config: Arc<Config>) -> Result<()> {
     let paths = RuntimePaths::new(config.socket.as_deref())?;
     if config.stop_daemon {
         return stop_daemon(&paths).await;
     }
+    if let Some(session_id) = config.release_session.as_deref() {
+        return release_session(&paths, session_id).await;
+    }
     let identity = Arc::<[u8]>::from(config.daemon_identity()?);
     if config.daemon {
         validate_config(&config)?;
         return run_daemon(config, paths, identity).await;
     }
-    bridge(paths, identity).await
+    bridge(paths, identity, config.routing).await
 }
 
 struct RuntimePaths {
@@ -117,12 +131,12 @@ fn validate_private_directory(directory: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn bridge(paths: RuntimePaths, identity: Arc<[u8]>) -> Result<()> {
+async fn bridge(paths: RuntimePaths, identity: Arc<[u8]>, routing: RoutingMode) -> Result<()> {
     let mut stream = match connect_or_absent(&paths.socket).await? {
         Some(stream) => stream,
         None => start_daemon_and_connect(&paths).await?,
     };
-    client_handshake(&mut stream, &identity).await?;
+    client_handshake(&mut stream, &identity, routing).await?;
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let (mut socket_read, mut socket_write) = stream.into_split();
@@ -271,7 +285,7 @@ async fn run_daemon(config: Arc<Config>, paths: RuntimePaths, identity: Arc<[u8]
                 }
             },
             _ = sleep_until(idle_deadline.unwrap_or_else(Instant::now)), if idle_deadline.is_some() => {
-                info!(grace = ?LAST_CLIENT_GRACE, "no OpenCode clients remain; stopping browser daemon");
+                info!(grace = ?LAST_CLIENT_GRACE, "no MCP clients remain; stopping browser daemon");
                 break;
             }
         }
@@ -293,19 +307,34 @@ async fn run_daemon(config: Arc<Config>, paths: RuntimePaths, identity: Arc<[u8]
 }
 
 fn profile_lease(profile: &Path) -> Result<File> {
+    let existed = profile.exists();
     fs::create_dir_all(profile)
         .with_context(|| format!("failed to create profile directory {}", profile.display()))?;
+    if !existed {
+        fs::set_permissions(profile, fs::Permissions::from_mode(0o700)).with_context(|| {
+            format!("failed to restrict profile directory {}", profile.display())
+        })?;
+    }
     validate_private_directory(profile)?;
     let path = profile.join("opencode-browser-session.lock");
     exclusive_lease(&path, "browser profile")
 }
 
 fn exclusive_lease(path: &Path, purpose: &str) -> Result<File> {
+    try_exclusive_lease(path)?
+        .ok_or_else(|| anyhow!("another daemon owns {purpose} {}", path.display()))
+}
+
+fn try_exclusive_lease(path: &Path) -> Result<Option<File>> {
     let lock = open_private_file(path, PrivateFileOpen::Lock)?
         .expect("lock creation must return an open file");
-    lock.try_lock()
-        .with_context(|| format!("another daemon owns {purpose} {}", path.display()))?;
-    Ok(lock)
+    match lock.try_lock() {
+        Ok(()) => Ok(Some(lock)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => {
+            Err(error).with_context(|| format!("failed to lock {}", path.display()))
+        }
+    }
 }
 
 fn validate_owned_regular_file(path: &Path, metadata: &fs::Metadata) -> Result<()> {
@@ -480,6 +509,77 @@ fn peer_workspace(pid: libc::pid_t) -> Result<PathBuf> {
 struct Connection {
     proxy: BrowserProxy,
     workspace: PathBuf,
+    routing: ConnectionRouting,
+    lifecycle: Option<Arc<ConnectionLifecycle>>,
+}
+
+#[derive(Default)]
+struct ConnectionLifecycle {
+    closed: AtomicBool,
+    active: AtomicUsize,
+    idle: Notify,
+}
+
+impl ConnectionLifecycle {
+    fn enter(self: &Arc<Self>) -> Option<ConnectionLease> {
+        if self.closed.load(Ordering::SeqCst) {
+            return None;
+        }
+        self.active.fetch_add(1, Ordering::SeqCst);
+        if self.closed.load(Ordering::SeqCst) {
+            self.leave();
+            return None;
+        }
+        Some(ConnectionLease(self.clone()))
+    }
+
+    async fn close_and_wait(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        while self.active.load(Ordering::SeqCst) != 0 {
+            self.idle.notified().await;
+        }
+    }
+
+    fn leave(&self) {
+        if self.active.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.idle.notify_one();
+        }
+    }
+}
+
+struct ConnectionLease(Arc<ConnectionLifecycle>);
+
+impl Drop for ConnectionLease {
+    fn drop(&mut self) {
+        self.0.leave();
+    }
+}
+
+#[derive(Clone)]
+enum ConnectionRouting {
+    Connection(String),
+    Opencode,
+}
+
+impl ConnectionRouting {
+    fn route(&self, mut request: CallToolRequestParams) -> Result<(String, CallToolRequestParams)> {
+        let arguments = request.arguments.get_or_insert_default();
+        let id = match self {
+            Self::Connection(id) => {
+                if arguments.remove(SESSION_KEY).is_some() {
+                    bail!("generic MCP clients cannot set the reserved OpenCode routing field");
+                }
+                id.clone()
+            }
+            Self::Opencode => arguments
+                .remove(SESSION_KEY)
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .filter(|id| !id.is_empty() && id.len() <= MAX_OPENCODE_SESSION_ID_BYTES)
+                .ok_or_else(|| anyhow!("browser call is missing the OpenCode session identifier"))
+                .map(|id| format!("{OPENCODE_PREFIX}{id}"))?,
+        };
+        Ok((id, request))
+    }
 }
 
 impl ServerHandler for Connection {
@@ -487,7 +587,7 @@ impl ServerHandler for Connection {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::from_build_env())
             .with_instructions(
-                "Controls a Chromium-based browser with pages isolated by OpenCode session."
+                "Controls a shared Chromium-family browser with connection-isolated pages."
                     .to_owned(),
             )
     }
@@ -506,7 +606,24 @@ impl ServerHandler for Connection {
         request: CallToolRequestParams,
         _: RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResponse, rmcp::ErrorData> {
-        match self.proxy.route_call(&self.workspace, request).await {
+        let _lease = match &self.lifecycle {
+            Some(lifecycle) => match lifecycle.enter() {
+                Some(lease) => Some(lease),
+                None => {
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(
+                        "browser connection is closed",
+                    )])
+                    .into());
+                }
+            },
+            None => None,
+        };
+        let routed = self.routing.route(request);
+        let result = match routed {
+            Ok((id, request)) => self.proxy.route_call(&self.workspace, &id, request).await,
+            Err(error) => Err(error),
+        };
+        match result {
             Ok(result) => Ok(result.into()),
             Err(error) => {
                 error!(%error, workspace = %self.workspace.display(), "browser tool call failed");
@@ -523,21 +640,62 @@ async fn serve_connection(
 ) -> Result<bool> {
     let mut stream = stream;
     let pid = peer_pid(&stream)?;
-    if !server_handshake(&mut stream, &identity).await? {
-        return Ok(true);
-    }
+    let routing = match server_handshake(&mut stream, &identity).await? {
+        HandshakeRequest::Identity(_, RoutingMode::Connection) => {
+            ConnectionRouting::Connection(format!("connection:{}", Uuid::new_v4()))
+        }
+        HandshakeRequest::Identity(_, RoutingMode::Opencode) => ConnectionRouting::Opencode,
+        HandshakeRequest::Stop => return Ok(true),
+        HandshakeRequest::Release(session_id) => {
+            let result = proxy
+                .release_session(&format!("{OPENCODE_PREFIX}{session_id}"))
+                .await;
+            stream.write_u8(u8::from(result.is_ok())).await?;
+            stream.flush().await?;
+            result?;
+            return Ok(false);
+        }
+    };
     let workspace = peer_workspace(pid)?;
-    let service = Connection { proxy, workspace }
-        .serve(stream)
-        .await
-        .context("failed to initialize MCP connection")?;
-    service.waiting().await.context("MCP connection failed")?;
+    let lifecycle = match &routing {
+        ConnectionRouting::Connection(_) => Some(Arc::new(ConnectionLifecycle::default())),
+        ConnectionRouting::Opencode => None,
+    };
+    let release = match &routing {
+        ConnectionRouting::Connection(id) => Some(id.clone()),
+        ConnectionRouting::Opencode => None,
+    };
+    let service = Connection {
+        proxy: proxy.clone(),
+        workspace,
+        routing,
+        lifecycle: lifecycle.clone(),
+    }
+    .serve(stream)
+    .await
+    .context("failed to initialize MCP connection")?;
+    let result = service.waiting().await.context("MCP connection failed");
+    if let (Some(id), Some(lifecycle)) = (release, lifecycle) {
+        lifecycle.close_and_wait().await;
+        if let Err(error) = proxy.release_session(&id).await {
+            warn!(%error, session_id = %id, "failed to release disconnected MCP client tabs");
+        }
+    }
+    result?;
     Ok(false)
 }
 
-async fn client_handshake(stream: &mut UnixStream, identity: &[u8]) -> Result<()> {
+async fn client_handshake(
+    stream: &mut UnixStream,
+    identity: &[u8],
+    routing: RoutingMode,
+) -> Result<()> {
     timeout(HANDSHAKE_TIMEOUT, async {
-        write_handshake(stream, &HandshakeRequest::Identity(identity.to_vec())).await?;
+        write_handshake(
+            stream,
+            &HandshakeRequest::Identity(identity.to_vec(), routing),
+        )
+        .await?;
         match stream.read_u8().await? {
             1 => Ok(()),
             _ => bail!("existing browser daemon uses incompatible configuration"),
@@ -547,41 +705,62 @@ async fn client_handshake(stream: &mut UnixStream, identity: &[u8]) -> Result<()
     .context("timed out negotiating with browser daemon")?
 }
 
-async fn server_handshake(stream: &mut UnixStream, expected: &[u8]) -> Result<bool> {
+async fn server_handshake(stream: &mut UnixStream, expected: &[u8]) -> Result<HandshakeRequest> {
     timeout(HANDSHAKE_TIMEOUT, async {
-        let HandshakeRequest::Identity(identity) = read_handshake(stream).await? else {
-            stream.write_u8(1).await?;
-            stream.flush().await?;
-            return Ok(false);
-        };
-        let matches = identity == expected;
-        stream.write_u8(u8::from(matches)).await?;
-        stream.flush().await?;
-        if !matches {
-            bail!("client browser configuration does not match the running daemon");
+        let request = read_handshake(stream).await?;
+        match &request {
+            HandshakeRequest::Identity(identity, _) => {
+                let matches = identity == expected;
+                stream.write_u8(u8::from(matches)).await?;
+                stream.flush().await?;
+                if !matches {
+                    bail!("client browser configuration does not match the running daemon");
+                }
+            }
+            HandshakeRequest::Stop => {
+                stream.write_u8(1).await?;
+                stream.flush().await?;
+            }
+            HandshakeRequest::Release(_) => {}
         }
-        Ok(true)
+        Ok(request)
     })
     .await
     .context("timed out negotiating browser daemon connection")?
 }
 
 enum HandshakeRequest {
-    Identity(Vec<u8>),
+    Identity(Vec<u8>, RoutingMode),
     Stop,
+    Release(String),
 }
 
 async fn write_handshake(stream: &mut UnixStream, request: &HandshakeRequest) -> Result<()> {
     stream.write_all(HANDSHAKE_MAGIC).await?;
     match request {
-        HandshakeRequest::Identity(identity) => {
+        HandshakeRequest::Identity(identity, routing) => {
             if identity.len() > MAX_IDENTITY_BYTES {
                 bail!("browser daemon configuration identity is too large");
             }
             stream.write_u32(identity.len() as u32).await?;
             stream.write_all(identity).await?;
+            stream
+                .write_u8(match routing {
+                    RoutingMode::Connection => 0,
+                    RoutingMode::Opencode => 1,
+                })
+                .await?;
         }
         HandshakeRequest::Stop => stream.write_u32(STOP_HANDSHAKE).await?,
+        HandshakeRequest::Release(session_id) => {
+            let bytes = session_id.as_bytes();
+            if bytes.is_empty() || bytes.len() > MAX_OPENCODE_SESSION_ID_BYTES {
+                bail!("invalid browser session identifier");
+            }
+            stream.write_u32(RELEASE_HANDSHAKE).await?;
+            stream.write_u32(bytes.len() as u32).await?;
+            stream.write_all(bytes).await?;
+        }
     }
     stream.flush().await?;
     Ok(())
@@ -597,13 +776,29 @@ async fn read_handshake(stream: &mut UnixStream) -> Result<HandshakeRequest> {
     if length == STOP_HANDSHAKE {
         return Ok(HandshakeRequest::Stop);
     }
+    if length == RELEASE_HANDSHAKE {
+        let length = stream.read_u32().await? as usize;
+        if length == 0 || length > MAX_OPENCODE_SESSION_ID_BYTES {
+            bail!("invalid browser session identifier length");
+        }
+        let mut session_id = vec![0; length];
+        stream.read_exact(&mut session_id).await?;
+        return Ok(HandshakeRequest::Release(
+            String::from_utf8(session_id).context("browser session identifier is not UTF-8")?,
+        ));
+    }
     let length = length as usize;
     if length > MAX_IDENTITY_BYTES {
         bail!("browser daemon configuration identity is too large");
     }
     let mut identity = vec![0; length];
     stream.read_exact(&mut identity).await?;
-    Ok(HandshakeRequest::Identity(identity))
+    let routing = match stream.read_u8().await? {
+        0 => RoutingMode::Connection,
+        1 => RoutingMode::Opencode,
+        _ => bail!("invalid browser routing mode"),
+    };
+    Ok(HandshakeRequest::Identity(identity, routing))
 }
 
 async fn shutdown_signal() {
@@ -620,26 +815,8 @@ async fn shutdown_signal() {
 
 async fn stop_daemon(paths: &RuntimePaths) -> Result<()> {
     let deadline = Instant::now() + DAEMON_TRANSITION_TIMEOUT;
-    loop {
-        if let Some(mut stream) = connect_or_absent(&paths.socket).await? {
-            let credentials = stream
-                .peer_cred()
-                .context("failed to read browser daemon credentials")?;
-            if credentials.uid() != unsafe { libc::geteuid() } {
-                bail!("refusing to stop daemon owned by another user");
-            }
-            stop_handshake(&mut stream).await?;
-            break;
-        }
-        if lease_is_available(&paths.lock)? {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            bail!(
-                "browser daemon did not become controllable within {DAEMON_TRANSITION_TIMEOUT:?}"
-            );
-        }
-        sleep(Duration::from_millis(50)).await;
+    if !send_control(paths, &HandshakeRequest::Stop, "stop").await? {
+        return Ok(());
     }
     while !lease_is_available(&paths.lock)? {
         if Instant::now() >= deadline {
@@ -650,14 +827,193 @@ async fn stop_daemon(paths: &RuntimePaths) -> Result<()> {
     Ok(())
 }
 
-async fn stop_handshake(stream: &mut UnixStream) -> Result<()> {
-    timeout(HANDSHAKE_TIMEOUT, async {
-        write_handshake(stream, &HandshakeRequest::Stop).await?;
-        if stream.read_u8().await? != 1 {
-            bail!("browser daemon rejected stop control connection");
+async fn release_session(paths: &RuntimePaths, session_id: &str) -> Result<()> {
+    if session_id.is_empty() || session_id.len() > MAX_OPENCODE_SESSION_ID_BYTES {
+        bail!("invalid browser session identifier");
+    }
+    let request = HandshakeRequest::Release(session_id.to_owned());
+    let lease = loop {
+        if send_control(paths, &request, "release session").await? {
+            return Ok(());
         }
-        Ok(())
-    })
-    .await
-    .context("timed out negotiating browser daemon stop")?
+        match try_exclusive_lease(&paths.lock)? {
+            Some(lease) => break lease,
+            None => continue,
+        }
+    };
+    if connect_or_absent(&paths.socket).await?.is_some() {
+        drop(lease);
+        if send_control(paths, &request, "release session").await? {
+            return Ok(());
+        }
+        bail!("browser daemon disappeared while releasing the session");
+    }
+    if paths.state.exists()
+        && OwnershipPersistence::open(paths.state.clone())?
+            .request_cleanup(&format!("{OPENCODE_PREFIX}{session_id}"))?
+    {
+        return Ok(());
+    }
+    bail!("browser daemon is not running and no persisted session could be released")
+}
+
+async fn send_control(
+    paths: &RuntimePaths,
+    request: &HandshakeRequest,
+    action: &str,
+) -> Result<bool> {
+    let deadline = Instant::now() + DAEMON_TRANSITION_TIMEOUT;
+    loop {
+        if let Some(mut stream) = connect_or_absent(&paths.socket).await? {
+            let credentials = stream
+                .peer_cred()
+                .context("failed to read browser daemon credentials")?;
+            if credentials.uid() != unsafe { libc::geteuid() } {
+                bail!("refusing to control daemon owned by another user");
+            }
+            timeout(DAEMON_TRANSITION_TIMEOUT, async {
+                write_handshake(&mut stream, request).await?;
+                if stream.read_u8().await? != 1 {
+                    bail!("browser daemon rejected {action} control request");
+                }
+                Ok(())
+            })
+            .await
+            .with_context(|| format!("timed out waiting for browser daemon to {action}"))??;
+            return Ok(true);
+        }
+        if lease_is_available(&paths.lock)? {
+            return Ok(false);
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "browser daemon did not become controllable within {DAEMON_TRANSITION_TIMEOUT:?}"
+            );
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn runtime_paths(name: &str) -> RuntimePaths {
+        let directory = std::env::temp_dir().join(format!(
+            "opencode-browser-daemon-{}-{name}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        RuntimePaths::from_socket(directory.join("daemon.sock"))
+    }
+
+    #[test]
+    fn generic_connections_use_their_connection_session() {
+        let routing = ConnectionRouting::Connection("connection-a".into());
+        let (id, request) = routing
+            .route(CallToolRequestParams::new("list_pages"))
+            .expect("route generic request");
+        assert_eq!(id, "connection-a");
+        assert!(
+            request
+                .arguments
+                .is_none_or(|arguments| !arguments.contains_key(SESSION_KEY))
+        );
+    }
+
+    #[test]
+    fn generic_connections_reject_opencode_routing_data() {
+        let routing = ConnectionRouting::Connection("connection-a".into());
+        let request = CallToolRequestParams::new("list_pages").with_arguments(
+            json!({(SESSION_KEY): "forged"})
+                .as_object()
+                .expect("request arguments")
+                .clone(),
+        );
+        assert!(routing.route(request).is_err());
+    }
+
+    #[test]
+    fn opencode_connections_require_and_remove_the_session_id() {
+        let request = CallToolRequestParams::new("list_pages").with_arguments(
+            json!({(SESSION_KEY): "session-a"})
+                .as_object()
+                .expect("request arguments")
+                .clone(),
+        );
+        let (id, request) = ConnectionRouting::Opencode
+            .route(request)
+            .expect("route OpenCode request");
+        assert_eq!(id, "opencode:session-a");
+        assert!(
+            request
+                .arguments
+                .is_some_and(|arguments| !arguments.contains_key(SESSION_KEY))
+        );
+        assert!(
+            ConnectionRouting::Opencode
+                .route(CallToolRequestParams::new("list_pages"))
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn closing_a_connection_waits_for_active_calls_and_rejects_new_ones() {
+        let lifecycle = Arc::new(ConnectionLifecycle::default());
+        let lease = lifecycle.enter().expect("enter open connection");
+        let closing = tokio::spawn({
+            let lifecycle = lifecycle.clone();
+            async move { lifecycle.close_and_wait().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(lifecycle.enter().is_none());
+        assert!(!closing.is_finished());
+        drop(lease);
+        timeout(Duration::from_secs(1), closing)
+            .await
+            .expect("connection close timed out")
+            .expect("connection close task failed");
+    }
+
+    #[tokio::test]
+    async fn offline_releases_merge_cleanup_intent() {
+        let paths = runtime_paths("offline-release");
+        let persistence = OwnershipPersistence::open(paths.state.clone()).unwrap();
+        persistence.activate_generation("generation").unwrap();
+        for id in ["opencode:session-a", "opencode:session-b"] {
+            persistence
+                .update_session(
+                    id,
+                    super::super::persistence::PersistedSession {
+                        workspace: PathBuf::from("/workspace"),
+                        current_tab: None,
+                        last_activity_unix_seconds: 1,
+                        cleanup_pending: false,
+                    },
+                )
+                .unwrap();
+        }
+        drop(persistence);
+
+        let (first, second) = tokio::join!(
+            release_session(&paths, "session-a"),
+            release_session(&paths, "session-b")
+        );
+        first.unwrap();
+        second.unwrap();
+        let restored = OwnershipPersistence::open(paths.state.clone())
+            .unwrap()
+            .activate_generation("generation")
+            .unwrap();
+        assert!(
+            restored
+                .sessions
+                .values()
+                .all(|session| session.cleanup_pending)
+        );
+        fs::remove_dir_all(paths.socket.parent().unwrap()).unwrap();
+    }
 }

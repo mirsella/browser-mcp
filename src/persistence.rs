@@ -151,10 +151,27 @@ impl OwnershipPersistence {
         })
     }
 
-    pub fn update_session(&self, id: &str, session: PersistedSession) -> Result<()> {
+    pub fn update_session(&self, id: &str, mut session: PersistedSession) -> Result<()> {
         self.commit(|state| {
+            if state
+                .sessions
+                .get(id)
+                .is_some_and(|current| current.cleanup_pending)
+            {
+                session.cleanup_pending = true;
+            }
             state.sessions.insert(id.to_owned(), session);
             Ok(())
+        })
+    }
+
+    pub fn request_cleanup(&self, id: &str) -> Result<bool> {
+        self.commit(|state| {
+            let Some(session) = state.sessions.get_mut(id) else {
+                return Ok(false);
+            };
+            session.cleanup_pending = true;
+            Ok(true)
         })
     }
 
@@ -333,6 +350,38 @@ mod tests {
             .activate_generation("generation")
             .unwrap();
         assert_eq!(restored.owners, current);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn cleanup_requests_are_durable_and_monotonic() {
+        let path = state_path("cleanup");
+        let store = OwnershipPersistence::open(path.clone()).unwrap();
+        store.activate_generation("generation").unwrap();
+        let session = PersistedSession {
+            workspace: PathBuf::from("/workspace"),
+            current_tab: Some("tab-a".into()),
+            last_activity_unix_seconds: 1,
+            cleanup_pending: false,
+        };
+        store.update_session("session-a", session.clone()).unwrap();
+        assert!(store.request_cleanup("session-a").unwrap());
+        assert!(!store.request_cleanup("missing").unwrap());
+        store.update_session("session-a", session).unwrap();
+        store
+            .replace_owners(
+                "generation",
+                1,
+                HashMap::from([("tab-a".into(), "session-a".into())]),
+            )
+            .unwrap();
+        drop(store);
+
+        let restored = OwnershipPersistence::open(path.clone())
+            .unwrap()
+            .activate_generation("generation")
+            .unwrap();
+        assert!(restored.sessions["session-a"].cleanup_pending);
         let _ = fs::remove_file(path);
     }
 }

@@ -1,7 +1,7 @@
 {
   "name": "@mirsella/opencode-browser-mcp",
-  "version": "0.1.0",
-  "description": "Session-isolated browser automation for OpenCode using Chrome DevTools and a shared Chromium profile",
+  "version": "0.2.0",
+  "description": "Session-isolated browser automation over MCP and Chrome DevTools Protocol",
   "type": "module",
   "exports": {
     ".": "./plugin/browser-routing.ts",
@@ -16,18 +16,23 @@
     "skills/",
     "vendor/",
     "README.md",
+    "SECURITY.md",
+    "CONTRIBUTING.md",
     "LICENSE"
   ],
   "scripts": {
     "build:native": "cargo build --release --target x86_64-unknown-linux-musl",
     "stage:native": "node scripts/stage-native.mjs",
     "prepack": "cargo build --release --target x86_64-unknown-linux-musl && node scripts/stage-native.mjs",
-    "test": "cargo test --all-targets"
+    "test": "cargo test --all-targets && bun test tests/plugin.test.ts"
   },
   "keywords": [
     "opencode",
     "mcp",
     "browser",
+    "browser-automation",
+    "cdp",
+    "session-isolation",
     "chrome-devtools",
     "chromium"
   ],
@@ -46,7 +51,7 @@
     "x64"
   ],
   "engines": {
-    "node": ">=20",
+    "node": "^20.19.0 || ^22.12.0 || >=23.0.0",
     "opencode": ">=1.18.0"
   },
   "devDependencies": {

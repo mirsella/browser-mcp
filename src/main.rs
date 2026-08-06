@@ -1,14 +1,20 @@
 use std::{
     collections::{HashMap, HashSet},
-    os::unix::{ffi::OsStrExt, fs::MetadataExt},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{MetadataExt, PermissionsExt},
+    },
     path::PathBuf,
     process::Stdio,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use reqwest::{Client, Url, redirect::Policy};
 #[allow(deprecated)]
 use rmcp::model::{ListRootsResult, Root};
@@ -16,7 +22,7 @@ use rmcp::{
     ClientHandler, RoleClient, ServiceExt,
     model::{
         CallToolRequest, CallToolRequestParams, CallToolResult, ClientCapabilities, ClientInfo,
-        ClientRequest, ContentBlock, Implementation, JsonObject, ServerResult, Tool,
+        ClientRequest, ContentBlock, Implementation, JsonObject, PingRequest, ServerResult, Tool,
     },
     service::{PeerRequestOptions, RequestContext, RunningService},
     transport::TokioChildProcess,
@@ -33,11 +39,42 @@ const SESSION_KEY: &str = "__opencode_session_id";
 const INTERNAL_URL: &str = "about:blank";
 const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const WORKER_START_TIMEOUT: Duration = Duration::from_secs(30);
+const WORKER_HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_SESSION_ID_BYTES: usize = 256;
+const MAX_POOLED_WORKERS: usize = 8;
 const MAX_VERSION_RESPONSE_BYTES: usize = 64 * 1024;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum RoutingMode {
+    #[default]
+    Connection,
+    Opencode,
+}
+
 fn default_browser_executable() -> PathBuf {
-    let mut candidates = vec![
+    const BROWSERS: &[&str] = &[
+        "helium",
+        "chromium",
+        "chromium-browser",
+        "google-chrome-stable",
+        "google-chrome",
+        "chrome-for-testing",
+        "brave-browser",
+        "brave-browser-stable",
+        "brave",
+        "microsoft-edge-stable",
+        "microsoft-edge",
+        "microsoft-edge-beta",
+        "microsoft-edge-dev",
+    ];
+    let mut candidates = Vec::new();
+    if let Some(path) = std::env::var_os("PATH") {
+        for browser in BROWSERS {
+            candidates
+                .extend(std::env::split_paths(&path).map(|directory| directory.join(browser)));
+        }
+    }
+    candidates.extend([
         PathBuf::from("/opt/helium-browser-bin/helium-wrapper"),
         PathBuf::from("/usr/local/bin/helium"),
         PathBuf::from("/usr/bin/helium"),
@@ -47,21 +84,7 @@ fn default_browser_executable() -> PathBuf {
         PathBuf::from("/usr/bin/google-chrome"),
         PathBuf::from("/usr/bin/brave-browser"),
         PathBuf::from("/usr/bin/microsoft-edge-stable"),
-    ];
-    if let Some(path) = std::env::var_os("PATH") {
-        const BROWSERS: &[&str] = &[
-            "helium",
-            "chromium",
-            "chromium-browser",
-            "google-chrome-stable",
-            "google-chrome",
-            "brave-browser",
-            "microsoft-edge-stable",
-        ];
-        for directory in std::env::split_paths(&path) {
-            candidates.extend(BROWSERS.iter().map(|browser| directory.join(browser)));
-        }
-    }
+    ]);
     candidates
         .into_iter()
         .find(|path| path.is_file())
@@ -82,9 +105,16 @@ fn default_browser_profile() -> PathBuf {
         .unwrap_or_default();
     match name {
         "helium" | "helium-wrapper" => config_home.join("net.imput.helium"),
-        "google-chrome" | "google-chrome-stable" => config_home.join("google-chrome"),
-        "brave-browser" => config_home.join("BraveSoftware/Brave-Browser"),
-        "microsoft-edge" | "microsoft-edge-stable" => config_home.join("microsoft-edge"),
+        "chrome-for-testing" | "google-chrome" | "google-chrome-stable" => {
+            config_home.join("opencode-browser-mcp/google-chrome")
+        }
+        "brave" | "brave-browser" | "brave-browser-stable" => {
+            config_home.join("BraveSoftware/Brave-Browser")
+        }
+        "microsoft-edge"
+        | "microsoft-edge-stable"
+        | "microsoft-edge-beta"
+        | "microsoft-edge-dev" => config_home.join("microsoft-edge"),
         _ => config_home.join("chromium"),
     }
 }
@@ -96,12 +126,29 @@ use cdp::{TargetId, TargetTracker};
 use persistence::{OwnershipPersistence, PersistedSession, RestoredState};
 
 #[derive(Debug, Parser)]
-#[command(version, about = "Session-isolated browser MCP for OpenCode")]
+#[command(version, about = "Session-isolated MCP for Chromium-family browsers")]
 struct Config {
-    #[arg(long, hide = true, conflicts_with = "stop_daemon")]
+    #[arg(
+        long,
+        hide = true,
+        conflicts_with_all = ["stop_daemon", "release_session"]
+    )]
     daemon: bool,
-    #[arg(long, hide = true, conflicts_with = "daemon")]
+    #[arg(
+        long,
+        hide = true,
+        conflicts_with_all = ["daemon", "release_session"]
+    )]
     stop_daemon: bool,
+    #[arg(
+        long,
+        hide = true,
+        value_name = "SESSION_ID",
+        conflicts_with_all = ["daemon", "stop_daemon"]
+    )]
+    release_session: Option<String>,
+    #[arg(long, value_enum, default_value_t)]
+    routing: RoutingMode,
     #[arg(long, env = "OPENCODE_BROWSER_SOCKET")]
     socket: Option<PathBuf>,
     #[arg(
@@ -407,8 +454,21 @@ impl Session {
 struct PageState {
     local_to_tab: HashMap<u64, TargetId>,
 }
-type SessionSlot = Arc<Mutex<Option<Session>>>;
+struct SessionSlotState {
+    lifecycle: AtomicU64,
+    session: Mutex<Option<Session>>,
+}
+type SessionSlot = Arc<SessionSlotState>;
 type Sessions = Mutex<HashMap<String, SessionSlot>>;
+
+impl SessionSlotState {
+    fn new(session: Option<Session>) -> Self {
+        Self {
+            lifecycle: AtomicU64::new(0),
+            session: Mutex::new(session),
+        }
+    }
+}
 
 fn unix_time_seconds() -> Result<u64> {
     Ok(SystemTime::now()
@@ -419,20 +479,25 @@ fn unix_time_seconds() -> Result<u64> {
 
 async fn restore_sessions(
     tracker: &TargetTracker,
+    persistence: &OwnershipPersistence,
     restored: RestoredState,
 ) -> Result<HashMap<String, SessionSlot>> {
     let mut sessions = HashMap::new();
-    for (id, persisted) in restored.sessions {
+    for (id, mut persisted) in restored.sessions {
         let owned = tracker.owned_tabs(&id).await?;
         if owned.is_empty() {
             continue;
+        }
+        if id.starts_with("connection:") {
+            persisted.cleanup_pending = true;
+            persistence.update_session(&id, persisted.clone())?;
         }
         let current_tab = persisted
             .current_tab
             .filter(|tab| owned.iter().any(|owned| owned == tab));
         sessions.insert(
             id,
-            Arc::new(Mutex::new(Some(Session {
+            Arc::new(SessionSlotState::new(Some(Session {
                 persisted: PersistedSession {
                     current_tab,
                     ..persisted
@@ -470,7 +535,10 @@ async fn spawn_downstream(config: &Config, workspace: &std::path::Path) -> Resul
         .arg("--experimental-interop-tools")
         .arg("--experimental-structured-content")
         .arg("--no-usage-statistics")
+        .arg("--no-performance-crux")
+        .arg("--redact-network-headers")
         .current_dir(workspace)
+        .env("CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS", "1")
         .stderr(Stdio::inherit());
     let transport =
         TokioChildProcess::new(command).context("failed to start Chrome DevTools MCP")?;
@@ -502,6 +570,8 @@ struct BrowserProxy {
     exposed_tools: Arc<HashSet<String>>,
     page_scoped: Arc<HashSet<String>>,
     sessions: Arc<Sessions>,
+    worker_pool: Arc<Mutex<HashMap<PathBuf, Vec<Downstream>>>>,
+    release_requested: Arc<Mutex<HashSet<String>>>,
     tracker: Arc<RwLock<TargetTracker>>,
     idle: Duration,
     operation_timeout: Duration,
@@ -525,9 +595,13 @@ impl BrowserProxy {
             .await
             .map_err(|_| anyhow!("timed out retrieving Chrome DevTools tools"))
             .and_then(|result| result.context("failed to retrieve Chrome DevTools tools"));
-        let stopped = stop_worker(worker).await;
-        let listed = listed?;
-        stopped?;
+        let listed = match listed {
+            Ok(listed) => listed,
+            Err(error) => {
+                stop_worker(worker).await?;
+                return Err(error);
+            }
+        };
         let mut page_scoped = HashSet::new();
         let mut has_get_tab_id = false;
         let mut tools = Vec::with_capacity(listed.len());
@@ -544,10 +618,22 @@ impl BrowserProxy {
             tools.push(tool);
         }
         if !has_get_tab_id {
+            stop_worker(worker).await?;
             bail!("Chrome DevTools MCP does not provide required get_tab_id capability");
         }
         let exposed_tools = tools.iter().map(|tool| tool.name.to_string()).collect();
-        let sessions = restore_sessions(&tracker, restored).await?;
+        let sessions = restore_sessions(&tracker, &persistence, restored).await?;
+        let release_requested = sessions
+            .iter()
+            .filter_map(|(id, slot)| {
+                slot.session.try_lock().ok().and_then(|session| {
+                    session
+                        .as_ref()
+                        .is_some_and(|session| session.persisted.cleanup_pending)
+                        .then(|| id.clone())
+                })
+            })
+            .collect();
         let proxy = Self {
             config: config.clone(),
             supervisor,
@@ -555,6 +641,8 @@ impl BrowserProxy {
             exposed_tools: Arc::new(exposed_tools),
             page_scoped: Arc::new(page_scoped),
             sessions: Arc::new(Mutex::new(sessions)),
+            worker_pool: Arc::new(Mutex::new(HashMap::from([(workspace, vec![worker])]))),
+            release_requested: Arc::new(Mutex::new(release_requested)),
             tracker: Arc::new(RwLock::new(tracker)),
             idle: Duration::from_secs(config.idle_minutes.saturating_mul(60)),
             operation_timeout: Duration::from_secs(config.operation_seconds),
@@ -568,6 +656,66 @@ impl BrowserProxy {
             Duration::from_secs(60)
         } else {
             self.idle.min(Duration::from_secs(60))
+        }
+    }
+
+    async fn acquire_worker(&self, workspace: &std::path::Path) -> Result<Downstream> {
+        loop {
+            let worker = self
+                .worker_pool
+                .lock()
+                .await
+                .get_mut(workspace)
+                .and_then(Vec::pop);
+            let Some(worker) = worker else {
+                return spawn_downstream(&self.config, workspace).await;
+            };
+            let healthy = !worker.is_closed()
+                && !worker.is_transport_closed()
+                && matches!(
+                    timeout(
+                        WORKER_HEALTH_TIMEOUT,
+                        worker.send_request(ClientRequest::PingRequest(PingRequest::default()))
+                    )
+                    .await,
+                    Ok(Ok(ServerResult::EmptyResult(_)))
+                );
+            if healthy {
+                return Ok(worker);
+            }
+            if let Err(error) = stop_worker(worker).await {
+                warn!(%error, "failed to stop unhealthy pooled Chrome DevTools MCP worker");
+            }
+        }
+    }
+
+    async fn recycle_worker(&self, workspace: PathBuf, worker: Downstream) {
+        if worker.is_closed() {
+            return;
+        }
+        let mut pool = self.worker_pool.lock().await;
+        if pool.values().map(Vec::len).sum::<usize>() < MAX_POOLED_WORKERS {
+            pool.entry(workspace).or_default().push(worker);
+            return;
+        }
+        drop(pool);
+        if let Err(error) = stop_worker(worker).await {
+            warn!(%error, "failed to stop excess pooled Chrome DevTools MCP worker");
+        }
+    }
+
+    async fn stop_pooled_workers(&self) {
+        let pooled = self
+            .worker_pool
+            .lock()
+            .await
+            .drain()
+            .flat_map(|(_, workers)| workers)
+            .collect::<Vec<_>>();
+        for result in futures_util::future::join_all(pooled.into_iter().map(stop_worker)).await {
+            if let Err(error) = result {
+                warn!(%error, "failed to stop pooled Chrome DevTools MCP worker");
+            }
         }
     }
 
@@ -605,18 +753,20 @@ impl BrowserProxy {
     async fn retire_all_sessions(&self) {
         let slots = self.sessions.lock().await.drain().collect::<Vec<_>>();
         for (id, slot) in slots {
-            if let Some(session) = slot.lock().await.take() {
+            if let Some(session) = slot.session.lock().await.take() {
                 // Targets belong to the previous endpoint, so never close them here.
                 self.stop_session(&id, session).await;
             }
         }
+        self.stop_pooled_workers().await;
+        self.release_requested.lock().await.clear();
     }
 
     async fn slot(&self, id: &str) -> SessionSlot {
         let mut sessions = self.sessions.lock().await;
         sessions
             .entry(id.to_owned())
-            .or_insert_with(|| Arc::new(Mutex::new(None)))
+            .or_insert_with(|| Arc::new(SessionSlotState::new(None)))
             .clone()
     }
 
@@ -626,7 +776,10 @@ impl BrowserProxy {
             .get(id)
             .is_some_and(|registered| Arc::ptr_eq(registered, slot))
             && Arc::strong_count(slot) == 2
-            && slot.try_lock().is_ok_and(|session| session.is_none());
+            && slot
+                .session
+                .try_lock()
+                .is_ok_and(|session| session.is_none());
         if removable {
             sessions.remove(id);
         }
@@ -635,27 +788,44 @@ impl BrowserProxy {
     async fn route_call(
         &self,
         workspace: &std::path::Path,
-        mut request: CallToolRequestParams,
+        id: &str,
+        request: CallToolRequestParams,
     ) -> Result<CallToolResult> {
-        let arguments = request.arguments.get_or_insert_default();
-        let id = arguments
-            .remove(SESSION_KEY)
-            .and_then(|v| v.as_str().map(str::to_owned))
-            .filter(|id| !id.is_empty() && id.len() <= MAX_SESSION_ID_BYTES)
-            .ok_or_else(|| anyhow!("browser call is missing the OpenCode session identifier"))?;
         if !self.exposed_tools.contains(request.name.as_ref()) {
             bail!("browser tool is not exposed: {}", request.name);
         }
         let tracker_lease = self.tracker_lease().await?; // Must outlive every browser operation below.
         let tracker = &*tracker_lease;
-        let slot = self.slot(&id).await;
-        let mut guard = slot.lock().await;
+        let slot = self.slot(id).await;
+        let lifecycle = slot.lifecycle.load(Ordering::SeqCst);
+        if self.release_requested.lock().await.contains(id) {
+            self.prune_slot(id, &slot).await;
+            bail!("browser session is pending owned-tab cleanup");
+        }
+        let mut guard = slot.session.lock().await;
+        if slot.lifecycle.load(Ordering::SeqCst) != lifecycle
+            || self.release_requested.lock().await.contains(id)
+        {
+            drop(guard);
+            self.prune_slot(id, &slot).await;
+            bail!("browser session is pending owned-tab cleanup");
+        }
+        if guard.is_none() && request.name == "list_pages" {
+            tracker.synchronize().await?;
+            if tracker.owned_tabs(id).await?.is_empty() {
+                drop(guard);
+                self.prune_slot(id, &slot).await;
+                let mut result = CallToolResult::success(vec![ContentBlock::text("## Pages")]);
+                result.structured_content = Some(json!({"pages": []}));
+                return Ok(result);
+            }
+        }
         if guard.is_none() {
-            tracker.activate_session(&id).await?;
-            let started = spawn_downstream(&self.config, workspace).await;
+            tracker.activate_session(id).await?;
+            let started = self.acquire_worker(workspace).await;
             match started {
                 Ok(downstream) => {
-                    *guard = Some(Session {
+                    let mut session = Session {
                         persisted: PersistedSession {
                             workspace: workspace.to_path_buf(),
                             current_tab: None,
@@ -664,20 +834,24 @@ impl BrowserProxy {
                         },
                         pages: PageState::default(),
                         downstream: Some(downstream),
-                    });
+                    };
+                    if self.release_requested.lock().await.contains(id) {
+                        session.persisted.cleanup_pending = true;
+                    }
+                    *guard = Some(session);
                     if let Err(error) =
-                        self.persist_session(&id, guard.as_ref().expect("session exists"))
+                        self.persist_session(id, guard.as_ref().expect("session exists"))
                     {
                         let session = guard.take().expect("session exists");
-                        self.stop_session(&id, session).await;
+                        self.stop_session(id, session).await;
                         drop(guard);
-                        self.prune_slot(&id, &slot).await;
+                        self.prune_slot(id, &slot).await;
                         return Err(error);
                     }
                 }
                 Err(error) => {
                     drop(guard);
-                    self.prune_slot(&id, &slot).await;
+                    self.prune_slot(id, &slot).await;
                     return Err(error);
                 }
             }
@@ -686,7 +860,7 @@ impl BrowserProxy {
             .as_ref()
             .is_some_and(|session| session.persisted.workspace != workspace)
         {
-            error!(session_id = %id, existing_workspace = %guard.as_ref().expect("session checked").persisted.workspace.display(), requested_workspace = %workspace.display(), "session identifier was reused from a different workspace");
+            error!(session_id = %id, existing_workspace = %guard.as_ref().expect("session checked").persisted.workspace.display(), requested_workspace = %workspace.display(), "browser session identifier was reused from a different workspace");
             bail!("browser session identifier is already bound to a different workspace");
         }
         if guard
@@ -700,20 +874,20 @@ impl BrowserProxy {
             .is_some_and(|session| session.downstream.is_none())
         {
             let session = guard.as_mut().expect("session exists");
-            session.downstream = Some(spawn_downstream(&self.config, workspace).await?);
+            session.downstream = Some(self.acquire_worker(workspace).await?);
         }
         let closes_page = request.name == "close_page";
         let mut result = self
             .call_session(
                 tracker,
-                &id,
+                id,
                 guard.as_mut().expect("session was just started"),
                 request,
             )
             .await;
         if let Some(session) = guard.as_mut() {
             session.persisted.last_activity_unix_seconds = unix_time_seconds()?;
-            if let Err(error) = self.persist_session(&id, session) {
+            if let Err(error) = self.persist_session(id, session) {
                 result = Err(error);
             }
         }
@@ -724,46 +898,104 @@ impl BrowserProxy {
             && guard
                 .as_ref()
                 .is_some_and(|session| session.persisted.current_tab.is_none())
-            && let Err(error) = self.finalize_session(&id, tracker, &mut guard).await
+            && let Err(error) = self.finalize_session(id, tracker, &mut guard, true).await
         {
             result = Err(error.context("failed to finalize closed browser session"));
         }
-        if let Err(error) = &result
+        let release_requested = self.release_requested.lock().await.contains(id);
+        if release_requested {
+            let recycle_worker = result.is_ok();
+            let retirement = if guard.is_some() {
+                self.retire_session(id, tracker, &mut guard, recycle_worker)
+                    .await
+            } else {
+                Ok(())
+            };
+            match retirement {
+                Ok(()) => {
+                    self.release_requested.lock().await.remove(id);
+                }
+                Err(error) => {
+                    warn!(%error, session_id = %id, "requested browser session retirement failed");
+                    result = Err(error.context("failed to release browser session"));
+                }
+            }
+        } else if let Err(error) = &result
             && guard.is_some()
         {
             error!(%error, session_id = %id, "retiring failed Chrome DevTools worker");
-            let cleanup_marked = self
-				.mark_cleanup_pending(&id, guard.as_mut().expect("session exists"))
-				.map_err(|persist_error| {
-					warn!(%persist_error, session_id = %id, "failed to persist cleanup-pending browser session");
-					persist_error
-				})
-				.is_ok();
-            if let Some(session) = guard.as_mut() {
-                if let Some(worker) = session.downstream.take()
-                    && let Err(stop_error) = stop_worker(worker).await
-                {
-                    warn!(%stop_error, session_id = %id, "failed to stop failed Chrome DevTools worker");
-                }
-                session.pages = PageState::default();
-            }
-            let cleanup_succeeded = cleanup_marked
-                && match self.close_owned_pages(&id, tracker).await {
-                    Ok(()) => true,
-                    Err(cleanup_error) => {
-                        warn!(%cleanup_error, session_id = %id, "owned tabs remain queued for cleanup");
-                        false
-                    }
-                };
-            if cleanup_succeeded
-                && let Err(finalize_error) = self.finalize_session(&id, tracker, &mut guard).await
-            {
-                warn!(%finalize_error, session_id = %id, "browser session retirement failed");
+            if let Err(cleanup_error) = self.retire_session(id, tracker, &mut guard, false).await {
+                warn!(%cleanup_error, session_id = %id, "browser session retirement failed");
             }
         }
         drop(guard);
-        self.prune_slot(&id, &slot).await;
+        self.prune_slot(id, &slot).await;
         result
+    }
+
+    async fn release_session(&self, id: &str) -> Result<()> {
+        if id.is_empty() || id.len() > MAX_SESSION_ID_BYTES {
+            bail!("invalid browser session identifier");
+        }
+        let Some(slot) = self.sessions.lock().await.get(id).cloned() else {
+            let tracker_lease = self.tracker_lease().await?;
+            let tracker = &*tracker_lease;
+            if !tracker.owned_tabs(id).await?.is_empty() {
+                error!(session_id = %id, "browser ownership exists without session state");
+                bail!("browser ownership exists without session state");
+            }
+            return Ok(());
+        };
+        self.release_requested.lock().await.insert(id.to_owned());
+        slot.lifecycle.fetch_add(1, Ordering::SeqCst);
+        if !self.persistence.request_cleanup(id)? {
+            warn!(session_id = %id, "browser session release arrived before its state was persisted");
+        }
+        let tracker_lease = self.tracker_lease().await?;
+        let tracker = &*tracker_lease;
+        let Ok(mut guard) = slot.session.try_lock() else {
+            return Ok(());
+        };
+        if guard.is_none() {
+            if !tracker.owned_tabs(id).await?.is_empty() {
+                error!(session_id = %id, "browser ownership exists without live session state");
+                bail!("browser ownership exists without live session state");
+            }
+            self.release_requested.lock().await.remove(id);
+            drop(guard);
+            self.prune_slot(id, &slot).await;
+            return Ok(());
+        }
+        self.retire_session(id, tracker, &mut guard, true).await?;
+        self.release_requested.lock().await.remove(id);
+        drop(guard);
+        self.prune_slot(id, &slot).await;
+        Ok(())
+    }
+
+    async fn retire_session(
+        &self,
+        id: &str,
+        tracker: &TargetTracker,
+        slot: &mut Option<Session>,
+        recycle_worker: bool,
+    ) -> Result<()> {
+        let session = slot
+            .as_mut()
+            .ok_or_else(|| anyhow!("browser session disappeared during retirement"))?;
+        self.mark_cleanup_pending(id, session)?;
+        session.pages = PageState::default();
+        let closed = self.close_owned_pages(id, tracker).await;
+        if let Some(worker) = session.downstream.take() {
+            if recycle_worker {
+                self.recycle_worker(session.persisted.workspace.clone(), worker)
+                    .await;
+            } else if let Err(error) = stop_worker(worker).await {
+                warn!(%error, session_id = %id, "failed to stop retiring Chrome DevTools MCP worker");
+            }
+        }
+        closed?;
+        self.finalize_session(id, tracker, slot, false).await
     }
 
     async fn stop_session(&self, id: &str, session: Session) {
@@ -779,13 +1011,21 @@ impl BrowserProxy {
         id: &str,
         tracker: &TargetTracker,
         slot: &mut Option<Session>,
+        recycle_worker: bool,
     ) -> Result<()> {
         tracker.finalize_session(id).await?;
         let persisted = self.persistence.remove_session_if_unowned(id);
         let session = slot
             .take()
             .ok_or_else(|| anyhow!("browser session disappeared during finalization"))?;
-        self.stop_session(id, session).await;
+        if recycle_worker {
+            if let Some(worker) = session.downstream {
+                self.recycle_worker(session.persisted.workspace, worker)
+                    .await;
+            }
+        } else {
+            self.stop_session(id, session).await;
+        }
         persisted.context("failed to remove persisted browser session")
     }
 
@@ -1083,7 +1323,7 @@ impl BrowserProxy {
             .persisted
             .current_tab
             .clone()
-            .ok_or_else(|| anyhow!("the current page is not owned by this OpenCode session"))?;
+            .ok_or_else(|| anyhow!("the current page is not owned by this browser session"))?;
         tracker.close_owned_target(id, &tab).await?;
         self.reconcile(tracker, id, session).await?;
         Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -1122,7 +1362,7 @@ impl BrowserProxy {
             .collect::<Vec<_>>();
         let mut idle_slots = Vec::new();
         for (id, slot) in slots {
-            let Ok(guard) = slot.try_lock() else {
+            let Ok(guard) = slot.session.try_lock() else {
                 continue;
             };
             if guard
@@ -1138,7 +1378,7 @@ impl BrowserProxy {
         let tracker_lease = self.tracker_lease().await?;
         let tracker = &*tracker_lease;
         for (id, slot) in idle_slots {
-            let Ok(mut guard) = slot.try_lock() else {
+            let Ok(mut guard) = slot.session.try_lock() else {
                 continue;
             };
             let Some(session) = guard.as_mut() else {
@@ -1147,16 +1387,11 @@ impl BrowserProxy {
             if !session.needs_cleanup(now, self.idle) {
                 continue;
             }
-            if let Err(error) = self.mark_cleanup_pending(&id, session) {
-                warn!(%error, session_id = %id, "failed to persist idle cleanup intent");
-                continue;
-            }
-            if let Err(error) = self.close_owned_pages(&id, tracker).await {
-                warn!(%error, session_id = %id, "failed to close idle browser session tabs");
-                continue;
-            }
-            match self.finalize_session(&id, tracker, &mut guard).await {
-                Ok(()) => info!(session_id = %id, "cleaned up idle browser session"),
+            match self.retire_session(&id, tracker, &mut guard, true).await {
+                Ok(()) => {
+                    self.release_requested.lock().await.remove(&id);
+                    info!(session_id = %id, "cleaned up idle browser session");
+                }
                 Err(error) => {
                     warn!(%error, session_id = %id, "idle session retirement failed")
                 }
@@ -1171,7 +1406,7 @@ impl BrowserProxy {
         let slots = self.sessions.lock().await.drain().collect::<Vec<_>>();
         let mut sessions = Vec::new();
         for (id, slot) in slots {
-            if let Some(session) = slot.lock().await.take() {
+            if let Some(session) = slot.session.lock().await.take() {
                 sessions.push((id, session));
             }
         }
@@ -1181,6 +1416,7 @@ impl BrowserProxy {
                 .map(|(id, session)| async move { self.stop_session(&id, session).await }),
         )
         .await;
+        self.stop_pooled_workers().await;
         let tracker = self.tracker.read().await.clone();
         let generation = tracker.generation().to_owned();
         if let Err(error) = tracker.close_browser().await {
@@ -1395,14 +1631,21 @@ async fn main() -> Result<()> {
     daemon::run(config).await
 }
 fn validate_config(config: &Config) -> Result<()> {
-    if !config.browser_executable.is_file() {
+    let executable = std::fs::metadata(&config.browser_executable);
+    if !executable
+        .as_ref()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    {
         bail!(
-            "browser executable does not exist: {}",
+            "browser executable is missing or not executable: {}",
             config.browser_executable.display()
         );
     }
     if config.cdp_host != "127.0.0.1" && config.cdp_host != "localhost" {
         bail!("CDP must be bound to localhost, got {}", config.cdp_host);
+    }
+    if config.cdp_port == 0 {
+        bail!("CDP port must not be zero");
     }
     if config.idle_minutes == 0 {
         warn!("idle expiration is disabled; cleanup-pending sessions will still be retried");

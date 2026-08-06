@@ -23,7 +23,7 @@ use tracing::warn;
 use crate::persistence::OwnershipPersistence;
 
 pub(crate) type TargetId = String;
-type OpenCodeSessionId = String;
+type BrowserSessionId = String;
 const TRACKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,10 +55,10 @@ impl std::fmt::Display for OwnershipError {
             Self::UnknownTarget(target) => write!(formatter, "target {target} is unknown"),
             Self::OwnerConflict { target } => write!(
                 formatter,
-                "target {target} is owned by another OpenCode session"
+                "target {target} is owned by another browser session"
             ),
             Self::NotOwner { target } => {
-                write!(formatter, "OpenCode session does not own target {target}")
+                write!(formatter, "browser session does not own target {target}")
             }
         }
     }
@@ -70,9 +70,9 @@ impl std::error::Error for OwnershipError {}
 struct State {
     connected: bool,
     records: HashMap<TargetId, TargetRecord>,
-    owners: HashMap<TargetId, OpenCodeSessionId>, // keyed by stable tab target
+    owners: HashMap<TargetId, BrowserSessionId>, // keyed by stable tab target
     owner_revision: u64,
-    retired_sessions: HashSet<OpenCodeSessionId>,
+    retired_sessions: HashSet<BrowserSessionId>,
     /// Every flattened CDP attachment, including direct tab attachments. This
     /// is the canonical session tree; a root has no parent session.
     sessions: HashMap<String, CdpSession>,
@@ -215,8 +215,8 @@ impl State {
 
     fn ownership_snapshot_if_changed(
         &mut self,
-        previous: &HashMap<TargetId, OpenCodeSessionId>,
-    ) -> Option<(u64, HashMap<TargetId, OpenCodeSessionId>)> {
+        previous: &HashMap<TargetId, BrowserSessionId>,
+    ) -> Option<(u64, HashMap<TargetId, BrowserSessionId>)> {
         if &self.owners == previous {
             return None;
         }
@@ -228,7 +228,7 @@ impl State {
     /// is idempotent, but a retiring session may never claim or reclaim a tab.
     fn claim_tab(&mut self, session: &str, tab: &str) -> Result<()> {
         if self.retired_sessions.contains(session) {
-            bail!("OpenCode session {session} is retiring");
+            bail!("browser session {session} is retiring");
         }
         let record = self
             .records
@@ -311,7 +311,7 @@ impl TargetTracker {
     pub async fn connect(
         websocket_url: impl Into<String>,
         persistence: Arc<OwnershipPersistence>,
-        owners: HashMap<TargetId, OpenCodeSessionId>,
+        owners: HashMap<TargetId, BrowserSessionId>,
         owner_revision: u64,
     ) -> Result<Self> {
         let generation = websocket_url.into();
@@ -442,9 +442,9 @@ impl TargetTracker {
         Ok(())
     }
 
-    /// Explicitly assigns one exact browser `tab` to an OpenCode session.
+    /// Explicitly assigns one exact browser `tab` to a browser session.
     /// Existing ownership is never overwritten.
-    async fn claim_root_tab(&self, session: impl Into<OpenCodeSessionId>, tab: &str) -> Result<()> {
+    async fn claim_root_tab(&self, session: impl Into<BrowserSessionId>, tab: &str) -> Result<()> {
         let session = session.into();
         let mut state = self.available().await?;
         let previous = state.owners.clone();
@@ -461,7 +461,7 @@ impl TargetTracker {
         Ok(())
     }
 
-    pub async fn owner_of(&self, target: &str) -> Result<Option<OpenCodeSessionId>> {
+    pub async fn owner_of(&self, target: &str) -> Result<Option<BrowserSessionId>> {
         Ok(self.available().await?.owner(target).map(str::to_owned))
     }
 
@@ -474,7 +474,7 @@ impl TargetTracker {
     pub async fn finalize_session(&self, session: &str) -> Result<()> {
         let mut state = self.available().await?;
         if state.owners.values().any(|owner| owner == session) {
-            bail!("OpenCode session still owns browser tabs");
+            bail!("browser session still owns browser tabs");
         }
         state.retired_sessions.insert(session.to_owned());
         Ok(())
@@ -528,14 +528,14 @@ impl TargetTracker {
     /// ownership from another client's page-list delta.
     pub async fn create_owned_tab(
         &self,
-        session: impl Into<OpenCodeSessionId>,
+        session: impl Into<BrowserSessionId>,
         url: &str,
         background: bool,
     ) -> Result<TargetId> {
         let session = session.into();
         let state = self.available().await?;
         if state.retired_sessions.contains(&session) {
-            bail!("OpenCode session {session} is retiring");
+            bail!("browser session {session} is retiring");
         }
         drop(state);
         let result = self
