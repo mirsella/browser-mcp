@@ -1,0 +1,58 @@
+{
+  "name": "@mirsella/opencode-browser-mcp",
+  "version": "0.1.0",
+  "description": "Session-isolated browser automation for OpenCode using Chrome DevTools and a shared Helium profile",
+  "type": "module",
+  "exports": {
+    ".": "./plugin/browser-routing.ts",
+    "./server": "./plugin/browser-routing.ts"
+  },
+  "bin": {
+    "opencode-browser-mcp": "bin/opencode-browser-mcp.cjs"
+  },
+  "files": [
+    "bin/",
+    "plugin/",
+    "skills/",
+    "vendor/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build:native": "cargo build --release --target x86_64-unknown-linux-musl",
+    "stage:native": "node scripts/stage-native.mjs",
+    "prepack": "cargo build --release --target x86_64-unknown-linux-musl && node scripts/stage-native.mjs",
+    "test": "cargo test --all-targets"
+  },
+  "keywords": [
+    "opencode",
+    "mcp",
+    "browser",
+    "chrome-devtools",
+    "helium"
+  ],
+  "homepage": "https://github.com/mirsella/opencode-browser-mcp#readme",
+  "bugs": "https://github.com/mirsella/opencode-browser-mcp/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mirsella/opencode-browser-mcp.git"
+  },
+  "license": "MIT",
+  "author": "mirsella",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "engines": {
+    "node": ">=20",
+    "opencode": ">=1.18.0"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "1.4.6"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

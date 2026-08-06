@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+          targets: x86_64-unknown-linux-musl
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: oven-sh/setup-bun@v2
+      - run: cargo fmt --check
+      - run: cargo test --all-targets
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo build --release --target x86_64-unknown-linux-musl
+      - run: node scripts/stage-native.mjs
+      - run: npm pack --dry-run --ignore-scripts
+      - name: Test packed OpenCode plugin export
+        run: |
+          tarball=$(npm pack --json --ignore-scripts | node -e 'let data=""; process.stdin.on("data", chunk => data += chunk); process.stdin.on("end", () => { const parsed = JSON.parse(data); const item = Array.isArray(parsed) ? parsed[0] : Object.values(parsed)[0]; console.log(item.filename) })')
+          mkdir /tmp/opencode-browser-mcp-package-test
+          cd /tmp/opencode-browser-mcp-package-test
+          bun init -y
+          bun add "$GITHUB_WORKSPACE/$tarball"
+          bun -e 'import plugin from "@mirsella/opencode-browser-mcp/server"; if (typeof plugin !== "function") process.exit(1)'
