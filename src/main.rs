@@ -36,27 +36,57 @@ const WORKER_START_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_SESSION_ID_BYTES: usize = 256;
 const MAX_VERSION_RESPONSE_BYTES: usize = 64 * 1024;
 
-fn default_helium_executable() -> PathBuf {
+fn default_browser_executable() -> PathBuf {
     let mut candidates = vec![
         PathBuf::from("/opt/helium-browser-bin/helium-wrapper"),
         PathBuf::from("/usr/local/bin/helium"),
         PathBuf::from("/usr/bin/helium"),
+        PathBuf::from("/usr/bin/chromium"),
+        PathBuf::from("/usr/bin/chromium-browser"),
+        PathBuf::from("/usr/bin/google-chrome-stable"),
+        PathBuf::from("/usr/bin/google-chrome"),
+        PathBuf::from("/usr/bin/brave-browser"),
+        PathBuf::from("/usr/bin/microsoft-edge-stable"),
     ];
     if let Some(path) = std::env::var_os("PATH") {
-        candidates.extend(std::env::split_paths(&path).map(|directory| directory.join("helium")));
+        const BROWSERS: &[&str] = &[
+            "helium",
+            "chromium",
+            "chromium-browser",
+            "google-chrome-stable",
+            "google-chrome",
+            "brave-browser",
+            "microsoft-edge-stable",
+        ];
+        for directory in std::env::split_paths(&path) {
+            candidates.extend(BROWSERS.iter().map(|browser| directory.join(browser)));
+        }
     }
     candidates
         .into_iter()
         .find(|path| path.is_file())
-        .unwrap_or_else(|| PathBuf::from("helium"))
+        .unwrap_or_else(|| PathBuf::from("chromium"))
 }
 
-fn default_helium_profile() -> PathBuf {
-    std::env::var_os("XDG_CONFIG_HOME")
+fn default_browser_profile() -> PathBuf {
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .unwrap_or_else(|| PathBuf::from(".config"))
-        .join("net.imput.helium")
+        .unwrap_or_else(|| PathBuf::from(".config"));
+    let executable = std::env::var_os("OPENCODE_BROWSER_EXECUTABLE")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_browser_executable);
+    let name = executable
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    match name {
+        "helium" | "helium-wrapper" => config_home.join("net.imput.helium"),
+        "google-chrome" | "google-chrome-stable" => config_home.join("google-chrome"),
+        "brave-browser" => config_home.join("BraveSoftware/Brave-Browser"),
+        "microsoft-edge" | "microsoft-edge-stable" => config_home.join("microsoft-edge"),
+        _ => config_home.join("chromium"),
+    }
 }
 
 mod cdp;
@@ -76,14 +106,14 @@ struct Config {
     socket: Option<PathBuf>,
     #[arg(
         long,
-        env = "OPENCODE_BROWSER_HELIUM_EXECUTABLE",
-        default_value_os_t = default_helium_executable()
+        env = "OPENCODE_BROWSER_EXECUTABLE",
+        default_value_os_t = default_browser_executable()
     )]
-    helium_executable: PathBuf,
+    browser_executable: PathBuf,
     #[arg(
         long,
         env = "OPENCODE_BROWSER_PROFILE",
-        default_value_os_t = default_helium_profile()
+        default_value_os_t = default_browser_profile()
     )]
     profile: PathBuf,
     #[arg(long, env = "OPENCODE_BROWSER_DISABLE_CRASH_REPORTER")]
@@ -128,7 +158,10 @@ impl Config {
             .context("failed to identify the browser MCP executable")?;
         field(&mut identity, &executable.dev().to_be_bytes());
         field(&mut identity, &executable.ino().to_be_bytes());
-        field(&mut identity, self.helium_executable.as_os_str().as_bytes());
+        field(
+            &mut identity,
+            self.browser_executable.as_os_str().as_bytes(),
+        );
         field(&mut identity, self.profile.as_os_str().as_bytes());
         field(&mut identity, &[self.disable_crash_reporter.into()]);
         field(&mut identity, self.cdp_host.as_bytes());
@@ -144,7 +177,7 @@ impl Config {
     }
 }
 
-struct HeliumSupervisor {
+struct BrowserSupervisor {
     config: Arc<Config>,
     client: Client,
     state: Mutex<SupervisorState>,
@@ -155,7 +188,7 @@ struct SupervisorState {
     trusted_generation: Option<String>,
 }
 
-impl HeliumSupervisor {
+impl BrowserSupervisor {
     fn new(config: Arc<Config>, trusted_generation: Option<String>) -> Result<Self> {
         Ok(Self {
             config,
@@ -164,7 +197,7 @@ impl HeliumSupervisor {
                 .redirect(Policy::none())
                 .timeout(Duration::from_millis(500))
                 .build()
-                .context("failed to configure the Helium endpoint client")?,
+                .context("failed to configure the browser endpoint client")?,
             state: Mutex::new(SupervisorState {
                 process: None,
                 trusted_generation,
@@ -185,23 +218,23 @@ impl HeliumSupervisor {
         let body = response
             .bytes()
             .await
-            .context("failed to read Helium /json/version response")?;
+            .context("failed to read browser /json/version response")?;
         if body.len() > MAX_VERSION_RESPONSE_BYTES {
-            bail!("Helium /json/version response is too large");
+            bail!("browser /json/version response is too large");
         }
         let version: Value =
-            serde_json::from_slice(&body).context("invalid Helium /json/version response")?;
+            serde_json::from_slice(&body).context("invalid browser /json/version response")?;
         let identity = version
             .get("webSocketDebuggerUrl")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("Helium /json/version has no webSocketDebuggerUrl"))?;
-        let endpoint = Url::parse(identity).context("invalid Helium WebSocket debugger URL")?;
+            .ok_or_else(|| anyhow!("browser /json/version has no webSocketDebuggerUrl"))?;
+        let endpoint = Url::parse(identity).context("invalid browser WebSocket debugger URL")?;
         let loopback_host = matches!(endpoint.host_str(), Some("127.0.0.1" | "localhost"));
         if !matches!(endpoint.scheme(), "ws" | "wss")
             || !loopback_host
             || endpoint.port_or_known_default() != Some(self.config.cdp_port)
         {
-            bail!("Helium returned an unexpected WebSocket debugger URL: {identity}");
+            bail!("browser returned an unexpected WebSocket debugger URL: {identity}");
         }
         Ok(Some(identity.to_owned()))
     }
@@ -212,7 +245,7 @@ impl HeliumSupervisor {
         if let Some(child) = state.process.as_mut()
             && child
                 .try_wait()
-                .context("failed to inspect Helium process")?
+                .context("failed to inspect browser process")?
                 .is_some()
         {
             state.process = None;
@@ -230,7 +263,7 @@ impl HeliumSupervisor {
             return Ok(identity);
         }
         if state.process.is_none() {
-            let mut command = Command::new(&self.config.helium_executable);
+            let mut command = Command::new(&self.config.browser_executable);
             command
                 .arg(format!("--user-data-dir={}", self.config.profile.display()))
                 .arg(format!(
@@ -250,8 +283,8 @@ impl HeliumSupervisor {
                     .arg("--disable-breakpad")
                     .arg("--disable-crash-reporter");
             }
-            info!(executable = %self.config.helium_executable.display(), profile = %self.config.profile.display(), "starting Helium");
-            state.process = Some(command.spawn().context("failed to start Helium")?);
+            info!(executable = %self.config.browser_executable.display(), profile = %self.config.profile.display(), "starting browser");
+            state.process = Some(command.spawn().context("failed to start browser")?);
         }
         match self.wait_until_ready().await {
             Ok(identity) => {
@@ -260,7 +293,7 @@ impl HeliumSupervisor {
             }
             Err(error) => {
                 if let Some(mut child) = state.process.take() {
-                    warn!("tracked Helium did not become ready; killing it");
+                    warn!("tracked browser did not become ready; killing it");
                     terminate_child(&mut child).await;
                 }
                 Err(error)
@@ -271,16 +304,16 @@ impl HeliumSupervisor {
     async fn wait_until_ready(&self) -> Result<String> {
         let deadline = Instant::now()
             .checked_add(Duration::from_secs(self.config.startup_seconds))
-            .ok_or_else(|| anyhow!("Helium startup timeout is too large"))?;
+            .ok_or_else(|| anyhow!("browser startup timeout is too large"))?;
         while Instant::now() < deadline {
             if let Some(identity) = self.endpoint_identity().await? {
-                info!(url = %self.config.browser_url(), "Helium CDP endpoint is ready");
+                info!(url = %self.config.browser_url(), "browser CDP endpoint is ready");
                 return Ok(identity);
             }
             sleep(Duration::from_millis(200)).await;
         }
         bail!(
-            "Helium CDP endpoint {} did not become ready",
+            "browser CDP endpoint {} did not become ready",
             self.config.browser_url()
         )
     }
@@ -299,7 +332,7 @@ impl HeliumSupervisor {
 
         let Some(mut child) = self.state.lock().await.process.take() else {
             if endpoint_still_running {
-                bail!("adopted Helium did not exit after Browser.close");
+                bail!("adopted browser did not exit after Browser.close");
             }
             return Ok(());
         };
@@ -308,14 +341,14 @@ impl HeliumSupervisor {
             Ok(None) if endpoint_still_running => terminate_child(&mut child).await,
             Ok(None) => {
                 if timeout(WORKER_STOP_TIMEOUT, child.wait()).await.is_err() {
-                    warn!("timed out reaping Helium after Browser.close; killing it");
+                    warn!("timed out reaping browser after Browser.close; killing it");
                     terminate_child(&mut child).await;
                 }
             }
-            Err(error) => return Err(error).context("failed to inspect Helium during shutdown"),
+            Err(error) => return Err(error).context("failed to inspect browser during shutdown"),
         }
         if self.endpoint_identity().await?.is_some() {
-            bail!("Helium remained reachable after shutdown");
+            bail!("browser remained reachable after shutdown");
         }
         Ok(())
     }
@@ -464,7 +497,7 @@ async fn stop_worker(worker: Downstream) -> Result<()> {
 #[derive(Clone)]
 struct BrowserProxy {
     config: Arc<Config>,
-    supervisor: Arc<HeliumSupervisor>,
+    supervisor: Arc<BrowserSupervisor>,
     tools: Arc<Vec<Tool>>,
     exposed_tools: Arc<HashSet<String>>,
     page_scoped: Arc<HashSet<String>>,
@@ -477,7 +510,7 @@ struct BrowserProxy {
 
 impl BrowserProxy {
     async fn new(config: Arc<Config>, persistence: Arc<OwnershipPersistence>) -> Result<Self> {
-        let supervisor = Arc::new(HeliumSupervisor::new(
+        let supervisor = Arc::new(BrowserSupervisor::new(
             config.clone(),
             persistence.generation(),
         )?);
@@ -554,7 +587,7 @@ impl BrowserProxy {
             let tracker_unavailable = !generation_changed && !write.is_available().await;
             if generation_changed || tracker_unavailable {
                 if generation_changed {
-                    warn!("Helium endpoint identity changed; retiring all session workers");
+                    warn!("browser endpoint identity changed; retiring all session workers");
                 } else {
                     warn!("CDP target tracker disconnected; restoring target ownership");
                 }
@@ -1151,7 +1184,7 @@ impl BrowserProxy {
         let tracker = self.tracker.read().await.clone();
         let generation = tracker.generation().to_owned();
         if let Err(error) = tracker.close_browser().await {
-            warn!(%error, "failed to request Helium shutdown through CDP");
+            warn!(%error, "failed to request browser shutdown through CDP");
         }
         let stopped = self.supervisor.wait_for_browser_exit().await;
         tracker.shutdown().await;
@@ -1362,10 +1395,10 @@ async fn main() -> Result<()> {
     daemon::run(config).await
 }
 fn validate_config(config: &Config) -> Result<()> {
-    if !config.helium_executable.is_file() {
+    if !config.browser_executable.is_file() {
         bail!(
-            "Helium executable does not exist: {}",
-            config.helium_executable.display()
+            "browser executable does not exist: {}",
+            config.browser_executable.display()
         );
     }
     if config.cdp_host != "127.0.0.1" && config.cdp_host != "localhost" {
@@ -1375,7 +1408,7 @@ fn validate_config(config: &Config) -> Result<()> {
         warn!("idle expiration is disabled; cleanup-pending sessions will still be retried");
     }
     if config.startup_seconds == 0 || config.startup_seconds > 300 {
-        bail!("Helium startup timeout must be between 1 and 300 seconds");
+        bail!("browser startup timeout must be between 1 and 300 seconds");
     }
     if config.operation_seconds == 0 || config.operation_seconds > 3600 {
         bail!("browser operation timeout must be between 1 and 3600 seconds");

@@ -123,7 +123,7 @@ fn assert_no_page_ids(text: &str) {
 }
 
 #[tokio::test]
-#[ignore = "starts an isolated headed Helium browser"]
+#[ignore = "starts an isolated headed browser"]
 async fn isolates_two_sessions_and_hides_routing_fields() {
     let socket = std::env::var_os("XDG_RUNTIME_DIR")
         .map(std::path::PathBuf::from)
@@ -280,7 +280,7 @@ async fn isolates_two_sessions_and_hides_routing_fields() {
         tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .is_err(),
-        "Helium remained reachable after the last OpenCode client disconnected"
+        "browser remained reachable after the last OpenCode client disconnected"
     );
     let persisted: Value = serde_json::from_slice(
         &std::fs::read(&state).expect("read final persisted ownership state"),

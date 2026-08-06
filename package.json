@@ -1,7 +1,7 @@
 {
   "name": "@mirsella/opencode-browser-mcp",
   "version": "0.1.0",
-  "description": "Session-isolated browser automation for OpenCode using Chrome DevTools and a shared Helium profile",
+  "description": "Session-isolated browser automation for OpenCode using Chrome DevTools and a shared Chromium profile",
   "type": "module",
   "exports": {
     ".": "./plugin/browser-routing.ts",
@@ -29,7 +29,7 @@
     "mcp",
     "browser",
     "chrome-devtools",
-    "helium"
+    "chromium"
   ],
   "homepage": "https://github.com/mirsella/opencode-browser-mcp#readme",
   "bugs": "https://github.com/mirsella/opencode-browser-mcp/issues",

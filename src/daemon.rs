@@ -487,7 +487,8 @@ impl ServerHandler for Connection {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::from_build_env())
             .with_instructions(
-                "Controls Helium with pages isolated by OpenCode session.".to_owned(),
+                "Controls a Chromium-based browser with pages isolated by OpenCode session."
+                    .to_owned(),
             )
     }
     async fn list_tools(
