@@ -23,7 +23,13 @@ jobs:
       - run: cargo test --all-targets
       - run: bun test tests/plugin.test.ts
       - run: cargo clippy --all-targets -- -D warnings
+      - name: Prepare real browser routing
+        run: |
+          google-chrome --version
+          bunx chrome-devtools-mcp@1.6.0 --help >/dev/null
       - name: Test real browser routing
+        env:
+          OPENCODE_BROWSER_EXECUTABLE: /usr/bin/google-chrome
         run: xvfb-run -a cargo test --release --test e2e -- --ignored --nocapture
       - name: Check package versions
         run: test "$(node -p 'require("./package.json").version')" = "$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
