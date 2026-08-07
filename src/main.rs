@@ -48,14 +48,8 @@ const MAX_VERSION_RESPONSE_BYTES: usize = 64 * 1024;
 enum RoutingMode {
     #[default]
     Connection,
+    OpencodeDirect,
     Opencode,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
-enum ToolInterface {
-    #[default]
-    Direct,
-    Progressive,
 }
 
 fn default_browser_executable() -> PathBuf {
@@ -156,8 +150,6 @@ struct Config {
     release_session: Option<String>,
     #[arg(long, value_enum, default_value_t)]
     routing: RoutingMode,
-    #[arg(long, value_enum, default_value_t)]
-    tool_interface: ToolInterface,
     #[arg(long, env = "OPENCODE_BROWSER_SOCKET")]
     socket: Option<PathBuf>,
     #[arg(
@@ -576,7 +568,6 @@ struct BrowserProxy {
     config: Arc<Config>,
     supervisor: Arc<BrowserSupervisor>,
     tools: Arc<Vec<Tool>>,
-    exposed_tools: Arc<HashSet<String>>,
     page_scoped: Arc<HashSet<String>>,
     sessions: Arc<Sessions>,
     worker_pool: Arc<Mutex<HashMap<PathBuf, Vec<Downstream>>>>,
@@ -630,7 +621,6 @@ impl BrowserProxy {
             stop_worker(worker).await?;
             bail!("Chrome DevTools MCP does not provide required get_tab_id capability");
         }
-        let exposed_tools = tools.iter().map(|tool| tool.name.to_string()).collect();
         let sessions = restore_sessions(&tracker, &persistence, restored).await?;
         let release_requested = sessions
             .iter()
@@ -647,7 +637,6 @@ impl BrowserProxy {
             config: config.clone(),
             supervisor,
             tools: Arc::new(tools),
-            exposed_tools: Arc::new(exposed_tools),
             page_scoped: Arc::new(page_scoped),
             sessions: Arc::new(Mutex::new(sessions)),
             worker_pool: Arc::new(Mutex::new(HashMap::from([(workspace, vec![worker])]))),
@@ -800,7 +789,7 @@ impl BrowserProxy {
         id: &str,
         request: CallToolRequestParams,
     ) -> Result<CallToolResult> {
-        if !self.exposed_tools.contains(request.name.as_ref()) {
+        if browser_tool(&self.tools, request.name.as_ref()).is_none() {
             bail!("browser tool is not exposed: {}", request.name);
         }
         let tracker_lease = self.tracker_lease().await?; // Must outlive every browser operation below.
@@ -1436,6 +1425,10 @@ impl BrowserProxy {
         stopped?;
         self.persistence.clear_generation(&generation)
     }
+}
+
+fn browser_tool<'a>(tools: &'a [Tool], name: &str) -> Option<&'a Tool> {
+    tools.iter().find(|tool| tool.name.as_ref() == name)
 }
 
 fn remove_schema_property(schema: &mut JsonObject, property: &str) -> bool {

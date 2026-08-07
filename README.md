@@ -36,7 +36,62 @@ record as the authority for routing and cleanup.
 - Bun for the default `chrome-devtools-mcp` worker launcher
 - Node.js 20.19+, 22.12+, or 23+ when installing or running through npm
 - A compatible local Chromium-family browser
+- A graphical display server; headless mode is not supported
 - An MCP host, or OpenCode 1.18+ for the bundled plugin
+- `XDG_RUNTIME_DIR` for the default daemon socket, unless a custom socket is configured
+
+## Installation
+
+The canonical npm package is `@mirsella/opencode-browser-mcp`. It includes the
+OpenCode plugin, browser skill, JavaScript launcher, and Linux x64 native binary.
+OpenCode users normally install it by adding the package to `opencode.json` as
+shown below; OpenCode resolves the npm package on restart.
+
+To run the npm CLI without installing it globally:
+
+```sh
+npx -y @mirsella/opencode-browser-mcp --help
+```
+
+Or install the CLI globally:
+
+```sh
+npm install --global @mirsella/opencode-browser-mcp
+opencode-browser-mcp --help
+```
+
+The Cargo package and binary are both named `opencode-browser-mcp`. The crate is
+not currently published on crates.io; install the native MCP server from GitHub:
+
+```sh
+cargo install --git https://github.com/mirsella/opencode-browser-mcp.git --locked opencode-browser-mcp
+```
+
+The Cargo installation contains only the native generic MCP server. Use the npm
+package for the OpenCode plugin, compact tools, skill, and session lifecycle
+hooks.
+
+To build a source checkout:
+
+```sh
+git clone https://github.com/mirsella/opencode-browser-mcp.git
+cd opencode-browser-mcp
+bun install
+cargo build --release
+./target/release/opencode-browser-mcp --help
+```
+
+For local OpenCode plugin development, reference the checkout directly after
+building it:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    "file:///absolute/path/to/opencode-browser-mcp/plugin/browser-routing.ts"
+  ]
+}
+```
 
 ## OpenCode setup
 
@@ -123,6 +178,19 @@ For hosts that use JSON configuration, the equivalent shape is:
 }
 ```
 
+After a global npm or Cargo installation, configure the installed binary
+directly instead:
+
+```json
+{
+  "mcpServers": {
+    "browser": {
+      "command": "opencode-browser-mcp"
+    }
+  }
+}
+```
+
 Each stdio connection gets its own browser session. Calls on that connection
 see only its owned tabs. When the connection closes, the daemon closes those
 tabs and leaves tabs owned by other connections alone.
@@ -198,11 +266,13 @@ The executable must accept Chromium command-line flags. The profile value is a
 full user-data directory, not a named profile such as `Default`.
 
 Chrome 136 and newer ignore remote-debugging flags for Chrome's default data
-directory. The auto-detected Chrome setup therefore uses a dedicated directory
-under `~/.config/opencode-browser-mcp/`. Set `OPENCODE_BROWSER_PROFILE` to
-another non-default directory if you want a previously signed-in profile. The
-current release manages a loopback CDP endpoint; attaching to an arbitrary
-existing or remote endpoint is not supported.
+directory. For Google Chrome and Chrome for Testing, the default user-data
+directory is `$XDG_CONFIG_HOME/opencode-browser-mcp/google-chrome`, or
+`~/.config/opencode-browser-mcp/google-chrome` when `XDG_CONFIG_HOME` is unset.
+Set `OPENCODE_BROWSER_PROFILE` to another non-default directory if you want a
+previously signed-in profile. The current release manages a loopback CDP
+endpoint; attaching to an arbitrary existing or remote endpoint is not
+supported.
 
 ## Lifecycle
 
@@ -224,7 +294,7 @@ daemon idle timeout is 60 minutes.
 | Environment variable | Default | Purpose |
 | --- | --- | --- |
 | `OPENCODE_BROWSER_EXECUTABLE` | auto-detected | Chromium-family browser executable |
-| `OPENCODE_BROWSER_PROFILE` | detected user-data directory | Shared browser data directory |
+| `OPENCODE_BROWSER_PROFILE` | browser-dependent; see Browser compatibility | Shared browser data directory |
 | `OPENCODE_BROWSER_SOCKET` | `$XDG_RUNTIME_DIR/opencode-browser-mcp/daemon.sock` | Private daemon socket |
 | `OPENCODE_BROWSER_CDP_HOST` | `127.0.0.1` | CDP host; loopback only |
 | `OPENCODE_BROWSER_CDP_PORT` | `9222` | CDP port |
@@ -238,12 +308,51 @@ daemon idle timeout is 60 minutes.
 The first client starts the daemon and fixes these values for its lifetime.
 Later clients with a different daemon configuration are rejected.
 
+The default socket directory is created under `XDG_RUNTIME_DIR` with mode
+`0700`. A custom socket path does not create its parent; the parent must already
+exist, be owned by the current user, and have no group or other permissions. The
+browser profile must satisfy the same ownership and privacy requirements.
+
+For a socket path `<socket>`, runtime files are:
+
+```text
+<socket>
+<socket>.lock
+<socket>.state.json
+<socket>.stderr.log
+```
+
+The browser profile also contains `opencode-browser-mcp.lock`. Environment
+overrides must be exported to the OpenCode process so the plugin and MCP server
+inherit them.
+
 CLI controls:
 
 ```sh
-npx -y @mirsella/opencode-browser-mcp --help
-npx -y @mirsella/opencode-browser-mcp --stop-daemon
+opencode-browser-mcp --help
+opencode-browser-mcp --version
+opencode-browser-mcp --stop-daemon
 ```
+
+The routing modes are `connection` for generic MCP clients, `opencode` for the
+compact OpenCode interface, and `opencode-direct` for OpenCode with every direct
+tool exposed. The plugin selects the appropriate OpenCode mode automatically.
+
+### Troubleshooting
+
+- If `XDG_RUNTIME_DIR` is unavailable, set `OPENCODE_BROWSER_SOCKET` to a socket
+  inside an existing private directory.
+- Permission errors for the socket or profile mean the path is not owned by the
+  current user or permits group/other access. Restrict the directory to `0700`.
+- A process already listening on the configured CDP port must belong to the
+  exact managed browser generation. Stop it or choose another
+  `OPENCODE_BROWSER_CDP_PORT`; arbitrary existing CDP endpoints are rejected.
+- A profile-lock error means another daemon is already using that profile.
+- Browser startup and daemon errors are written to `<socket>.stderr.log`.
+- If `chrome-devtools-mcp` cannot start, verify that `bunx` is available or set
+  `OPENCODE_BROWSER_DOWNSTREAM_COMMAND` to a compatible launcher.
+- The plugin refuses to replace an unrelated `mcp.browser` entry. Remove or
+  rename that MCP configuration before enabling this package.
 
 ## Security model
 
@@ -280,6 +389,7 @@ Read [`SECURITY.md`](SECURITY.md) before using a profile with sensitive data.
 cargo fmt --check
 cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
+bun test tests/plugin.test.ts
 cargo test --release --test e2e -- --ignored --nocapture
 ```
 

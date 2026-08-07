@@ -1,22 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import { BrowserRouting } from "../plugin/browser-routing";
 
-type ShellResult = {
-	exitCode: number;
-	stdout: string;
-	stderr: string;
-};
-
+type ShellResult = { exitCode: number; stdout: string; stderr: string };
 const successful = Promise.resolve<ShellResult>({ exitCode: 0, stdout: "", stderr: "" });
 
 function shell(results: Array<Promise<ShellResult>>, calls: unknown[][]) {
 	return ((strings: TemplateStringsArray, ...values: unknown[]) => {
 		calls.push([strings, ...values]);
 		const result = results.shift() ?? successful;
-		const command = {
-			quiet: () => command,
-			nothrow: () => result,
-		};
+		const command = { quiet: () => command, nothrow: () => result };
 		return command;
 	}) as never;
 }
@@ -27,40 +19,26 @@ async function hooks(
 ) {
 	const calls: unknown[][] = [];
 	const plugin = await BrowserRouting(
-		{
-			$: shell(results, calls),
-			directory: "/workspace",
-			worktree: "/workspace",
-		} as never,
+		{ $: shell(results, calls), directory: "/workspace", worktree: "/workspace" } as never,
 		options,
 	);
 	return { plugin, calls };
 }
 
-describe("BrowserRouting", () => {
-	test("registers compact OpenCode routing and injects the session ID", async () => {
-		const { plugin } = await hooks();
-		const config = {} as never;
-		await plugin.config?.(config);
-		expect(config).toMatchObject({
-			mcp: {
-				browser: {
-					type: "local",
-					command: [
-						expect.any(String),
-						"--routing",
-						"opencode",
-						"--tool-interface",
-						"progressive",
-					],
-					enabled: true,
-				},
-			},
-		});
+function expectRouting(config: { mcp: { browser: { command: unknown[] } } }, routing: string) {
+	expect(config.mcp.browser.command).toEqual([expect.any(String), "--routing", routing]);
+}
 
-		const output = {
-			args: { action: "navigate_page", arguments: { url: "https://example.com" } },
-		};
+describe("BrowserRouting", () => {
+	test("registers compact routing and injects the session ID", async () => {
+		const { plugin } = await hooks();
+		const config = { skills: { paths: ["/existing"] } } as never;
+		await plugin.config?.(config);
+		await plugin.config?.(config);
+		expectRouting(config, "opencode");
+		expect(config.skills.paths).toHaveLength(2);
+
+		const output = { args: { action: "navigate_page", arguments: { url: "https://example.com" } } };
 		await plugin["tool.execute.before"]?.(
 			{ tool: "browser_dispatch", sessionID: "session-a", callID: "call-a" },
 			output,
@@ -70,67 +48,37 @@ describe("BrowserRouting", () => {
 			arguments: { url: "https://example.com" },
 			__opencode_session_id: "session-a",
 		});
+		expect(
+			plugin["tool.execute.before"]?.(
+				{ tool: "browser_dispatch", sessionID: "session-a", callID: "call-b" },
+				{ args: [] },
+			),
+		).rejects.toThrow("invalid arguments");
 	});
 
-	test("can expose direct tools", async () => {
-		const { plugin, calls } = await hooks([], { compactTools: false });
+	test("uses direct tools for partial browser policies", async () => {
+		for (const [pattern, routing] of [
+			["*_evaluate_scrip?", "opencode-direct"],
+			["browser_click", "opencode-direct"],
+			["browser_d*", "opencode-direct"],
+			["browser_*", "opencode"],
+			["*", "opencode"],
+			["browser_help", "opencode"],
+			["browser_nonexistent", "opencode"],
+			["read_*", "opencode"],
+		]) {
+			const { plugin } = await hooks();
+			const config = { permission: { [pattern]: "deny" } } as never;
+			await plugin.config?.(config);
+			expectRouting(config, routing);
+		}
+		const { plugin } = await hooks([], { compactTools: false });
 		const config = {} as never;
 		await plugin.config?.(config);
-		expect(config).toMatchObject({
-			mcp: {
-				browser: {
-					command: [
-						expect.any(String),
-						"--routing",
-						"opencode",
-						"--tool-interface",
-						"direct",
-					],
-				},
-			},
-		});
-		expect(calls).toHaveLength(0);
+		expectRouting(config, "opencode-direct");
 	});
 
-	test("preserves per-action browser permission rules", async () => {
-		const { plugin } = await hooks();
-		const config = { permission: { "*_evaluate_scrip?": "deny" } } as never;
-		await plugin.config?.(config);
-		expect(config).toMatchObject({
-			mcp: {
-				browser: {
-					command: [
-						expect.any(String),
-						"--routing",
-						"opencode",
-						"--tool-interface",
-						"direct",
-					],
-				},
-			},
-		});
-	});
-
-	test("keeps compact tools for policies that cover the dispatcher", async () => {
-		const { plugin } = await hooks();
-		const config = { permission: { "browser_*": "ask" } } as never;
-		await plugin.config?.(config);
-		expect(config).toMatchObject({
-			mcp: {
-				browser: {
-					command: [
-						expect.any(String),
-						"--routing",
-						"opencode",
-						"--tool-interface",
-						"progressive",
-					],
-				},
-			},
-		});
-	});
-
-	test("does not treat compact help as a browser session", async () => {
+	test("does not treat compact help as a used browser session", async () => {
 		const { plugin, calls } = await hooks();
 		await plugin["tool.execute.before"]?.(
 			{ tool: "browser_help", sessionID: "session-a", callID: "call-a" },
@@ -142,7 +90,7 @@ describe("BrowserRouting", () => {
 		expect(calls).toHaveLength(0);
 	});
 
-	test("can retain tabs between idle turns but still cleans deleted sessions", async () => {
+	test("can retain tabs between turns but still cleans deleted sessions", async () => {
 		const { plugin, calls } = await hooks([], { releaseOnIdle: false });
 		await plugin["tool.execute.before"]?.(
 			{ tool: "browser_dispatch", sessionID: "session-a", callID: "call-a" },
@@ -152,9 +100,46 @@ describe("BrowserRouting", () => {
 			event: { type: "session.idle", properties: { sessionID: "session-a" } },
 		} as never);
 		expect(calls).toHaveLength(0);
-
 		await plugin.event?.({
 			event: { type: "session.deleted", properties: { info: { id: "session-a" } } },
+		} as never);
+		expect(calls).toHaveLength(1);
+	});
+
+	test("retries failed idle cleanup", async () => {
+		const failed = Promise.resolve({ exitCode: 1, stdout: "", stderr: "failed" });
+		const { plugin, calls } = await hooks([failed, successful]);
+		await plugin["tool.execute.before"]?.(
+			{ tool: "browser_dispatch", sessionID: "idle", callID: "call-a" },
+			{ args: {} },
+		);
+		for (const sessionID of ["idle", "idle"]) {
+			await plugin.event?.({ event: { type: "session.idle", properties: { sessionID } } } as never);
+		}
+		expect(calls).toHaveLength(2);
+	});
+
+	test("does not resurrect a deleted session after a shared release fails", async () => {
+		let failRelease: (result: ShellResult) => void = () => {};
+		const pending = new Promise<ShellResult>((resolve) => {
+			failRelease = resolve;
+		});
+		const { plugin, calls } = await hooks([pending]);
+		await plugin["tool.execute.before"]?.(
+			{ tool: "browser_dispatch", sessionID: "session-a", callID: "call-a" },
+			{ args: {} },
+		);
+		const idle = plugin.event?.({
+			event: { type: "session.idle", properties: { sessionID: "session-a" } },
+		} as never);
+		await Promise.resolve();
+		const deleted = plugin.event?.({
+			event: { type: "session.deleted", properties: { info: { id: "session-a" } } },
+		} as never);
+		failRelease({ exitCode: 1, stdout: "", stderr: "failed" });
+		await Promise.all([idle, deleted]);
+		await plugin.event?.({
+			event: { type: "session.idle", properties: { sessionID: "session-a" } },
 		} as never);
 		expect(calls).toHaveLength(1);
 	});
@@ -166,7 +151,6 @@ describe("BrowserRouting", () => {
 		});
 		const { plugin, calls } = await hooks([first, successful]);
 		const input = { tool: "browser_dispatch", sessionID: "session-a", callID: "call-a" };
-
 		await plugin["tool.execute.before"]?.(input, { args: {} });
 		const firstIdle = plugin.event?.({
 			event: { type: "session.idle", properties: { sessionID: "session-a" } },
@@ -179,7 +163,6 @@ describe("BrowserRouting", () => {
 		await plugin.event?.({
 			event: { type: "session.idle", properties: { sessionID: "session-a" } },
 		} as never);
-
 		expect(calls).toHaveLength(2);
 	});
 });

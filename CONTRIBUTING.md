@@ -9,6 +9,7 @@ it in an adapter or response filter.
 - Bun
 - Node.js 20.19+, 22.12+, or 23+ for npm packaging
 - A compatible headed Chromium-family browser for the E2E test
+- A display server or Xvfb for headed browser tests
 - `x86_64-unknown-linux-musl` for the published native binary
 
 ## Checks
@@ -19,6 +20,7 @@ Run the normal checks before opening a pull request:
 cargo fmt --check
 cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
+bun test tests/plugin.test.ts
 ```
 
 Run the real-browser test for changes to routing, ownership, browser startup,
@@ -44,7 +46,7 @@ npm pack --dry-run
 
 - Stable browser-level CDP tab target IDs are the ownership authority.
 - Worker-local numeric page IDs are disposable routes and must not reach models.
-- A tab can have only one browser-session owner.
+- A tab can have only one browser session owner.
 - Existing or unowned tabs must not be claimed by inference.
 - Cleanup closes only exact targets owned by the retiring session.
 - Browser generation changes invalidate ownership instead of guessing.
@@ -60,8 +62,11 @@ npm pack --dry-run
 Releases are published from GitHub Actions through npm trusted publishing. Do
 not add an npm token to the repository or workflow.
 
-1. Update `package.json`, `Cargo.toml`, and `Cargo.lock` to the same version.
-2. Run the Rust checks, headed E2E test, and `npm pack --dry-run`.
+1. Update npm package `@mirsella/opencode-browser-mcp` and Cargo package
+   `opencode-browser-mcp` to the same version in `package.json`, `Cargo.toml`,
+   and `Cargo.lock`.
+2. Run the Rust checks, `bun test tests/plugin.test.ts`, headed E2E test, and
+   `npm pack --dry-run`.
 3. Push the release commit.
 4. Create a GitHub release tagged `v<version>`.
 5. The `publish` workflow builds the static binary and publishes with OIDC.

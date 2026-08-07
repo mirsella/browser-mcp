@@ -64,16 +64,6 @@ async fn call_generic_ok(client: &Client, name: &str, arguments: Value) -> CallT
 }
 
 async fn client(socket: &Path, profile: &Path, port: u16, routing: &str) -> Client {
-    client_with_interface(socket, profile, port, routing, "direct").await
-}
-
-async fn client_with_interface(
-    socket: &Path,
-    profile: &Path,
-    port: u16,
-    routing: &str,
-    tool_interface: &str,
-) -> Client {
     let mut command = Command::new(env!("CARGO_BIN_EXE_opencode-browser-mcp"));
     command
         .arg("--socket")
@@ -85,8 +75,6 @@ async fn client_with_interface(
         .arg("--disable-crash-reporter")
         .arg("--routing")
         .arg(routing)
-        .arg("--tool-interface")
-        .arg(tool_interface)
         .stderr(Stdio::inherit());
     let transport = TokioChildProcess::new(command).expect("start stdio bridge");
     ().serve(transport).await.expect("initialize bridge")
@@ -229,13 +217,13 @@ async fn isolates_two_sessions_and_hides_routing_fields() {
     let _ = std::fs::remove_file(&lock);
     let _ = std::fs::remove_file(&log);
     let (client_a, client_b) = tokio::join!(
-        client(&socket, &profile, port, "opencode"),
-        client(&socket, &profile, port, "opencode")
+        client(&socket, &profile, port, "opencode-direct"),
+        client(&socket, &profile, port, "opencode-direct")
     );
     create_unowned_tab(port).await;
 
     let direct_tools = client_a.list_all_tools().await.expect("list direct tools");
-    let compact = client_with_interface(&socket, &profile, port, "opencode", "progressive").await;
+    let compact = client(&socket, &profile, port, "opencode").await;
     let compact_tools = compact.list_all_tools().await.expect("list compact tools");
     assert_eq!(
         compact_tools
@@ -249,10 +237,7 @@ async fn isolates_two_sessions_and_hides_routing_fields() {
     eprintln!(
         "browser tool definitions: {direct_schema_bytes} direct bytes, {compact_schema_bytes} compact bytes"
     );
-    assert!(
-        compact_schema_bytes * 4 < direct_schema_bytes,
-        "compact tool definitions did not reduce the always-loaded schema enough"
-    );
+    assert!(compact_schema_bytes * 4 < direct_schema_bytes);
     let targets_before_help = browser_tabs(port).await;
     let help = call_ok(&compact, "help", "compact-smoke", json!({})).await;
     let mut documented = text(&help)
@@ -336,7 +321,6 @@ async fn isolates_two_sessions_and_hides_routing_fields() {
             !properties.contains_key("pageId") && !properties.contains_key(SESSION_KEY)
         }));
     }
-
     let (navigate_a, navigate_b) = tokio::join!(
         call_ok(
             &client_a,
@@ -522,7 +506,7 @@ async fn isolates_two_sessions_and_hides_routing_fields() {
     call_ok(&client_b, "list_pages", "smoke-b", json!({})).await;
     client_b.cancel().await.expect("stop bridge B");
     tokio::time::sleep(Duration::from_secs(1)).await;
-    let client_c = client(&socket, &profile, port, "opencode").await;
+    let client_c = client(&socket, &profile, port, "opencode-direct").await;
     assert_eq!(daemon_pid(&socket).await, original_daemon_pid);
     tokio::time::sleep(Duration::from_millis(1500)).await;
     call_ok(&client_c, "list_pages", "smoke-b", json!({})).await;

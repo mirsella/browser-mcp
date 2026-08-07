@@ -11,9 +11,9 @@ if (process.platform !== "linux" || process.arch !== "x64") {
 
 const root = resolve(__dirname, "..");
 const candidates = [
-	join(root, "vendor", "opencode-browser-mcp"),
-	join(root, "target", "x86_64-unknown-linux-musl", "release", "opencode-browser-mcp"),
 	join(root, "target", "release", "opencode-browser-mcp"),
+	join(root, "target", "x86_64-unknown-linux-musl", "release", "opencode-browser-mcp"),
+	join(root, "vendor", "opencode-browser-mcp"),
 ];
 const binary = candidates.find(existsSync);
 
