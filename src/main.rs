@@ -51,6 +51,13 @@ enum RoutingMode {
     Opencode,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum ToolInterface {
+    #[default]
+    Direct,
+    Progressive,
+}
+
 fn default_browser_executable() -> PathBuf {
     const BROWSERS: &[&str] = &[
         "helium",
@@ -149,6 +156,8 @@ struct Config {
     release_session: Option<String>,
     #[arg(long, value_enum, default_value_t)]
     routing: RoutingMode,
+    #[arg(long, value_enum, default_value_t)]
+    tool_interface: ToolInterface,
     #[arg(long, env = "OPENCODE_BROWSER_SOCKET")]
     socket: Option<PathBuf>,
     #[arg(

@@ -64,6 +64,16 @@ async fn call_generic_ok(client: &Client, name: &str, arguments: Value) -> CallT
 }
 
 async fn client(socket: &Path, profile: &Path, port: u16, routing: &str) -> Client {
+    client_with_interface(socket, profile, port, routing, "direct").await
+}
+
+async fn client_with_interface(
+    socket: &Path,
+    profile: &Path,
+    port: u16,
+    routing: &str,
+    tool_interface: &str,
+) -> Client {
     let mut command = Command::new(env!("CARGO_BIN_EXE_opencode-browser-mcp"));
     command
         .arg("--socket")
@@ -75,6 +85,8 @@ async fn client(socket: &Path, profile: &Path, port: u16, routing: &str) -> Clie
         .arg("--disable-crash-reporter")
         .arg("--routing")
         .arg(routing)
+        .arg("--tool-interface")
+        .arg(tool_interface)
         .stderr(Stdio::inherit());
     let transport = TokioChildProcess::new(command).expect("start stdio bridge");
     ().serve(transport).await.expect("initialize bridge")
@@ -222,6 +234,62 @@ async fn isolates_two_sessions_and_hides_routing_fields() {
     );
     create_unowned_tab(port).await;
 
+    let direct_tools = client_a.list_all_tools().await.expect("list direct tools");
+    let compact = client_with_interface(&socket, &profile, port, "opencode", "progressive").await;
+    let compact_tools = compact.list_all_tools().await.expect("list compact tools");
+    assert_eq!(
+        compact_tools
+            .iter()
+            .map(|tool| tool.name.as_ref())
+            .collect::<Vec<_>>(),
+        ["dispatch", "help"]
+    );
+    let direct_schema_bytes = serde_json::to_vec(&direct_tools).unwrap().len();
+    let compact_schema_bytes = serde_json::to_vec(&compact_tools).unwrap().len();
+    eprintln!(
+        "browser tool definitions: {direct_schema_bytes} direct bytes, {compact_schema_bytes} compact bytes"
+    );
+    assert!(
+        compact_schema_bytes * 4 < direct_schema_bytes,
+        "compact tool definitions did not reduce the always-loaded schema enough"
+    );
+    let targets_before_help = browser_tabs(port).await;
+    let help = call_ok(&compact, "help", "compact-smoke", json!({})).await;
+    let mut documented = text(&help)
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("Available browser actions: ")
+        .unwrap()
+        .split(", ")
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let mut direct_names = direct_tools
+        .iter()
+        .map(|tool| tool.name.to_string())
+        .collect::<Vec<_>>();
+    documented.sort_unstable();
+    direct_names.sort_unstable();
+    assert_eq!(documented, direct_names);
+    assert_eq!(browser_tabs(port).await.len(), targets_before_help.len());
+    call_ok(
+        &compact,
+        "dispatch",
+        "compact-smoke",
+        json!({
+            "action": "navigate_page",
+            "arguments": {"type": "url", "url": "https://example.net/#compact-client"}
+        }),
+    )
+    .await;
+    assert!(browser_tabs(port).await.iter().any(|tab| {
+        tab.get("url")
+            .and_then(Value::as_str)
+            .is_some_and(|url| url.contains("compact-client"))
+    }));
+    assert!(release_session(&socket, "compact-smoke").await);
+    compact.cancel().await.expect("stop compact bridge");
+
     let generic = client(&socket, &profile, port, "connection").await;
     call_generic_ok(
         &generic,
@@ -257,7 +325,7 @@ async fn isolates_two_sessions_and_hides_routing_fields() {
             .is_some_and(|url| url.contains("user-tab"))
     }));
 
-    for tool in client_a.list_all_tools().await.expect("list tools") {
+    for tool in direct_tools {
         assert_ne!(tool.name, "select_page");
         assert_ne!(tool.name, "get_tab_id");
         let properties = tool

@@ -30,7 +30,8 @@ cargo test --release --test e2e -- --ignored --nocapture
 
 The E2E test uses a temporary profile, socket, and CDP port. It verifies generic
 connection cleanup, OpenCode session isolation, concurrent calls, unowned-tab
-preservation, daemon reconnection, and final shutdown.
+preservation, compact-tool dispatch and schema reduction, daemon reconnection,
+and final shutdown.
 
 Check the npm artifact when changing package files or the native launcher:
 
@@ -49,6 +50,10 @@ npm pack --dry-run
 - Browser generation changes invalidate ownership instead of guessing.
 - Ownership conflicts and malformed downstream responses fail closed.
 - Generic MCP routing and OpenCode routing remain separate connection modes.
+- Generic MCP clients keep direct tools; compact OpenCode tools disclose one
+  current action schema at a time without duplicating upstream definitions.
+- Per-action OpenCode permission or tool rules force direct mode rather than
+  silently broadening access through the compact dispatcher.
 
 ## Releases
 

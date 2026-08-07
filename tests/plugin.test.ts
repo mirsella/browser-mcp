@@ -23,7 +23,7 @@ function shell(results: Array<Promise<ShellResult>>, calls: unknown[][]) {
 
 async function hooks(
 	results: Array<Promise<ShellResult>> = [],
-	options?: { releaseOnIdle?: boolean },
+	options?: { compactTools?: boolean; releaseOnIdle?: boolean },
 ) {
 	const calls: unknown[][] = [];
 	const plugin = await BrowserRouting(
@@ -38,7 +38,7 @@ async function hooks(
 }
 
 describe("BrowserRouting", () => {
-	test("registers OpenCode routing and injects the session ID", async () => {
+	test("registers compact OpenCode routing and injects the session ID", async () => {
 		const { plugin } = await hooks();
 		const config = {} as never;
 		await plugin.config?.(config);
@@ -46,27 +46,106 @@ describe("BrowserRouting", () => {
 			mcp: {
 				browser: {
 					type: "local",
-					command: [expect.any(String), "--routing", "opencode"],
+					command: [
+						expect.any(String),
+						"--routing",
+						"opencode",
+						"--tool-interface",
+						"progressive",
+					],
 					enabled: true,
 				},
 			},
 		});
 
-		const output = { args: { url: "https://example.com" } };
+		const output = {
+			args: { action: "navigate_page", arguments: { url: "https://example.com" } },
+		};
 		await plugin["tool.execute.before"]?.(
-			{ tool: "browser_navigate_page", sessionID: "session-a", callID: "call-a" },
+			{ tool: "browser_dispatch", sessionID: "session-a", callID: "call-a" },
 			output,
 		);
 		expect(output.args).toEqual({
-			url: "https://example.com",
+			action: "navigate_page",
+			arguments: { url: "https://example.com" },
 			__opencode_session_id: "session-a",
 		});
+	});
+
+	test("can expose direct tools", async () => {
+		const { plugin, calls } = await hooks([], { compactTools: false });
+		const config = {} as never;
+		await plugin.config?.(config);
+		expect(config).toMatchObject({
+			mcp: {
+				browser: {
+					command: [
+						expect.any(String),
+						"--routing",
+						"opencode",
+						"--tool-interface",
+						"direct",
+					],
+				},
+			},
+		});
+		expect(calls).toHaveLength(0);
+	});
+
+	test("preserves per-action browser permission rules", async () => {
+		const { plugin } = await hooks();
+		const config = { permission: { "*_evaluate_scrip?": "deny" } } as never;
+		await plugin.config?.(config);
+		expect(config).toMatchObject({
+			mcp: {
+				browser: {
+					command: [
+						expect.any(String),
+						"--routing",
+						"opencode",
+						"--tool-interface",
+						"direct",
+					],
+				},
+			},
+		});
+	});
+
+	test("keeps compact tools for policies that cover the dispatcher", async () => {
+		const { plugin } = await hooks();
+		const config = { permission: { "browser_*": "ask" } } as never;
+		await plugin.config?.(config);
+		expect(config).toMatchObject({
+			mcp: {
+				browser: {
+					command: [
+						expect.any(String),
+						"--routing",
+						"opencode",
+						"--tool-interface",
+						"progressive",
+					],
+				},
+			},
+		});
+	});
+
+	test("does not treat compact help as a browser session", async () => {
+		const { plugin, calls } = await hooks();
+		await plugin["tool.execute.before"]?.(
+			{ tool: "browser_help", sessionID: "session-a", callID: "call-a" },
+			{ args: {} },
+		);
+		await plugin.event?.({
+			event: { type: "session.idle", properties: { sessionID: "session-a" } },
+		} as never);
+		expect(calls).toHaveLength(0);
 	});
 
 	test("can retain tabs between idle turns but still cleans deleted sessions", async () => {
 		const { plugin, calls } = await hooks([], { releaseOnIdle: false });
 		await plugin["tool.execute.before"]?.(
-			{ tool: "browser_list_pages", sessionID: "session-a", callID: "call-a" },
+			{ tool: "browser_dispatch", sessionID: "session-a", callID: "call-a" },
 			{ args: {} },
 		);
 		await plugin.event?.({
@@ -86,7 +165,7 @@ describe("BrowserRouting", () => {
 			completeFirst = resolve;
 		});
 		const { plugin, calls } = await hooks([first, successful]);
-		const input = { tool: "browser_list_pages", sessionID: "session-a", callID: "call-a" };
+		const input = { tool: "browser_dispatch", sessionID: "session-a", callID: "call-a" };
 
 		await plugin["tool.execute.before"]?.(input, { args: {} });
 		const firstIdle = plugin.event?.({

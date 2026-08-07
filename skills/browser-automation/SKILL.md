@@ -1,18 +1,32 @@
 ---
 name: browser-automation
-description: Use browser automation and Chrome DevTools tools to inspect or interact with websites, test web interfaces, capture screenshots, and diagnose browser console or network behavior.
+description: Use browser automation to inspect or interact with websites, test rendered interfaces, capture screenshots, and diagnose console or network behavior.
 ---
 
 # Browser Automation
 
-Use the `browser_*` tools when the task requires a real, rendered browser or browser-only state such as authentication, client-side behavior, layout, accessibility, console output, or network traffic.
+Use the browser tools when the task requires rendered state, authentication,
+client-side behavior, layout, accessibility, console output, or network traffic.
+
+OpenCode normally exposes two compact tools:
+
+- `browser_help` lists action names or loads the current schema for one action.
+- `browser_dispatch` executes an action with `{ action, arguments }`.
+
+Common actions include `navigate_page`, `take_snapshot`, `click`, `fill_form`,
+`take_screenshot`, `evaluate_script`, `list_console_messages`, and
+`list_network_requests`. Call `browser_help` for an action before using it when
+its exact arguments are not already clear. Do not guess argument shapes.
+
+Direct `browser_*` action tools may appear when compact tools are disabled. Use
+them directly with the same workflow.
 
 ## Workflow
 
-1. Navigate to the target URL, then inspect the page before interacting.
-2. Use the current snapshot to identify elements and references. Refresh the snapshot after navigation or meaningful DOM changes rather than reusing stale references.
-3. Perform the smallest interaction needed, then inspect the resulting page state.
-4. Verify navigation, form submission, downloads, and other consequential actions from visible page state or relevant browser diagnostics.
+1. Navigate, then inspect the page before interacting.
+2. Use the latest snapshot to identify elements and references. Refresh it after navigation or meaningful DOM changes.
+3. Perform the smallest interaction needed, then inspect the result.
+4. Verify consequential actions from visible state or relevant diagnostics.
 
 Use screenshots when visual appearance, responsive layout, rendering, or image output matters. Prefer snapshots for locating elements and understanding page structure.
 

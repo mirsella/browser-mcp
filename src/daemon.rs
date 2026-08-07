@@ -18,10 +18,12 @@ use rmcp::{
     ServerHandler, ServiceExt,
     model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-        ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo,
+        ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+        ToolAnnotations,
     },
     service::RequestContext,
 };
+use serde_json::{Value, json};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, copy},
     net::{UnixListener, UnixStream},
@@ -33,7 +35,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use super::{
-    BrowserProxy, Config, MAX_SESSION_ID_BYTES, RoutingMode, SESSION_KEY,
+    BrowserProxy, Config, MAX_SESSION_ID_BYTES, RoutingMode, SESSION_KEY, ToolInterface,
     persistence::OwnershipPersistence, validate_config,
 };
 
@@ -63,7 +65,7 @@ pub(super) async fn run(config: Arc<Config>) -> Result<()> {
         validate_config(&config)?;
         return run_daemon(config, paths, identity).await;
     }
-    bridge(paths, identity, config.routing).await
+    bridge(paths, identity, config.routing, config.tool_interface).await
 }
 
 struct RuntimePaths {
@@ -131,12 +133,17 @@ fn validate_private_directory(directory: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn bridge(paths: RuntimePaths, identity: Arc<[u8]>, routing: RoutingMode) -> Result<()> {
+async fn bridge(
+    paths: RuntimePaths,
+    identity: Arc<[u8]>,
+    routing: RoutingMode,
+    tool_interface: ToolInterface,
+) -> Result<()> {
     let mut stream = match connect_or_absent(&paths.socket).await? {
         Some(stream) => stream,
         None => start_daemon_and_connect(&paths).await?,
     };
-    client_handshake(&mut stream, &identity, routing).await?;
+    client_handshake(&mut stream, &identity, routing, tool_interface).await?;
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let (mut socket_read, mut socket_write) = stream.into_split();
@@ -510,6 +517,7 @@ struct Connection {
     proxy: BrowserProxy,
     workspace: PathBuf,
     routing: ConnectionRouting,
+    tool_interface: ToolInterface,
     lifecycle: Option<Arc<ConnectionLifecycle>>,
 }
 
@@ -582,6 +590,136 @@ impl ConnectionRouting {
     }
 }
 
+fn progressive_tools() -> Vec<Tool> {
+    let dispatch_schema = json!({
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Browser action name. Use browser_help when its arguments are unknown."
+            },
+            "arguments": {
+                "type": "object",
+                "description": "Arguments for the action. Omit when none are needed."
+            }
+        },
+        "required": ["action"],
+        "additionalProperties": false
+    })
+    .as_object()
+    .expect("dispatch schema is an object")
+    .clone();
+    let help_schema = json!({
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Action to document. Omit to list action names."
+            }
+        },
+        "additionalProperties": false
+    })
+    .as_object()
+    .expect("help schema is an object")
+    .clone();
+    vec![
+        Tool::new(
+            "dispatch",
+            "Execute a browser action. Use browser_help first when its arguments are unknown.",
+            dispatch_schema,
+        )
+        .with_annotations(
+            ToolAnnotations::new()
+                .read_only(false)
+                .destructive(true)
+                .idempotent(false)
+                .open_world(true),
+        ),
+        Tool::new(
+            "help",
+            "List browser actions or load the current schema for one action.",
+            help_schema,
+        )
+        .with_annotations(
+            ToolAnnotations::new()
+                .read_only(true)
+                .destructive(false)
+                .idempotent(true)
+                .open_world(false),
+        ),
+    ]
+}
+
+fn only_fields(arguments: &serde_json::Map<String, Value>, allowed: &[&str]) -> Result<()> {
+    if let Some(field) = arguments
+        .keys()
+        .find(|field| !allowed.contains(&field.as_str()))
+    {
+        bail!("unexpected field {field:?}");
+    }
+    Ok(())
+}
+
+fn expand_dispatch(
+    mut request: CallToolRequestParams,
+    exposed_tools: &std::collections::HashSet<String>,
+) -> Result<CallToolRequestParams> {
+    let mut envelope = request.arguments.take().unwrap_or_default();
+    only_fields(&envelope, &["action", "arguments"])?;
+    let action = envelope
+        .remove("action")
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .filter(|action| !action.is_empty())
+        .ok_or_else(|| anyhow!("browser_dispatch requires a non-empty string action"))?;
+    if !exposed_tools.contains(&action) {
+        bail!("unknown browser action {action:?}; call browser_help to list available actions");
+    }
+    let arguments = match envelope.remove("arguments") {
+        Some(Value::Object(arguments)) => arguments,
+        Some(_) => bail!("browser_dispatch arguments must be an object"),
+        None => Default::default(),
+    };
+    if arguments.contains_key(SESSION_KEY) {
+        bail!("browser action arguments contain a reserved routing field");
+    }
+    request.name = action.into();
+    request.arguments = Some(arguments);
+    Ok(request)
+}
+
+fn progressive_help(request: CallToolRequestParams, tools: &[Tool]) -> Result<CallToolResult> {
+    let mut arguments = request.arguments.unwrap_or_default();
+    only_fields(&arguments, &["action"])?;
+    let action = match arguments.remove("action") {
+        Some(Value::String(action)) if !action.is_empty() => Some(action),
+        Some(_) => bail!("browser_help action must be a non-empty string"),
+        None => None,
+    };
+    if let Some(action) = action {
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name == action)
+            .ok_or_else(|| anyhow!("unknown browser action {action:?}; call browser_help without an action to list available actions"))?;
+        let definition =
+            serde_json::to_value(tool).context("failed to serialize browser action")?;
+        let text = serde_json::to_string_pretty(&definition)
+            .context("failed to format browser action definition")?;
+        return Ok(CallToolResult::success(vec![ContentBlock::text(text)]));
+    }
+    let mut actions = tools
+        .iter()
+        .map(|tool| tool.name.to_string())
+        .collect::<Vec<_>>();
+    actions.sort_unstable();
+    let text = format!(
+        "Available browser actions: {}\nUse browser_help with an action to load its schema.",
+        actions.join(", ")
+    );
+    Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+}
+
 impl ServerHandler for Connection {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
@@ -597,15 +735,26 @@ impl ServerHandler for Connection {
         context: RequestContext<rmcp::RoleServer>,
     ) -> Result<ListToolsResult, rmcp::ErrorData> {
         let _ = (request, context);
-        Ok(ListToolsResult::with_all_items(
-            self.proxy.tools.as_ref().clone(),
-        ))
+        let tools = match self.tool_interface {
+            ToolInterface::Direct => self.proxy.tools.as_ref().clone(),
+            ToolInterface::Progressive => progressive_tools(),
+        };
+        Ok(ListToolsResult::with_all_items(tools))
     }
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
         _: RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResponse, rmcp::ErrorData> {
+        if self.tool_interface == ToolInterface::Progressive
+            && request.name != "dispatch"
+            && request.name != "help"
+        {
+            return Err(rmcp::ErrorData::invalid_params(
+                "tool not found; use browser_dispatch or browser_help",
+                None,
+            ));
+        }
         let _lease = match &self.lifecycle {
             Some(lifecycle) => match lifecycle.enter() {
                 Some(lease) => Some(lease),
@@ -620,7 +769,19 @@ impl ServerHandler for Connection {
         };
         let routed = self.routing.route(request);
         let result = match routed {
-            Ok((id, request)) => self.proxy.route_call(&self.workspace, &id, request).await,
+            Ok((id, request)) => match self.tool_interface {
+                ToolInterface::Direct => self.proxy.route_call(&self.workspace, &id, request).await,
+                ToolInterface::Progressive if request.name == "dispatch" => {
+                    match expand_dispatch(request, &self.proxy.exposed_tools) {
+                        Ok(request) => self.proxy.route_call(&self.workspace, &id, request).await,
+                        Err(error) => Err(error),
+                    }
+                }
+                ToolInterface::Progressive if request.name == "help" => {
+                    progressive_help(request, &self.proxy.tools)
+                }
+                ToolInterface::Progressive => unreachable!("compact tool name checked above"),
+            },
             Err(error) => Err(error),
         };
         match result {
@@ -640,11 +801,21 @@ async fn serve_connection(
 ) -> Result<bool> {
     let mut stream = stream;
     let pid = peer_pid(&stream)?;
-    let routing = match server_handshake(&mut stream, &identity).await? {
-        HandshakeRequest::Identity(_, RoutingMode::Connection) => {
-            ConnectionRouting::Connection(format!("connection:{}", Uuid::new_v4()))
+    let (routing, tool_interface) = match server_handshake(&mut stream, &identity).await? {
+        HandshakeRequest::Identity(
+            _,
+            RoutingMode::Connection,
+            tool_interface @ ToolInterface::Direct,
+        ) => (
+            ConnectionRouting::Connection(format!("connection:{}", Uuid::new_v4())),
+            tool_interface,
+        ),
+        HandshakeRequest::Identity(_, RoutingMode::Opencode, tool_interface) => {
+            (ConnectionRouting::Opencode, tool_interface)
         }
-        HandshakeRequest::Identity(_, RoutingMode::Opencode) => ConnectionRouting::Opencode,
+        HandshakeRequest::Identity(_, RoutingMode::Connection, ToolInterface::Progressive) => {
+            bail!("the progressive tool interface requires OpenCode routing")
+        }
         HandshakeRequest::Stop => return Ok(true),
         HandshakeRequest::Release(session_id) => {
             let result = proxy
@@ -669,6 +840,7 @@ async fn serve_connection(
         proxy: proxy.clone(),
         workspace,
         routing,
+        tool_interface,
         lifecycle: lifecycle.clone(),
     }
     .serve(stream)
@@ -689,11 +861,12 @@ async fn client_handshake(
     stream: &mut UnixStream,
     identity: &[u8],
     routing: RoutingMode,
+    tool_interface: ToolInterface,
 ) -> Result<()> {
     timeout(HANDSHAKE_TIMEOUT, async {
         write_handshake(
             stream,
-            &HandshakeRequest::Identity(identity.to_vec(), routing),
+            &HandshakeRequest::Identity(identity.to_vec(), routing, tool_interface),
         )
         .await?;
         match stream.read_u8().await? {
@@ -709,7 +882,7 @@ async fn server_handshake(stream: &mut UnixStream, expected: &[u8]) -> Result<Ha
     timeout(HANDSHAKE_TIMEOUT, async {
         let request = read_handshake(stream).await?;
         match &request {
-            HandshakeRequest::Identity(identity, _) => {
+            HandshakeRequest::Identity(identity, _, _) => {
                 let matches = identity == expected;
                 stream.write_u8(u8::from(matches)).await?;
                 stream.flush().await?;
@@ -730,25 +903,42 @@ async fn server_handshake(stream: &mut UnixStream, expected: &[u8]) -> Result<Ha
 }
 
 enum HandshakeRequest {
-    Identity(Vec<u8>, RoutingMode),
+    Identity(Vec<u8>, RoutingMode, ToolInterface),
     Stop,
     Release(String),
+}
+
+fn connection_mode(routing: RoutingMode, tool_interface: ToolInterface) -> Result<u8> {
+    match (routing, tool_interface) {
+        (RoutingMode::Connection, ToolInterface::Direct) => Ok(0),
+        (RoutingMode::Opencode, ToolInterface::Direct) => Ok(1),
+        (RoutingMode::Opencode, ToolInterface::Progressive) => Ok(2),
+        (RoutingMode::Connection, ToolInterface::Progressive) => {
+            bail!("the progressive tool interface requires OpenCode routing")
+        }
+    }
+}
+
+fn parse_connection_mode(mode: u8) -> Result<(RoutingMode, ToolInterface)> {
+    match mode {
+        0 => Ok((RoutingMode::Connection, ToolInterface::Direct)),
+        1 => Ok((RoutingMode::Opencode, ToolInterface::Direct)),
+        2 => Ok((RoutingMode::Opencode, ToolInterface::Progressive)),
+        _ => bail!("invalid browser connection mode"),
+    }
 }
 
 async fn write_handshake(stream: &mut UnixStream, request: &HandshakeRequest) -> Result<()> {
     stream.write_all(HANDSHAKE_MAGIC).await?;
     match request {
-        HandshakeRequest::Identity(identity, routing) => {
+        HandshakeRequest::Identity(identity, routing, tool_interface) => {
             if identity.len() > MAX_IDENTITY_BYTES {
                 bail!("browser daemon configuration identity is too large");
             }
             stream.write_u32(identity.len() as u32).await?;
             stream.write_all(identity).await?;
             stream
-                .write_u8(match routing {
-                    RoutingMode::Connection => 0,
-                    RoutingMode::Opencode => 1,
-                })
+                .write_u8(connection_mode(*routing, *tool_interface)?)
                 .await?;
         }
         HandshakeRequest::Stop => stream.write_u32(STOP_HANDSHAKE).await?,
@@ -793,12 +983,12 @@ async fn read_handshake(stream: &mut UnixStream) -> Result<HandshakeRequest> {
     }
     let mut identity = vec![0; length];
     stream.read_exact(&mut identity).await?;
-    let routing = match stream.read_u8().await? {
-        0 => RoutingMode::Connection,
-        1 => RoutingMode::Opencode,
-        _ => bail!("invalid browser routing mode"),
-    };
-    Ok(HandshakeRequest::Identity(identity, routing))
+    let (routing, tool_interface) = parse_connection_mode(stream.read_u8().await?)?;
+    Ok(HandshakeRequest::Identity(
+        identity,
+        routing,
+        tool_interface,
+    ))
 }
 
 async fn shutdown_signal() {
@@ -896,6 +1086,8 @@ async fn send_control(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use serde_json::json;
 
     use super::*;
@@ -958,6 +1150,114 @@ mod tests {
                 .route(CallToolRequestParams::new("list_pages"))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn progressive_interface_is_small_and_dispatches_known_actions() {
+        let tools = progressive_tools();
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool.name.as_ref())
+                .collect::<Vec<_>>(),
+            ["dispatch", "help"]
+        );
+        assert!(
+            !serde_json::to_string(&tools)
+                .unwrap()
+                .contains("navigate_page")
+        );
+
+        let exposed = HashSet::from(["navigate_page".to_owned()]);
+        let request = CallToolRequestParams::new("dispatch")
+            .with_arguments(
+                json!({"action": "navigate_page", "arguments": {"url": "https://example.com"}})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+            .with_request_state("state-a");
+        let expanded = expand_dispatch(request, &exposed).unwrap();
+        assert_eq!(expanded.name, "navigate_page");
+        assert_eq!(expanded.arguments.unwrap()["url"], "https://example.com");
+        assert_eq!(expanded.request_state.as_deref(), Some("state-a"));
+    }
+
+    #[test]
+    fn progressive_interface_rejects_invalid_envelopes() {
+        let exposed = HashSet::from(["navigate_page".to_owned()]);
+        for arguments in [
+            json!({}),
+            json!({"action": "missing"}),
+            json!({"action": "navigate_page", "arguments": []}),
+            json!({"action": "navigate_page", "extra": true}),
+            json!({"action": "navigate_page", "arguments": {(SESSION_KEY): "forged"}}),
+        ] {
+            let request = CallToolRequestParams::new("dispatch")
+                .with_arguments(arguments.as_object().unwrap().clone());
+            assert!(expand_dispatch(request, &exposed).is_err());
+        }
+    }
+
+    #[test]
+    fn progressive_help_lists_names_and_loads_one_definition() {
+        let tools = vec![
+            Tool::new(
+                "navigate_page",
+                "Navigate",
+                json!({"type": "object", "properties": {"url": {"type": "string"}}})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+            Tool::new(
+                "click",
+                "Click",
+                json!({"type": "object"}).as_object().unwrap().clone(),
+            ),
+        ];
+        let listed = progressive_help(CallToolRequestParams::new("help"), &tools).unwrap();
+        assert!(
+            listed.content[0]
+                .as_text()
+                .unwrap()
+                .text
+                .contains("click, navigate_page")
+        );
+        let detailed = progressive_help(
+            CallToolRequestParams::new("help").with_arguments(
+                json!({"action": "navigate_page"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+            &tools,
+        )
+        .unwrap();
+        let definition: Value = serde_json::from_str(&detailed.content[0].as_text().unwrap().text)
+            .expect("detailed help JSON");
+        assert_eq!(definition["name"], "navigate_page");
+        assert_eq!(
+            definition["inputSchema"]["properties"]["url"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn connection_modes_round_trip_and_reject_invalid_combinations() {
+        for (routing, tool_interface, expected) in [
+            (RoutingMode::Connection, ToolInterface::Direct, 0),
+            (RoutingMode::Opencode, ToolInterface::Direct, 1),
+            (RoutingMode::Opencode, ToolInterface::Progressive, 2),
+        ] {
+            assert_eq!(connection_mode(routing, tool_interface).unwrap(), expected);
+            assert_eq!(
+                parse_connection_mode(expected).unwrap(),
+                (routing, tool_interface)
+            );
+        }
+        assert!(connection_mode(RoutingMode::Connection, ToolInterface::Progressive).is_err());
+        assert!(parse_connection_mode(3).is_err());
     }
 
     #[tokio::test]
