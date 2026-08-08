@@ -7,7 +7,7 @@ use std::{
     path::PathBuf,
     process::Stdio,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -15,6 +15,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, ValueEnum};
+use futures_util::{FutureExt, future::BoxFuture, future::Shared};
 use reqwest::{Client, Url, redirect::Policy};
 #[allow(deprecated)]
 use rmcp::model::{ListRootsResult, Root};
@@ -30,7 +31,7 @@ use rmcp::{
 use serde_json::{Value, json};
 use tokio::{
     process::{Child, Command},
-    sync::{Mutex, RwLock},
+    sync::{Mutex, RwLock, watch},
     time::{sleep, timeout},
 };
 use tracing::{error, info, warn};
@@ -123,7 +124,7 @@ fn default_browser_profile() -> PathBuf {
 mod cdp;
 mod daemon;
 mod persistence;
-use cdp::{TargetId, TargetTracker};
+use cdp::{SessionLayout, TargetId, TargetTracker};
 use persistence::{OwnershipPersistence, PersistedSession, RestoredState};
 
 #[derive(Debug, Parser)]
@@ -150,6 +151,13 @@ struct Config {
     release_session: Option<String>,
     #[arg(long, value_enum, default_value_t)]
     routing: RoutingMode,
+    #[arg(
+        long,
+        value_enum,
+        env = "OPENCODE_BROWSER_SESSION_LAYOUT",
+        default_value_t
+    )]
+    session_layout: SessionLayout,
     #[arg(long, env = "OPENCODE_BROWSER_SOCKET")]
     socket: Option<PathBuf>,
     #[arg(
@@ -200,7 +208,7 @@ impl Config {
         }
 
         let mut identity = Vec::new();
-        field(&mut identity, b"daemon-config-v2");
+        field(&mut identity, b"daemon-config-v3");
         field(&mut identity, env!("CARGO_PKG_VERSION").as_bytes());
         let executable = std::fs::metadata("/proc/self/exe")
             .context("failed to identify the browser MCP executable")?;
@@ -212,6 +220,13 @@ impl Config {
         );
         field(&mut identity, self.profile.as_os_str().as_bytes());
         field(&mut identity, &[self.disable_crash_reporter.into()]);
+        field(
+            &mut identity,
+            match self.session_layout {
+                SessionLayout::SharedWindow => b"shared-window",
+                SessionLayout::WindowPerSession => b"window-per-session",
+            },
+        );
         field(&mut identity, self.cdp_host.as_bytes());
         field(&mut identity, &self.cdp_port.to_be_bytes());
         field(&mut identity, &self.idle_minutes.to_be_bytes());
@@ -234,6 +249,20 @@ struct BrowserSupervisor {
 struct SupervisorState {
     process: Option<Child>,
     trusted_generation: Option<String>,
+}
+
+impl SupervisorState {
+    fn reap_exited_process(&mut self) -> Result<()> {
+        if let Some(child) = self.process.as_mut()
+            && child
+                .try_wait()
+                .context("failed to inspect browser process")?
+                .is_some()
+        {
+            self.process = None;
+        }
+        Ok(())
+    }
 }
 
 impl BrowserSupervisor {
@@ -289,24 +318,8 @@ impl BrowserSupervisor {
 
     async fn ensure_running(&self) -> Result<String> {
         let mut state = self.state.lock().await;
-        let endpoint = self.endpoint_identity().await?;
-        if let Some(child) = state.process.as_mut()
-            && child
-                .try_wait()
-                .context("failed to inspect browser process")?
-                .is_some()
-        {
-            state.process = None;
-        }
+        let endpoint = self.existing_trusted_endpoint(&mut state).await?;
         if let Some(identity) = endpoint {
-            if state.process.is_none()
-                && state.trusted_generation.as_deref() != Some(identity.as_str())
-            {
-                bail!(
-                    "refusing to adopt an unrecognized browser CDP endpoint at {}",
-                    self.config.browser_url()
-                );
-            }
             state.trusted_generation = Some(identity.clone());
             return Ok(identity);
         }
@@ -347,6 +360,29 @@ impl BrowserSupervisor {
                 Err(error)
             }
         }
+    }
+
+    async fn existing_trusted_endpoint(
+        &self,
+        state: &mut SupervisorState,
+    ) -> Result<Option<String>> {
+        state.reap_exited_process()?;
+        let endpoint = self.endpoint_identity().await?;
+        if let Some(identity) = endpoint.as_deref()
+            && state.process.is_none()
+            && state.trusted_generation.as_deref() != Some(identity)
+        {
+            bail!(
+                "refusing to adopt an unrecognized browser CDP endpoint at {}",
+                self.config.browser_url()
+            );
+        }
+        Ok(endpoint)
+    }
+
+    async fn trusted_endpoint(&self) -> Result<Option<String>> {
+        let mut state = self.state.lock().await;
+        self.existing_trusted_endpoint(&mut state).await
     }
 
     async fn wait_until_ready(&self) -> Result<String> {
@@ -435,6 +471,7 @@ impl ClientHandler for DownstreamClient {
 }
 
 type Downstream = RunningService<RoleClient, DownstreamClient>;
+type WorkerPool = Arc<Mutex<HashMap<PathBuf, Vec<Downstream>>>>;
 struct Session {
     persisted: PersistedSession,
     /// Worker-local numeric IDs are merely routes.  TargetTracker is the
@@ -443,30 +480,41 @@ struct Session {
     downstream: Option<Downstream>,
 }
 
-impl Session {
-    fn needs_cleanup(&self, now: u64, idle: Duration) -> bool {
-        self.persisted.cleanup_pending
-            || (!idle.is_zero()
-                && now.saturating_sub(self.persisted.last_activity_unix_seconds) >= idle.as_secs())
-    }
-}
-
 #[derive(Default)]
 struct PageState {
     local_to_tab: HashMap<u64, TargetId>,
 }
+#[derive(Default)]
 struct SessionSlotState {
-    lifecycle: AtomicU64,
+    revision: AtomicU64,
     session: Mutex<Option<Session>>,
 }
 type SessionSlot = Arc<SessionSlotState>;
 type Sessions = Mutex<HashMap<String, SessionSlot>>;
 
 impl SessionSlotState {
-    fn new(session: Option<Session>) -> Self {
-        Self {
-            lifecycle: AtomicU64::new(0),
-            session: Mutex::new(session),
+    fn available_revision(&self) -> Option<u64> {
+        let revision = self.revision.load(Ordering::SeqCst);
+        (revision & 1 == 0).then_some(revision)
+    }
+
+    fn cleanup_requested(&self) -> bool {
+        self.revision.load(Ordering::SeqCst) & 1 == 1
+    }
+
+    fn request_cleanup(&self) {
+        self.revision.fetch_or(1, Ordering::SeqCst);
+    }
+
+    fn finish_cleanup(&self) {
+        let revision = self.revision.load(Ordering::SeqCst);
+        if revision & 1 == 1 {
+            let _ = self.revision.compare_exchange(
+                revision,
+                revision.wrapping_add(1),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
         }
     }
 }
@@ -481,10 +529,10 @@ fn unix_time_seconds() -> Result<u64> {
 async fn restore_sessions(
     tracker: &TargetTracker,
     persistence: &OwnershipPersistence,
-    restored: RestoredState,
-) -> Result<HashMap<String, SessionSlot>> {
+    restored: HashMap<String, PersistedSession>,
+) -> Result<HashMap<String, Session>> {
     let mut sessions = HashMap::new();
-    for (id, mut persisted) in restored.sessions {
+    for (id, mut persisted) in restored {
         let owned = tracker.owned_tabs(&id).await?;
         if owned.is_empty() {
             continue;
@@ -498,32 +546,30 @@ async fn restore_sessions(
             .filter(|tab| owned.iter().any(|owned| owned == tab));
         sessions.insert(
             id,
-            Arc::new(SessionSlotState::new(Some(Session {
+            Session {
                 persisted: PersistedSession {
                     current_tab,
                     ..persisted
                 },
                 pages: PageState::default(),
                 downstream: None,
-            }))),
+            },
         );
     }
     Ok(sessions)
 }
 
-async fn restore_tracker(
+async fn connect_tracker(
     identity: String,
     persistence: Arc<OwnershipPersistence>,
-) -> Result<(TargetTracker, RestoredState)> {
-    let restored = persistence.activate_generation(&identity)?;
-    let tracker = TargetTracker::connect(
-        identity,
-        persistence,
-        restored.owners.clone(),
-        restored.owner_revision,
-    )
-    .await?;
-    Ok((tracker, restored))
+) -> Result<(TargetTracker, HashMap<String, PersistedSession>)> {
+    let RestoredState {
+        owners,
+        sessions,
+        owner_revision,
+    } = persistence.activate_generation(&identity)?;
+    let tracker = TargetTracker::connect(identity, persistence, owners, owner_revision).await?;
+    Ok((tracker, sessions))
 }
 
 async fn spawn_downstream(config: &Config, workspace: &std::path::Path) -> Result<Downstream> {
@@ -563,90 +609,172 @@ async fn stop_worker(worker: Downstream) -> Result<()> {
     Ok(())
 }
 
+async fn recycle_worker(pool: &WorkerPool, workspace: PathBuf, worker: Downstream) {
+    if worker.is_closed() {
+        return;
+    }
+    let mut pool = pool.lock().await;
+    if pool.values().map(Vec::len).sum::<usize>() < MAX_POOLED_WORKERS {
+        pool.entry(workspace).or_default().push(worker);
+        return;
+    }
+    drop(pool);
+    if let Err(error) = stop_worker(worker).await {
+        warn!(%error, "failed to stop excess pooled Chrome DevTools MCP worker");
+    }
+}
+
+struct ToolCatalog {
+    tools: Vec<Tool>,
+    page_scoped: HashSet<String>,
+}
+type CatalogResult = std::result::Result<Arc<ToolCatalog>, Arc<str>>;
+type CatalogFuture = Shared<BoxFuture<'static, CatalogResult>>;
+
+struct CatalogLoader {
+    config: Arc<Config>,
+    worker_pool: WorkerPool,
+    future: OnceLock<CatalogFuture>,
+    cancel: watch::Sender<bool>,
+}
+
+impl CatalogLoader {
+    async fn get(&self) -> Result<Arc<ToolCatalog>> {
+        let future = self
+            .future
+            .get_or_init(|| {
+                let config = self.config.clone();
+                let worker_pool = self.worker_pool.clone();
+                let cancel = self.cancel.subscribe();
+                let future = async move {
+                    let result = discover_catalog(&config, &worker_pool, cancel).await;
+                    if let Err(error) = &result {
+                        warn!(%error, "Chrome DevTools tool catalog initialization failed");
+                    }
+                    result
+                        .map(Arc::new)
+                        .map_err(|error| Arc::from(error.to_string()))
+                }
+                .boxed()
+                .shared();
+                let background = future.clone();
+                tokio::spawn(async move { drop(background.await) });
+                future
+            })
+            .clone();
+        future.await.map_err(|error| anyhow!(error.to_string()))
+    }
+
+    fn cancel(&self) {
+        self.cancel.send_replace(true);
+    }
+
+    async fn shutdown(&self) {
+        self.cancel();
+        if let Some(future) = self.future.get() {
+            drop(future.clone().await);
+        }
+    }
+}
+
+async fn discover_catalog(
+    config: &Config,
+    worker_pool: &WorkerPool,
+    mut cancel: watch::Receiver<bool>,
+) -> Result<ToolCatalog> {
+    async fn cancelled(cancel: &mut watch::Receiver<bool>) {
+        if *cancel.borrow() {
+            return;
+        }
+        let _ = cancel.changed().await;
+    }
+
+    if *cancel.borrow() {
+        bail!("Chrome DevTools tool catalog initialization stopped");
+    }
+    let workspace = std::env::current_dir().context("failed to determine the daemon workspace")?;
+    let worker = tokio::select! {
+        biased;
+        _ = cancelled(&mut cancel) => bail!("Chrome DevTools tool catalog initialization stopped"),
+        result = spawn_downstream(config, &workspace) => result?,
+    };
+    let listed = tokio::select! {
+        biased;
+        _ = cancelled(&mut cancel) => {
+            stop_worker(worker).await?;
+            bail!("Chrome DevTools tool catalog initialization stopped");
+        },
+        result = timeout(WORKER_START_TIMEOUT, worker.list_all_tools()) => result
+            .map_err(|_| anyhow!("timed out retrieving Chrome DevTools tools"))
+            .and_then(|result| result.context("failed to retrieve Chrome DevTools tools")),
+    };
+    let listed = match listed {
+        Ok(listed) => listed,
+        Err(error) => {
+            stop_worker(worker).await?;
+            return Err(error);
+        }
+    };
+    let mut page_scoped = HashSet::new();
+    let mut has_get_tab_id = false;
+    let mut tools = Vec::with_capacity(listed.len());
+    for mut tool in listed {
+        if tool.name == "select_page" || tool.name == "get_tab_id" {
+            has_get_tab_id |= tool.name == "get_tab_id";
+            continue;
+        }
+        let mut schema = (*tool.input_schema).clone();
+        if remove_schema_property(&mut schema, "pageId") {
+            page_scoped.insert(tool.name.to_string());
+        }
+        tool.input_schema = Arc::new(schema);
+        tools.push(tool);
+    }
+    if !has_get_tab_id {
+        stop_worker(worker).await?;
+        bail!("Chrome DevTools MCP does not provide required get_tab_id capability");
+    }
+    recycle_worker(worker_pool, workspace, worker).await;
+    Ok(ToolCatalog { tools, page_scoped })
+}
+
 #[derive(Clone)]
 struct BrowserProxy {
     config: Arc<Config>,
     supervisor: Arc<BrowserSupervisor>,
-    tools: Arc<Vec<Tool>>,
-    page_scoped: Arc<HashSet<String>>,
+    catalog: Arc<CatalogLoader>,
     sessions: Arc<Sessions>,
-    worker_pool: Arc<Mutex<HashMap<PathBuf, Vec<Downstream>>>>,
-    release_requested: Arc<Mutex<HashSet<String>>>,
-    tracker: Arc<RwLock<TargetTracker>>,
+    worker_pool: WorkerPool,
+    tracker: Arc<RwLock<Option<TargetTracker>>>,
     idle: Duration,
     operation_timeout: Duration,
     persistence: Arc<OwnershipPersistence>,
 }
 
 impl BrowserProxy {
-    async fn new(config: Arc<Config>, persistence: Arc<OwnershipPersistence>) -> Result<Self> {
+    fn new(config: Arc<Config>, persistence: Arc<OwnershipPersistence>) -> Result<Self> {
         let supervisor = Arc::new(BrowserSupervisor::new(
             config.clone(),
             persistence.generation(),
         )?);
-        // The tracker must be connected before tool discovery: discovery is a
-        // browser operation too and must use the same endpoint generation.
-        let identity = supervisor.ensure_running().await?;
-        let (tracker, restored) = restore_tracker(identity, persistence.clone()).await?;
-        let workspace =
-            std::env::current_dir().context("failed to determine the daemon workspace")?;
-        let worker = spawn_downstream(&config, &workspace).await?;
-        let listed = timeout(WORKER_START_TIMEOUT, worker.list_all_tools())
-            .await
-            .map_err(|_| anyhow!("timed out retrieving Chrome DevTools tools"))
-            .and_then(|result| result.context("failed to retrieve Chrome DevTools tools"));
-        let listed = match listed {
-            Ok(listed) => listed,
-            Err(error) => {
-                stop_worker(worker).await?;
-                return Err(error);
-            }
-        };
-        let mut page_scoped = HashSet::new();
-        let mut has_get_tab_id = false;
-        let mut tools = Vec::with_capacity(listed.len());
-        for mut tool in listed {
-            if tool.name == "select_page" || tool.name == "get_tab_id" {
-                has_get_tab_id |= tool.name == "get_tab_id";
-                continue;
-            }
-            let mut schema = (*tool.input_schema).clone();
-            if remove_schema_property(&mut schema, "pageId") {
-                page_scoped.insert(tool.name.to_string());
-            }
-            tool.input_schema = Arc::new(schema);
-            tools.push(tool);
-        }
-        if !has_get_tab_id {
-            stop_worker(worker).await?;
-            bail!("Chrome DevTools MCP does not provide required get_tab_id capability");
-        }
-        let sessions = restore_sessions(&tracker, &persistence, restored).await?;
-        let release_requested = sessions
-            .iter()
-            .filter_map(|(id, slot)| {
-                slot.session.try_lock().ok().and_then(|session| {
-                    session
-                        .as_ref()
-                        .is_some_and(|session| session.persisted.cleanup_pending)
-                        .then(|| id.clone())
-                })
-            })
-            .collect();
-        let proxy = Self {
+        let worker_pool = Arc::new(Mutex::new(HashMap::new()));
+        let (catalog_cancel, _) = watch::channel(false);
+        Ok(Self {
             config: config.clone(),
             supervisor,
-            tools: Arc::new(tools),
-            page_scoped: Arc::new(page_scoped),
-            sessions: Arc::new(Mutex::new(sessions)),
-            worker_pool: Arc::new(Mutex::new(HashMap::from([(workspace, vec![worker])]))),
-            release_requested: Arc::new(Mutex::new(release_requested)),
-            tracker: Arc::new(RwLock::new(tracker)),
+            catalog: Arc::new(CatalogLoader {
+                config: config.clone(),
+                worker_pool: worker_pool.clone(),
+                future: OnceLock::new(),
+                cancel: catalog_cancel,
+            }),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            worker_pool,
+            tracker: Arc::new(RwLock::new(None)),
             idle: Duration::from_secs(config.idle_minutes.saturating_mul(60)),
             operation_timeout: Duration::from_secs(config.operation_seconds),
             persistence,
-        };
-        Ok(proxy)
+        })
     }
 
     fn cleanup_cadence(&self) -> Duration {
@@ -687,21 +815,6 @@ impl BrowserProxy {
         }
     }
 
-    async fn recycle_worker(&self, workspace: PathBuf, worker: Downstream) {
-        if worker.is_closed() {
-            return;
-        }
-        let mut pool = self.worker_pool.lock().await;
-        if pool.values().map(Vec::len).sum::<usize>() < MAX_POOLED_WORKERS {
-            pool.entry(workspace).or_default().push(worker);
-            return;
-        }
-        drop(pool);
-        if let Err(error) = stop_worker(worker).await {
-            warn!(%error, "failed to stop excess pooled Chrome DevTools MCP worker");
-        }
-    }
-
     async fn stop_pooled_workers(&self) {
         let pooled = self
             .worker_pool
@@ -717,39 +830,79 @@ impl BrowserProxy {
         }
     }
 
+    async fn tracker_is_current(&self, tracker: Option<&TargetTracker>) -> Result<bool> {
+        let Some(tracker) = tracker else {
+            return Ok(false);
+        };
+        if self.supervisor.endpoint_identity().await?.as_deref() != Some(tracker.generation()) {
+            return Ok(false);
+        }
+        Ok(tracker.is_available().await)
+    }
+
     async fn tracker_lease(&self) -> Result<tokio::sync::RwLockReadGuard<'_, TargetTracker>> {
         loop {
             let read = self.tracker.read().await;
-            if let Some(identity) = self.supervisor.endpoint_identity().await?
-                && read.generation() == identity
-                && read.is_available().await
-            {
-                return Ok(read);
+            if self.tracker_is_current(read.as_ref()).await? {
+                return Ok(tokio::sync::RwLockReadGuard::map(read, |tracker| {
+                    tracker.as_ref().expect("tracker was checked")
+                }));
             }
             drop(read);
-            let mut write = self.tracker.write().await;
+            let mut current = self.tracker.write().await;
+            if self.tracker_is_current(current.as_ref()).await? {
+                continue;
+            }
+
             let identity = self.supervisor.ensure_running().await?;
-            let generation_changed = write.generation() != identity;
-            let tracker_unavailable = !generation_changed && !write.is_available().await;
-            if generation_changed || tracker_unavailable {
+            let cold = current.is_none();
+            let generation_changed = current
+                .as_ref()
+                .is_some_and(|tracker| tracker.generation() != identity);
+            if let Some(previous) = current.as_ref() {
                 if generation_changed {
                     warn!("browser endpoint identity changed; retiring all session workers");
+                    self.retire_all_sessions().await;
                 } else {
                     warn!("CDP target tracker disconnected; restoring target ownership");
                 }
-                if generation_changed {
-                    self.retire_all_sessions().await;
-                }
-                write.shutdown().await;
-                let (tracker, _) =
-                    restore_tracker(identity.clone(), self.persistence.clone()).await?;
-                *write = tracker;
+                previous.shutdown().await;
             }
+
+            let (tracker, restored) = connect_tracker(identity, self.persistence.clone()).await?;
+            tracker.synchronize().await?;
+            if cold || generation_changed {
+                let sessions = restore_sessions(&tracker, &self.persistence, restored).await?;
+                let mut current_sessions = self.sessions.lock().await;
+                if current_sessions.values().any(|slot| {
+                    !slot
+                        .session
+                        .try_lock()
+                        .is_ok_and(|session| session.is_none())
+                }) {
+                    error!("cold browser runtime unexpectedly has live session slots");
+                    bail!("cannot restore browser sessions over live session state");
+                }
+                for (id, session) in sessions {
+                    let slot = current_sessions.entry(id).or_insert_with(Arc::default);
+                    if session.persisted.cleanup_pending {
+                        slot.request_cleanup();
+                    }
+                    *slot.session.try_lock().expect("session slots were checked") = Some(session);
+                }
+            }
+            *current = Some(tracker);
         }
     }
 
     async fn retire_all_sessions(&self) {
-        let slots = self.sessions.lock().await.drain().collect::<Vec<_>>();
+        let slots = self
+            .sessions
+            .lock()
+            .await
+            .iter()
+            .map(|(id, slot)| (id.clone(), slot.clone()))
+            .collect::<Vec<_>>();
         for (id, slot) in slots {
             if let Some(session) = slot.session.lock().await.take() {
                 // Targets belong to the previous endpoint, so never close them here.
@@ -757,14 +910,15 @@ impl BrowserProxy {
             }
         }
         self.stop_pooled_workers().await;
-        self.release_requested.lock().await.clear();
+        let mut sessions = self.sessions.lock().await;
+        sessions.retain(|_, slot| Arc::strong_count(slot) > 1);
     }
 
     async fn slot(&self, id: &str) -> SessionSlot {
         let mut sessions = self.sessions.lock().await;
         sessions
             .entry(id.to_owned())
-            .or_insert_with(|| Arc::new(SessionSlotState::new(None)))
+            .or_insert_with(Arc::default)
             .clone()
     }
 
@@ -785,25 +939,29 @@ impl BrowserProxy {
 
     async fn route_call(
         &self,
+        catalog: &ToolCatalog,
         workspace: &std::path::Path,
         id: &str,
         request: CallToolRequestParams,
     ) -> Result<CallToolResult> {
-        if browser_tool(&self.tools, request.name.as_ref()).is_none() {
+        if browser_tool(&catalog.tools, request.name.as_ref()).is_none() {
             bail!("browser tool is not exposed: {}", request.name);
         }
-        let tracker_lease = self.tracker_lease().await?; // Must outlive every browser operation below.
-        let tracker = &*tracker_lease;
         let slot = self.slot(id).await;
-        let lifecycle = slot.lifecycle.load(Ordering::SeqCst);
-        if self.release_requested.lock().await.contains(id) {
+        let Some(revision) = slot.available_revision() else {
             self.prune_slot(id, &slot).await;
             bail!("browser session is pending owned-tab cleanup");
-        }
+        };
+        let tracker_lease = match self.tracker_lease().await {
+            Ok(tracker) => tracker,
+            Err(error) => {
+                self.prune_slot(id, &slot).await;
+                return Err(error);
+            }
+        }; // Must outlive every browser operation below.
+        let tracker = &*tracker_lease;
         let mut guard = slot.session.lock().await;
-        if slot.lifecycle.load(Ordering::SeqCst) != lifecycle
-            || self.release_requested.lock().await.contains(id)
-        {
+        if slot.available_revision() != Some(revision) {
             drop(guard);
             self.prune_slot(id, &slot).await;
             bail!("browser session is pending owned-tab cleanup");
@@ -833,7 +991,7 @@ impl BrowserProxy {
                         pages: PageState::default(),
                         downstream: Some(downstream),
                     };
-                    if self.release_requested.lock().await.contains(id) {
+                    if slot.cleanup_requested() {
                         session.persisted.cleanup_pending = true;
                     }
                     *guard = Some(session);
@@ -877,6 +1035,7 @@ impl BrowserProxy {
         let closes_page = request.name == "close_page";
         let mut result = self
             .call_session(
+                catalog,
                 tracker,
                 id,
                 guard.as_mut().expect("session was just started"),
@@ -900,8 +1059,7 @@ impl BrowserProxy {
         {
             result = Err(error.context("failed to finalize closed browser session"));
         }
-        let release_requested = self.release_requested.lock().await.contains(id);
-        if release_requested {
+        if slot.cleanup_requested() {
             let recycle_worker = result.is_ok();
             let retirement = if guard.is_some() {
                 self.retire_session(id, tracker, &mut guard, recycle_worker)
@@ -911,7 +1069,7 @@ impl BrowserProxy {
             };
             match retirement {
                 Ok(()) => {
-                    self.release_requested.lock().await.remove(id);
+                    slot.finish_cleanup();
                 }
                 Err(error) => {
                     warn!(%error, session_id = %id, "requested browser session retirement failed");
@@ -935,7 +1093,29 @@ impl BrowserProxy {
         if id.is_empty() || id.len() > MAX_SESSION_ID_BYTES {
             bail!("invalid browser session identifier");
         }
-        let Some(slot) = self.sessions.lock().await.get(id).cloned() else {
+        let mut slot = self.sessions.lock().await.get(id).cloned();
+        if let Some(slot) = slot.as_ref() {
+            slot.request_cleanup();
+        }
+        let persisted = self.persistence.request_cleanup(id)?;
+        if self.tracker.read().await.is_none() {
+            if let Some(current) = slot.as_ref() {
+                self.prune_slot(id, current).await;
+                slot = self.sessions.lock().await.get(id).cloned();
+            }
+            if slot.is_none() && !persisted {
+                return Ok(());
+            }
+            if persisted {
+                // Cleanup of a concrete persisted session may recover a
+                // surviving browser generation; empty placeholders do not.
+                drop(self.tracker_lease().await?);
+            }
+        }
+        if slot.is_none() {
+            slot = self.sessions.lock().await.get(id).cloned();
+        }
+        let Some(slot) = slot else {
             let tracker_lease = self.tracker_lease().await?;
             let tracker = &*tracker_lease;
             if !tracker.owned_tabs(id).await?.is_empty() {
@@ -944,9 +1124,8 @@ impl BrowserProxy {
             }
             return Ok(());
         };
-        self.release_requested.lock().await.insert(id.to_owned());
-        slot.lifecycle.fetch_add(1, Ordering::SeqCst);
-        if !self.persistence.request_cleanup(id)? {
+        slot.request_cleanup();
+        if !persisted {
             warn!(session_id = %id, "browser session release arrived before its state was persisted");
         }
         let tracker_lease = self.tracker_lease().await?;
@@ -959,13 +1138,13 @@ impl BrowserProxy {
                 error!(session_id = %id, "browser ownership exists without live session state");
                 bail!("browser ownership exists without live session state");
             }
-            self.release_requested.lock().await.remove(id);
+            slot.finish_cleanup();
             drop(guard);
             self.prune_slot(id, &slot).await;
             return Ok(());
         }
         self.retire_session(id, tracker, &mut guard, true).await?;
-        self.release_requested.lock().await.remove(id);
+        slot.finish_cleanup();
         drop(guard);
         self.prune_slot(id, &slot).await;
         Ok(())
@@ -976,7 +1155,7 @@ impl BrowserProxy {
         id: &str,
         tracker: &TargetTracker,
         slot: &mut Option<Session>,
-        recycle_worker: bool,
+        reuse_worker: bool,
     ) -> Result<()> {
         let session = slot
             .as_mut()
@@ -985,9 +1164,13 @@ impl BrowserProxy {
         session.pages = PageState::default();
         let closed = self.close_owned_pages(id, tracker).await;
         if let Some(worker) = session.downstream.take() {
-            if recycle_worker {
-                self.recycle_worker(session.persisted.workspace.clone(), worker)
-                    .await;
+            if reuse_worker {
+                recycle_worker(
+                    &self.worker_pool,
+                    session.persisted.workspace.clone(),
+                    worker,
+                )
+                .await;
             } else if let Err(error) = stop_worker(worker).await {
                 warn!(%error, session_id = %id, "failed to stop retiring Chrome DevTools MCP worker");
             }
@@ -1009,17 +1192,16 @@ impl BrowserProxy {
         id: &str,
         tracker: &TargetTracker,
         slot: &mut Option<Session>,
-        recycle_worker: bool,
+        reuse_worker: bool,
     ) -> Result<()> {
         tracker.finalize_session(id).await?;
         let persisted = self.persistence.remove_session_if_unowned(id);
         let session = slot
             .take()
             .ok_or_else(|| anyhow!("browser session disappeared during finalization"))?;
-        if recycle_worker {
+        if reuse_worker {
             if let Some(worker) = session.downstream {
-                self.recycle_worker(session.persisted.workspace, worker)
-                    .await;
+                recycle_worker(&self.worker_pool, session.persisted.workspace, worker).await;
             }
         } else {
             self.stop_session(id, session).await;
@@ -1044,6 +1226,7 @@ impl BrowserProxy {
 
     async fn call_session(
         &self,
+        catalog: &ToolCatalog,
         tracker: &TargetTracker,
         id: &str,
         session: &mut Session,
@@ -1065,7 +1248,7 @@ impl BrowserProxy {
             }
             _ => {
                 let page = self.ensure_page(tracker, id, session).await?;
-                if self.page_scoped.contains(request.name.as_ref()) {
+                if catalog.page_scoped.contains(request.name.as_ref()) {
                     request
                         .arguments
                         .get_or_insert_default()
@@ -1250,7 +1433,13 @@ impl BrowserProxy {
             None => false,
         };
         let tab = tracker
-            .create_owned_tab(id, INTERNAL_URL, background)
+            .create_owned_tab(
+                id,
+                INTERNAL_URL,
+                background,
+                self.config.session_layout,
+                session.persisted.current_tab.as_deref(),
+            )
             .await?;
         let established = timeout(WORKER_STOP_TIMEOUT, async {
             loop {
@@ -1311,6 +1500,7 @@ impl BrowserProxy {
         )
         .await
     }
+
     async fn close_page(
         &self,
         tracker: &TargetTracker,
@@ -1351,6 +1541,12 @@ impl BrowserProxy {
     }
     async fn cleanup_idle_sessions(&self) -> Result<()> {
         let now = unix_time_seconds()?;
+        if self.tracker.read().await.is_none() && self.persistence.cleanup_due(now, self.idle) {
+            let endpoint = self.supervisor.endpoint_identity().await?;
+            if endpoint.as_deref() == self.persistence.generation().as_deref() {
+                drop(self.tracker_lease().await?);
+            }
+        }
         let slots = self
             .sessions
             .lock()
@@ -1358,36 +1554,30 @@ impl BrowserProxy {
             .iter()
             .map(|(id, slot)| (id.clone(), slot.clone()))
             .collect::<Vec<_>>();
-        let mut idle_slots = Vec::new();
-        for (id, slot) in slots {
-            let Ok(guard) = slot.session.try_lock() else {
-                continue;
-            };
-            if guard
-                .as_ref()
-                .is_some_and(|session| session.needs_cleanup(now, self.idle))
-            {
-                idle_slots.push((id, slot.clone()));
-            }
-        }
-        if idle_slots.is_empty() {
+        if !slots.iter().any(|(_, slot)| {
+            slot.session.try_lock().is_ok_and(|session| {
+                session.as_ref().is_some_and(|session| {
+                    slot.cleanup_requested() || session.persisted.needs_cleanup(now, self.idle)
+                })
+            })
+        }) {
             return Ok(());
         }
         let tracker_lease = self.tracker_lease().await?;
         let tracker = &*tracker_lease;
-        for (id, slot) in idle_slots {
+        for (id, slot) in slots {
             let Ok(mut guard) = slot.session.try_lock() else {
                 continue;
             };
             let Some(session) = guard.as_mut() else {
                 continue;
             };
-            if !session.needs_cleanup(now, self.idle) {
+            if !slot.cleanup_requested() && !session.persisted.needs_cleanup(now, self.idle) {
                 continue;
             }
             match self.retire_session(&id, tracker, &mut guard, true).await {
                 Ok(()) => {
-                    self.release_requested.lock().await.remove(&id);
+                    slot.finish_cleanup();
                     info!(session_id = %id, "cleaned up idle browser session");
                 }
                 Err(error) => {
@@ -1401,6 +1591,7 @@ impl BrowserProxy {
     }
 
     async fn shutdown(&self) -> Result<()> {
+        self.catalog.shutdown().await;
         let slots = self.sessions.lock().await.drain().collect::<Vec<_>>();
         let mut sessions = Vec::new();
         for (id, slot) in slots {
@@ -1415,7 +1606,16 @@ impl BrowserProxy {
         )
         .await;
         self.stop_pooled_workers().await;
-        let tracker = self.tracker.read().await.clone();
+        let tracker = match self.tracker.write().await.take() {
+            Some(tracker) => tracker,
+            None => {
+                let Some(identity) = self.supervisor.trusted_endpoint().await? else {
+                    self.supervisor.wait_for_browser_exit().await?;
+                    return Ok(());
+                };
+                connect_tracker(identity, self.persistence.clone()).await?.0
+            }
+        };
         let generation = tracker.generation().to_owned();
         if let Err(error) = tracker.close_browser().await {
             warn!(%error, "failed to request browser shutdown through CDP");
@@ -1764,52 +1964,5 @@ mod tests {
             Some("tab-a")
         );
         assert!(!state.local_to_tab.contains_key(&4));
-    }
-
-    #[test]
-    fn restored_session_uses_persisted_activity_for_idle_cleanup() {
-        let session = Session {
-            persisted: PersistedSession {
-                workspace: PathBuf::from("/workspace"),
-                current_tab: None,
-                last_activity_unix_seconds: 100,
-                cleanup_pending: false,
-            },
-            pages: PageState::default(),
-            downstream: None,
-        };
-        assert!(!session.needs_cleanup(120, Duration::from_secs(60)));
-        assert!(session.needs_cleanup(160, Duration::from_secs(60)));
-    }
-
-    #[test]
-    fn failed_session_is_immediately_cleanup_eligible() {
-        let session = Session {
-            persisted: PersistedSession {
-                workspace: PathBuf::from("/workspace"),
-                current_tab: None,
-                last_activity_unix_seconds: 100,
-                cleanup_pending: true,
-            },
-            pages: PageState::default(),
-            downstream: None,
-        };
-        assert!(session.needs_cleanup(100, Duration::from_secs(60)));
-        assert!(session.needs_cleanup(100, Duration::ZERO));
-    }
-
-    #[test]
-    fn disabled_idle_expiration_does_not_retire_healthy_sessions() {
-        let session = Session {
-            persisted: PersistedSession {
-                workspace: PathBuf::from("/workspace"),
-                current_tab: None,
-                last_activity_unix_seconds: 1,
-                cleanup_pending: false,
-            },
-            pages: PageState::default(),
-            downstream: None,
-        };
-        assert!(!session.needs_cleanup(u64::MAX, Duration::ZERO));
     }
 }

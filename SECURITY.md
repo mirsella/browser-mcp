@@ -23,6 +23,8 @@ All browser sessions share one user-data directory. This includes cookies,
 authentication, local storage, cache, extensions, permissions, history, and
 downloads. A session cannot inspect another session's tabs through the broker,
 but websites can still communicate through shared browser data and origins.
+The optional per-session window layout is visual organization only and does not
+create another security boundary.
 
 Browser content is untrusted input. Pages can include text designed to alter an
 agent's behavior. The broker preserves structured output where upstream tools

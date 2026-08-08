@@ -11,6 +11,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use clap::ValueEnum;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::{
@@ -25,6 +26,13 @@ use crate::persistence::OwnershipPersistence;
 pub(crate) type TargetId = String;
 type BrowserSessionId = String;
 const TRACKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+pub(crate) enum SessionLayout {
+    #[default]
+    SharedWindow,
+    WindowPerSession,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TargetRecord {
@@ -301,13 +309,14 @@ pub struct TargetTracker {
     state: Arc<Mutex<State>>,
     commands: mpsc::Sender<Command>,
     synchronize_lock: Arc<Mutex<()>>,
+    tab_creation: Arc<Mutex<()>>,
     persistence: Arc<OwnershipPersistence>,
     control: Arc<TrackerControl>,
 }
 
 impl TargetTracker {
-    /// Connects to a browser-level `webSocketDebuggerUrl` and performs an
-    /// initial discovery snapshot. The URL itself is the generation token.
+    /// Connects to a browser-level `webSocketDebuggerUrl`. The URL itself is
+    /// the generation token; callers choose when to synchronize target state.
     pub async fn connect(
         websocket_url: impl Into<String>,
         persistence: Arc<OwnershipPersistence>,
@@ -342,6 +351,7 @@ impl TargetTracker {
             state,
             commands,
             synchronize_lock: Arc::new(Mutex::new(())),
+            tab_creation: Arc::new(Mutex::new(())),
             persistence,
             control: Arc::new(TrackerControl {
                 shutdown,
@@ -350,7 +360,6 @@ impl TargetTracker {
                 stopped,
             }),
         };
-        tracker.synchronize().await?;
         Ok(tracker)
     }
 
@@ -444,11 +453,10 @@ impl TargetTracker {
 
     /// Explicitly assigns one exact browser `tab` to a browser session.
     /// Existing ownership is never overwritten.
-    async fn claim_root_tab(&self, session: impl Into<BrowserSessionId>, tab: &str) -> Result<()> {
-        let session = session.into();
+    async fn claim_root_tab(&self, session: &str, tab: &str) -> Result<()> {
         let mut state = self.available().await?;
         let previous = state.owners.clone();
-        state.claim_tab(&session, tab)?;
+        state.claim_tab(session, tab)?;
         let snapshot = state.ownership_snapshot_if_changed(&previous);
         drop(state);
         if let Some((revision, owners)) = snapshot
@@ -528,22 +536,54 @@ impl TargetTracker {
     /// ownership from another client's page-list delta.
     pub async fn create_owned_tab(
         &self,
-        session: impl Into<BrowserSessionId>,
+        session: &str,
         url: &str,
         background: bool,
+        layout: SessionLayout,
+        preferred_anchor: Option<&str>,
     ) -> Result<TargetId> {
-        let session = session.into();
         let state = self.available().await?;
-        if state.retired_sessions.contains(&session) {
+        if state.retired_sessions.contains(session) {
             bail!("browser session {session} is retiring");
         }
         drop(state);
+        let (_creation, anchor) = match layout {
+            SessionLayout::SharedWindow => (None, None),
+            SessionLayout::WindowPerSession => {
+                let creation = self.tab_creation.lock().await;
+                let owned = self.owned_tabs(session).await?;
+                let anchor = preferred_anchor
+                    .filter(|preferred| owned.iter().any(|tab| tab == preferred))
+                    .map(str::to_owned)
+                    .or_else(|| owned.into_iter().next());
+                (Some(creation), anchor)
+            }
+        };
+        let new_window = _creation.is_some() && anchor.is_none();
+        let expected_window = if let Some(anchor) = anchor.as_deref() {
+            let window = match self.target_window(anchor).await {
+                Ok(window) => Some(window),
+                Err(error) => {
+                    warn!(%error, session_id = %session, tab = anchor, "could not identify session window before tab creation");
+                    None
+                }
+            };
+            if let Err(error) = self
+                .command("Target.activateTarget", json!({"targetId": anchor}), None)
+                .await
+            {
+                warn!(%error, session_id = %session, tab = anchor, "could not activate session window before tab creation");
+            }
+            window
+        } else {
+            None
+        };
+        let mut parameters = json!({"url": url, "background": background, "forTab": true});
+        if new_window {
+            parameters["newWindow"] = Value::Bool(true);
+        }
         let result = self
-            .command(
-                "Target.createTarget",
-                json!({"url": url, "background": background, "forTab": true}),
-                None,
-            )
+            .command("Target.createTarget", parameters, None)
             .await?;
         let tab = result
             .get("targetId")
@@ -566,7 +606,28 @@ impl TargetTracker {
             self.fail_closed().await;
             return Err(error);
         }
+        drop(_creation);
+        if let Some(expected_window) = expected_window {
+            match self.target_window(&tab).await {
+                Ok(actual_window) if actual_window != expected_window => {
+                    warn!(session_id = %session, tab, expected_window, actual_window, "browser placed new tab outside the session window");
+                }
+                Ok(_) => {}
+                Err(error) if self.is_available().await => {
+                    warn!(%error, session_id = %session, tab, "could not verify new tab window placement")
+                }
+                Err(error) => return Err(error),
+            }
+        }
         Ok(tab)
+    }
+
+    async fn target_window(&self, tab: &str) -> Result<i64> {
+        self.command("Browser.getWindowForTarget", json!({"targetId": tab}), None)
+            .await?
+            .get("windowId")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| anyhow!("Browser.getWindowForTarget returned no windowId for {tab}"))
     }
 
     pub async fn wait_until_gone(&self, tab: &str, duration: Duration) -> Result<()> {

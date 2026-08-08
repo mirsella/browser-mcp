@@ -229,9 +229,7 @@ async fn run_daemon(config: Arc<Config>, paths: RuntimePaths, identity: Arc<[u8]
     let persistence = OwnershipPersistence::open(paths.state.clone())?;
     let signal = shutdown_signal();
     tokio::pin!(signal);
-    // Initialization owns a kill-on-drop browser child. Finish it rather than
-    // cancelling midway and process any queued signal through normal shutdown.
-    let proxy = BrowserProxy::new(config, persistence).await?;
+    let proxy = BrowserProxy::new(config, persistence)?;
     // Keep the socket unpublished until initialization succeeds so clients
     // cannot connect to a daemon that has not become ready yet.
     let listener = tokio::select! {
@@ -294,6 +292,7 @@ async fn run_daemon(config: Arc<Config>, paths: RuntimePaths, identity: Arc<[u8]
     }
     drop(listener);
     drop(socket_guard);
+    proxy.catalog.cancel();
     cleanup.abort();
     let _ = cleanup.await;
     let deadline = Instant::now() + DRAIN_TIMEOUT;
@@ -732,7 +731,13 @@ impl ServerHandler for Connection {
         let tools = if self.routing.compact() {
             compact_tools()
         } else {
-            self.proxy.tools.as_ref().clone()
+            self.proxy
+                .catalog
+                .get()
+                .await
+                .map_err(|error| rmcp::ErrorData::internal_error(error.to_string(), None))?
+                .tools
+                .clone()
         };
         Ok(ListToolsResult::with_all_items(tools))
     }
@@ -759,18 +764,21 @@ impl ServerHandler for Connection {
             },
             None => None,
         };
-        let result = match self.routing.route(request) {
-            Ok((id, request)) => match (self.routing.compact(), request.name.as_ref()) {
-                (false, _) => self.proxy.route_call(&self.workspace, &id, request).await,
-                (true, "dispatch") => match expand_dispatch(request, &self.proxy.tools) {
-                    Ok(request) => self.proxy.route_call(&self.workspace, &id, request).await,
-                    Err(error) => Err(error),
-                },
-                (true, "help") => compact_help(request, &self.proxy.tools),
-                (true, _) => unreachable!("compact tool name checked above"),
-            },
-            Err(error) => Err(error),
-        };
+        let result: Result<_> = async {
+            let (id, mut request) = self.routing.route(request)?;
+            let catalog = self.proxy.catalog.get().await?;
+            if self.routing.compact() {
+                match request.name.as_ref() {
+                    "dispatch" => request = expand_dispatch(request, &catalog.tools)?,
+                    "help" => return compact_help(request, &catalog.tools),
+                    _ => unreachable!("compact tool name checked above"),
+                }
+            }
+            self.proxy
+                .route_call(&catalog, &self.workspace, &id, request)
+                .await
+        }
+        .await;
         match result {
             Ok(result) => Ok(result.into()),
             Err(error) => {

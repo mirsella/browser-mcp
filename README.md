@@ -15,6 +15,11 @@ It works as a standard stdio MCP server. The bundled OpenCode plugin adds a
 stronger integration that multiplexes many OpenCode conversations through the
 same MCP connection without exposing routing details to the model.
 
+The MCP daemon answers compact OpenCode initialization without starting its
+downstream worker or opening Chromium. Compact help, direct tool listing, or the
+first browser action initializes the tool catalog on demand. The first browser
+action then starts the managed browser and restores any matching ownership state.
+
 Tab control is isolated. Browser data is shared. See [security model](#security-model)
 before using a profile that contains sensitive accounts.
 
@@ -155,6 +160,29 @@ daemon's idle timeout instead:
 }
 ```
 
+To give each active OpenCode session its own top-level browser window for visual
+organization, opt into `window-per-session`. This commonly pairs with retained
+tabs so the window stays available between turns:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    [
+      "@mirsella/opencode-browser-mcp",
+      { "sessionLayout": "window-per-session", "releaseOnIdle": false }
+    ]
+  ]
+}
+```
+
+`sessionLayout` defaults to `shared-window`. Window placement is best effort:
+the first broker-created tab requests a new window, and later tabs are created
+after activating one of that session's owned tabs. Chromium does not expose an
+atomic "create in window ID" operation, so manual tab moves, site-created
+popups, or other browser activity can change the visual grouping. The broker
+never moves or closes a tab merely to repair window placement.
+
 OpenCode 1.18 or newer is required.
 
 ## Generic MCP setup
@@ -163,6 +191,12 @@ Run the package as a normal stdio MCP server:
 
 ```sh
 npx -y @mirsella/opencode-browser-mcp
+```
+
+Generic MCP clients can also opt into separate visual windows per connection:
+
+```sh
+npx -y @mirsella/opencode-browser-mcp --session-layout window-per-session
 ```
 
 For hosts that use JSON configuration, the equivalent shape is:
@@ -220,6 +254,10 @@ flowchart LR
 Each active browser session leases its own `chrome-devtools-mcp` worker.
 Reusable workers are kept in a bounded, workspace-keyed warm pool to avoid
 browser-level CDP reconnect churn and are health-checked before each lease.
+The compact two-tool surface is available before the downstream worker starts.
+Direct tool listing, compact help, and the first action trigger one daemon-owned
+tool discovery task and await its cached result. None of these operations opens
+the browser; Chromium still starts only for an actual browser action.
 Worker-local numeric page IDs never cross session boundaries. The daemon maps
 them to stable browser-level CDP tab targets and removes page selection tools
 from the public surface.
@@ -233,6 +271,7 @@ browser WebSocket generation and live tab targets still match.
 - A tab has at most one owner.
 - Sessions run concurrently through separate downstream workers.
 - Popups inherit the owner of their opener tab.
+- Optional per-session windows are visual organization only; target ownership remains the routing authority.
 - A session cannot select, inspect, or close another session's tabs through this MCP server.
 - Manual and otherwise unowned tabs are never claimed during session cleanup.
 - Stale browser generations, malformed worker responses, ownership conflicts, and tracker disconnects fail closed.
@@ -247,7 +286,9 @@ local process that connects directly to the CDP port bypasses the broker.
 The managed browser must be a Chromium-family browser with a Chrome-compatible
 browser-level CDP endpoint. In particular, this project relies on Chromium's
 `Target` discovery, flat sessions, tab targets, opener lineage, and
-`Target.createTarget` with `forTab`.
+`Target.createTarget` with `forTab`. Per-session window layout additionally uses
+`Target.createTarget` with `newWindow`, `Target.activateTarget`, and
+`Browser.getWindowForTarget`.
 
 Google Chrome and Chrome for Testing are the browsers officially supported by
 the pinned `chrome-devtools-mcp@1.6.0`. The launcher also detects Helium,
@@ -278,16 +319,23 @@ supported.
 
 | Event | Behavior |
 | --- | --- |
+| MCP initializes, lists tools, or loads compact help | The daemon responds without starting Chromium |
+| First browser action | The managed browser and CDP ownership tracker start lazily |
 | Generic MCP connection closes | Its owned tabs and worker lease are released |
 | OpenCode turn becomes idle | Its owned tabs are released by default |
 | OpenCode session is deleted | Its owned tabs are released |
 | Release arrives during an active call | Cleanup is queued and runs after active work completes |
 | Session exceeds the idle timeout | The daemon retries cleanup as a fallback |
-| Last MCP client disconnects | After two seconds, the daemon closes the managed browser and clears ownership |
+| Last MCP stdio bridge disconnects | After two seconds, the daemon closes the managed browser and clears ownership |
 | Daemon crashes but browser survives | Matching generation state is recovered conservatively |
 
 `releaseOnIdle: false` keeps OpenCode tabs alive between turns. The default
 daemon idle timeout is 60 minutes.
+
+Closing a TUI attached to a long-lived OpenCode server does not necessarily
+close the server's shared MCP bridge. OpenCode currently exposes no plugin event
+for an individual attached client disconnect, so use turn-idle cleanup, session
+deletion, or the daemon idle timeout for per-session cleanup.
 
 ## Configuration
 
@@ -296,6 +344,7 @@ daemon idle timeout is 60 minutes.
 | `OPENCODE_BROWSER_EXECUTABLE` | auto-detected | Chromium-family browser executable |
 | `OPENCODE_BROWSER_PROFILE` | browser-dependent; see Browser compatibility | Shared browser data directory |
 | `OPENCODE_BROWSER_SOCKET` | `$XDG_RUNTIME_DIR/opencode-browser-mcp/daemon.sock` | Private daemon socket |
+| `OPENCODE_BROWSER_SESSION_LAYOUT` | `shared-window` | `shared-window` or best-effort `window-per-session` organization |
 | `OPENCODE_BROWSER_CDP_HOST` | `127.0.0.1` | CDP host; loopback only |
 | `OPENCODE_BROWSER_CDP_PORT` | `9222` | CDP port |
 | `OPENCODE_BROWSER_IDLE_MINUTES` | `60` | Fallback session cleanup; `0` disables expiry |
@@ -305,8 +354,9 @@ daemon idle timeout is 60 minutes.
 | `OPENCODE_BROWSER_DISABLE_CRASH_REPORTER` | `false` | Disable Chromium crash reporting |
 | `RUST_LOG` | `opencode_browser_mcp=info` | Native daemon log filter |
 
-The first client starts the daemon and fixes these values for its lifetime.
-Later clients with a different daemon configuration are rejected.
+The first client starts the daemon and fixes these values for its lifetime, but
+Chromium remains stopped until a browser action needs it. Later clients with a
+different daemon configuration are rejected.
 
 The default socket directory is created under `XDG_RUNTIME_DIR` with mode
 `0700`. A custom socket path does not create its parent; the parent must already
@@ -350,7 +400,9 @@ tool exposed. The plugin selects the appropriate OpenCode mode automatically.
 - A profile-lock error means another daemon is already using that profile.
 - Browser startup and daemon errors are written to `<socket>.stderr.log`.
 - If `chrome-devtools-mcp` cannot start, verify that `bunx` is available or set
-  `OPENCODE_BROWSER_DOWNSTREAM_COMMAND` to a compatible launcher.
+  `OPENCODE_BROWSER_DOWNSTREAM_COMMAND` to a compatible launcher, then restart
+  the OpenCode MCP connection; catalog initialization errors are cached for the
+  daemon lifetime.
 - The plugin refuses to replace an unrelated `mcp.browser` entry. Remove or
   rename that MCP configuration before enabling this package.
 

@@ -8,6 +8,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -24,6 +25,14 @@ pub struct PersistedSession {
     pub current_tab: Option<String>,
     pub last_activity_unix_seconds: u64,
     pub cleanup_pending: bool,
+}
+
+impl PersistedSession {
+    pub fn needs_cleanup(&self, now: u64, idle: Duration) -> bool {
+        self.cleanup_pending
+            || (!idle.is_zero()
+                && now.saturating_sub(self.last_activity_unix_seconds) >= idle.as_secs())
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -112,6 +121,15 @@ impl OwnershipPersistence {
         let state = self.state.lock().expect("ownership persistence poisoned");
         (state.version == FORMAT_VERSION && !state.generation.is_empty())
             .then(|| state.generation.clone())
+    }
+
+    pub fn cleanup_due(&self, now: u64, idle: Duration) -> bool {
+        self.state
+            .lock()
+            .expect("ownership persistence poisoned")
+            .sessions
+            .values()
+            .any(|session| session.needs_cleanup(now, idle))
     }
 
     pub fn clear_generation(&self, generation: &str) -> Result<()> {
@@ -365,7 +383,11 @@ mod tests {
             cleanup_pending: false,
         };
         store.update_session("session-a", session.clone()).unwrap();
+        assert!(!store.cleanup_due(60, Duration::from_secs(60)));
+        assert!(store.cleanup_due(61, Duration::from_secs(60)));
+        assert!(!store.cleanup_due(u64::MAX, Duration::ZERO));
         assert!(store.request_cleanup("session-a").unwrap());
+        assert!(store.cleanup_due(1, Duration::ZERO));
         assert!(!store.request_cleanup("missing").unwrap());
         store.update_session("session-a", session).unwrap();
         store

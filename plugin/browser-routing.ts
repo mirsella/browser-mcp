@@ -26,6 +26,7 @@ type ConfigWithPolicies = {
 type BrowserRoutingOptions = {
 	compactTools?: boolean;
 	releaseOnIdle?: boolean;
+	sessionLayout?: "shared-window" | "window-per-session";
 };
 
 type PendingRelease = {
@@ -59,9 +60,11 @@ function requiresDirectTools(config: ConfigWithPolicies): boolean {
 }
 
 export const BrowserRouting: Plugin = async ({ $ }, options) => {
-	const { compactTools = true, releaseOnIdle = true } = (options ?? {}) as BrowserRoutingOptions;
+	const { compactTools = true, releaseOnIdle = true, sessionLayout } = (options ?? {}) as BrowserRoutingOptions;
 	if (typeof compactTools !== "boolean") throw new Error("compactTools must be a boolean");
 	if (typeof releaseOnIdle !== "boolean") throw new Error("releaseOnIdle must be a boolean");
+	if (sessionLayout !== undefined && sessionLayout !== "shared-window" && sessionLayout !== "window-per-session")
+		throw new Error('sessionLayout must be "shared-window" or "window-per-session"');
 	const usedSessions = new Set<string>();
 	const pendingReleases = new Map<string, PendingRelease>();
 	const release = (sessionID: string, deleted = false) => {
@@ -112,9 +115,11 @@ export const BrowserRouting: Plugin = async ({ $ }, options) => {
 					"@mirsella/opencode-browser-mcp cannot replace the existing mcp.browser configuration",
 				);
 			}
+			const command = [MCP_CLI, "--routing", compact ? "opencode" : "opencode-direct"];
+			if (sessionLayout !== undefined) command.push("--session-layout", sessionLayout);
 			config.mcp.browser = {
 				type: "local",
-				command: [MCP_CLI, "--routing", compact ? "opencode" : "opencode-direct"],
+				command,
 				enabled: true,
 				timeout: 600_000,
 			};

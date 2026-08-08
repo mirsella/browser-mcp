@@ -15,7 +15,7 @@ function shell(results: Array<Promise<ShellResult>>, calls: unknown[][]) {
 
 async function hooks(
 	results: Array<Promise<ShellResult>> = [],
-	options?: { compactTools?: boolean; releaseOnIdle?: boolean },
+	options?: { compactTools?: boolean; releaseOnIdle?: boolean; sessionLayout?: "shared-window" | "window-per-session" },
 ) {
 	const calls: unknown[][] = [];
 	const plugin = await BrowserRouting(
@@ -25,8 +25,14 @@ async function hooks(
 	return { plugin, calls };
 }
 
-function expectRouting(config: { mcp: { browser: { command: unknown[] } } }, routing: string) {
-	expect(config.mcp.browser.command).toEqual([expect.any(String), "--routing", routing]);
+function expectRouting(
+	config: { mcp: { browser: { command: unknown[] } } },
+	routing: string,
+	layout?: string,
+) {
+	const command: unknown[] = [expect.any(String), "--routing", routing];
+	if (layout) command.push("--session-layout", layout);
+	expect(config.mcp.browser.command).toEqual(command);
 }
 
 describe("BrowserRouting", () => {
@@ -76,6 +82,16 @@ describe("BrowserRouting", () => {
 		const config = {} as never;
 		await plugin.config?.(config);
 		expectRouting(config, "opencode-direct");
+	});
+
+	test("configures and validates session window layout", async () => {
+		const { plugin } = await hooks([], { sessionLayout: "window-per-session" });
+		const config = {} as never;
+		await plugin.config?.(config);
+		expectRouting(config, "opencode", "window-per-session");
+		expect(hooks([], { sessionLayout: "invalid" as never })).rejects.toThrow(
+			"sessionLayout must be",
+		);
 	});
 
 	test("does not treat compact help as a used browser session", async () => {
