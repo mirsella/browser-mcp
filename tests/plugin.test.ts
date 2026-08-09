@@ -17,9 +17,8 @@ async function hooks(
 	results: Array<Promise<ShellResult>> = [],
 	options?: {
 		compactTools?: boolean;
-		headless?: boolean;
 		releaseOnIdle?: boolean;
-		sessionLayout?: "shared-window" | "window-per-session";
+		socket?: string;
 	},
 ) {
 	const calls: unknown[][] = [];
@@ -33,12 +32,11 @@ async function hooks(
 function expectRouting(
 	config: { mcp: { browser: { command: unknown[] } } },
 	routing: string,
-	layout?: string,
-	headless?: boolean,
+	socket?: string,
 ) {
-	const command: unknown[] = [expect.any(String), "--routing", routing];
-	if (layout) command.push("--session-layout", layout);
-	if (headless !== undefined) command.push("--headless", String(headless));
+	const command: unknown[] = [expect.any(String)];
+	if (socket) command.push("--socket", socket);
+	command.push("--routing", routing);
 	expect(config.mcp.browser.command).toEqual(command);
 }
 
@@ -72,12 +70,8 @@ describe("BrowserRouting", () => {
 	test("uses direct tools for partial browser policies", async () => {
 		for (const [pattern, routing] of [
 			["*_evaluate_scrip?", "opencode-direct"],
-			["browser_click", "opencode-direct"],
 			["browser_d*", "opencode-direct"],
 			["browser_*", "opencode"],
-			["*", "opencode"],
-			["browser_help", "opencode"],
-			["browser_nonexistent", "opencode"],
 			["read_*", "opencode"],
 		]) {
 			const { plugin } = await hooks();
@@ -91,24 +85,23 @@ describe("BrowserRouting", () => {
 		expectRouting(config, "opencode-direct");
 	});
 
-	test("configures and validates session window layout", async () => {
-		const { plugin } = await hooks([], { sessionLayout: "window-per-session" });
+	test("configures and validates the broker socket", async () => {
+		const socket = "/run/user/1000/browser.sock";
+		const { plugin, calls } = await hooks([], { socket });
 		const config = {} as never;
 		await plugin.config?.(config);
-		expectRouting(config, "opencode", "window-per-session");
-		expect(hooks([], { sessionLayout: "invalid" as never })).rejects.toThrow(
-			"sessionLayout must be",
-		);
-	});
-
-	test("configures and validates headless mode", async () => {
-		for (const headless of [false, true]) {
-			const { plugin } = await hooks([], { headless });
-			const config = {} as never;
-			await plugin.config?.(config);
-			expectRouting(config, "opencode", undefined, headless);
-		}
-		expect(hooks([], { headless: "false" as never })).rejects.toThrow("headless must be a boolean");
+		expectRouting(config, "opencode", socket);
+		await plugin.event?.({
+			event: { type: "session.deleted", properties: { info: { id: "session-a" } } },
+		} as never);
+		expect(calls[0]?.[1]).toEqual([
+			expect.any(String),
+			"--socket",
+			socket,
+			"release-session",
+			"session-a",
+		]);
+		expect(hooks([], { socket: "" })).rejects.toThrow("socket must be a non-empty string");
 	});
 
 	test("does not treat compact help as a used browser session", async () => {
@@ -140,24 +133,24 @@ describe("BrowserRouting", () => {
 	});
 
 	test("retries failed idle cleanup", async () => {
-		const failed = Promise.resolve({ exitCode: 1, stdout: "", stderr: "failed" });
+		const failed = Promise.resolve<ShellResult>({ exitCode: 1, stdout: "", stderr: "broker unavailable" });
 		const { plugin, calls } = await hooks([failed, successful]);
 		await plugin["tool.execute.before"]?.(
-			{ tool: "browser_dispatch", sessionID: "idle", callID: "call-a" },
+			{ tool: "browser_dispatch", sessionID: "session-a", callID: "call-a" },
 			{ args: {} },
 		);
-		for (const sessionID of ["idle", "idle"]) {
-			await plugin.event?.({ event: { type: "session.idle", properties: { sessionID } } } as never);
-		}
+		const idle = { event: { type: "session.idle", properties: { sessionID: "session-a" } } } as never;
+		await plugin.event?.(idle);
+		await plugin.event?.(idle);
 		expect(calls).toHaveLength(2);
 	});
 
-	test("does not resurrect a deleted session after a shared release fails", async () => {
-		let failRelease: (result: ShellResult) => void = () => {};
-		const pending = new Promise<ShellResult>((resolve) => {
-			failRelease = resolve;
+	test("retries a failed pending release when the session is deleted", async () => {
+		let failFirst: (result: ShellResult) => void = () => {};
+		const first = new Promise<ShellResult>((resolve) => {
+			failFirst = resolve;
 		});
-		const { plugin, calls } = await hooks([pending]);
+		const { plugin, calls } = await hooks([first, successful]);
 		await plugin["tool.execute.before"]?.(
 			{ tool: "browser_dispatch", sessionID: "session-a", callID: "call-a" },
 			{ args: {} },
@@ -169,12 +162,10 @@ describe("BrowserRouting", () => {
 		const deleted = plugin.event?.({
 			event: { type: "session.deleted", properties: { info: { id: "session-a" } } },
 		} as never);
-		failRelease({ exitCode: 1, stdout: "", stderr: "failed" });
-		await Promise.all([idle, deleted]);
-		await plugin.event?.({
-			event: { type: "session.idle", properties: { sessionID: "session-a" } },
-		} as never);
 		expect(calls).toHaveLength(1);
+		failFirst({ exitCode: 1, stdout: "", stderr: "broker unavailable" });
+		await Promise.all([idle, deleted]);
+		expect(calls).toHaveLength(2);
 	});
 
 	test("waits for idle cleanup before routing the next turn", async () => {

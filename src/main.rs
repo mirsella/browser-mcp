@@ -1,9 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    os::unix::{
-        ffi::OsStrExt,
-        fs::{MetadataExt, PermissionsExt},
-    },
+    os::unix::fs::PermissionsExt,
     path::PathBuf,
     process::Stdio,
     sync::{
@@ -14,7 +11,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{ArgAction, Parser, ValueEnum};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use futures_util::{FutureExt, future::BoxFuture, future::Shared};
 use reqwest::{Client, Url, redirect::Policy};
 #[allow(deprecated)]
@@ -121,36 +118,35 @@ fn default_browser_profile() -> PathBuf {
     }
 }
 
+mod broker;
 mod cdp;
-mod daemon;
 mod persistence;
 use cdp::{SessionLayout, TargetId, TargetTracker};
 use persistence::{OwnershipPersistence, PersistedSession, RestoredState};
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Session-isolated MCP for Chromium-family browsers")]
-struct Config {
-    #[arg(
-        long,
-        hide = true,
-        conflicts_with_all = ["stop_daemon", "release_session"]
-    )]
-    daemon: bool,
-    #[arg(
-        long,
-        hide = true,
-        conflicts_with_all = ["daemon", "release_session"]
-    )]
-    stop_daemon: bool,
-    #[arg(
-        long,
-        hide = true,
-        value_name = "SESSION_ID",
-        conflicts_with_all = ["daemon", "stop_daemon"]
-    )]
-    release_session: Option<String>,
+struct Cli {
     #[arg(long, value_enum, default_value_t)]
     routing: RoutingMode,
+    #[arg(long, global = true, env = "OPENCODE_BROWSER_SOCKET")]
+    socket: Option<PathBuf>,
+    #[command(subcommand)]
+    command: Option<ProcessMode>,
+}
+
+#[derive(Debug, Subcommand)]
+enum ProcessMode {
+    /// Run the shared browser broker in the foreground.
+    Broker(Config),
+    /// Ask the running broker to shut down.
+    StopBroker,
+    /// Release the tabs owned by an OpenCode session.
+    ReleaseSession { session_id: String },
+}
+
+#[derive(Debug, Args)]
+struct Config {
     #[arg(
         long,
         value_enum,
@@ -158,8 +154,6 @@ struct Config {
         default_value_t
     )]
     session_layout: SessionLayout,
-    #[arg(long, env = "OPENCODE_BROWSER_SOCKET")]
-    socket: Option<PathBuf>,
     #[arg(
         long,
         env = "OPENCODE_BROWSER_EXECUTABLE",
@@ -208,45 +202,6 @@ struct Config {
 impl Config {
     fn browser_url(&self) -> String {
         format!("http://{}:{}", self.cdp_host, self.cdp_port)
-    }
-
-    fn daemon_identity(&self) -> Result<Vec<u8>> {
-        fn field(identity: &mut Vec<u8>, value: &[u8]) {
-            identity.extend_from_slice(&(value.len() as u64).to_be_bytes());
-            identity.extend_from_slice(value);
-        }
-
-        let mut identity = Vec::new();
-        field(&mut identity, b"daemon-config-v4");
-        field(&mut identity, env!("CARGO_PKG_VERSION").as_bytes());
-        let executable = std::fs::metadata("/proc/self/exe")
-            .context("failed to identify the browser MCP executable")?;
-        field(&mut identity, &executable.dev().to_be_bytes());
-        field(&mut identity, &executable.ino().to_be_bytes());
-        field(
-            &mut identity,
-            self.browser_executable.as_os_str().as_bytes(),
-        );
-        field(&mut identity, self.profile.as_os_str().as_bytes());
-        field(&mut identity, &[self.headless.into()]);
-        field(&mut identity, &[self.disable_crash_reporter.into()]);
-        field(
-            &mut identity,
-            match self.session_layout {
-                SessionLayout::SharedWindow => b"shared-window",
-                SessionLayout::WindowPerSession => b"window-per-session",
-            },
-        );
-        field(&mut identity, self.cdp_host.as_bytes());
-        field(&mut identity, &self.cdp_port.to_be_bytes());
-        field(&mut identity, &self.idle_minutes.to_be_bytes());
-        field(&mut identity, &self.startup_seconds.to_be_bytes());
-        field(&mut identity, &self.operation_seconds.to_be_bytes());
-        field(
-            &mut identity,
-            self.downstream_command.as_os_str().as_bytes(),
-        );
-        Ok(identity)
     }
 }
 
@@ -705,7 +660,7 @@ async fn discover_catalog(
     if *cancel.borrow() {
         bail!("Chrome DevTools tool catalog initialization stopped");
     }
-    let workspace = std::env::current_dir().context("failed to determine the daemon workspace")?;
+    let workspace = std::env::current_dir().context("failed to determine the MCP workspace")?;
     let worker = tokio::select! {
         biased;
         _ = cancelled(&mut cancel) => bail!("Chrome DevTools tool catalog initialization stopped"),
@@ -1143,9 +1098,7 @@ impl BrowserProxy {
         }
         let tracker_lease = self.tracker_lease().await?;
         let tracker = &*tracker_lease;
-        let Ok(mut guard) = slot.session.try_lock() else {
-            return Ok(());
-        };
+        let mut guard = slot.session.lock().await;
         if guard.is_none() {
             if !tracker.owned_tabs(id).await?.is_empty() {
                 error!(session_id = %id, "browser ownership exists without live session state");
@@ -1232,7 +1185,7 @@ impl BrowserProxy {
         persisted.cleanup_pending = true;
         let result = self.persistence.update_session(id, persisted.clone());
         // A storage failure cannot provide crash durability, but the live
-        // daemon must still reject work and retry cleanup rather than fail open.
+        // broker must still reject work and retry cleanup rather than fail open.
         session.persisted = persisted;
         result
     }
@@ -1842,8 +1795,7 @@ async fn main() -> Result<()> {
         )
         .with_writer(std::io::stderr)
         .init();
-    let config = Arc::new(Config::parse());
-    daemon::run(config).await
+    broker::run(Cli::parse()).await
 }
 fn validate_config(config: &Config) -> Result<()> {
     let executable = std::fs::metadata(&config.browser_executable);
@@ -1877,19 +1829,25 @@ fn validate_config(config: &Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn broker_config(arguments: &[&str]) -> Config {
+        let cli = Cli::try_parse_from(
+            std::iter::once("test")
+                .chain(std::iter::once("broker"))
+                .chain(arguments.iter().copied()),
+        )
+        .unwrap();
+        let Some(ProcessMode::Broker(config)) = cli.command else {
+            panic!("expected broker configuration");
+        };
+        config
+    }
+
     #[test]
     fn browser_is_headed_by_default_and_headless_is_configurable() {
-        assert!(!Config::try_parse_from(["test"]).unwrap().headless);
-        assert!(
-            Config::try_parse_from(["test", "--headless"])
-                .unwrap()
-                .headless
-        );
-        assert!(
-            !Config::try_parse_from(["test", "--headless=false"])
-                .unwrap()
-                .headless
-        );
+        assert!(!broker_config(&[]).headless);
+        assert!(broker_config(&["--headless"]).headless);
+        assert!(!broker_config(&["--headless=false"]).headless);
     }
     #[test]
     fn removes_page_id_from_schema_and_required_fields() {

@@ -14,10 +14,19 @@ and whether the issue also reproduces with `chrome-devtools-mcp@1.6.0` directly.
 This project isolates tab ownership between cooperating MCP sessions. It is not
 a sandbox for mutually untrusted local users or processes.
 
-The daemon socket and ownership state are private to the current Unix user, but
-the managed browser exposes an unauthenticated CDP endpoint on loopback. Any
-process running as the same user can connect to that port and control the
-browser without going through the ownership broker.
+The broker keeps its Unix socket, profile lock, and ownership state private to
+the current Unix user, but the managed browser exposes an unauthenticated CDP
+endpoint on loopback. Any process running as the same user can connect to that
+port and control the browser without going through the ownership broker.
+
+Only one broker may open a given browser profile. The profile and socket locks
+prevent accidental concurrent use and profile corruption; they are not a
+security boundary against another process running as the same user. Multiple MCP
+adapters are expected to connect to that broker and share its browser profile.
+
+The broker socket accepts only peers with the broker's Unix UID and is created
+with mode `0600` in a private directory. This protects against other local users,
+not against another process already running as the same user.
 
 All browser sessions share one user-data directory. This includes cookies,
 authentication, local storage, cache, extensions, permissions, history, and
@@ -33,6 +42,9 @@ provide it, but it cannot prevent prompt injection.
 ## Operational guidance
 
 - Use a dedicated browser user-data directory for sensitive automation.
+- Do not bypass or remove the profile or socket locks to run another broker.
+- Run one supervised broker and connect concurrent MCP adapters through its
+  private socket.
 - Do not expose the CDP port beyond loopback.
 - Do not run untrusted local processes while a sensitive profile is open.
 - Use OS, container, or VM isolation when local users or workloads do not trust each other.

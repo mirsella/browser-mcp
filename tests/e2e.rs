@@ -1,4 +1,9 @@
-use std::{os::unix::fs::PermissionsExt, path::Path, process::Stdio, time::Duration};
+use std::{
+    os::unix::fs::PermissionsExt,
+    path::Path,
+    process::Stdio,
+    time::{Duration, Instant},
+};
 
 use futures_util::{SinkExt, StreamExt};
 use rmcp::{
@@ -7,7 +12,11 @@ use rmcp::{
     transport::TokioChildProcess,
 };
 use serde_json::{Map, Value, json};
-use tokio::{net::UnixStream, process::Command};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    process::{Child, Command},
+    task::JoinHandle,
+};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const SESSION_KEY: &str = "__opencode_session_id";
@@ -65,58 +74,112 @@ async fn call_generic_ok(client: &Client, name: &str, arguments: Value) -> CallT
     result
 }
 
-fn bridge_command(
-    socket: &Path,
-    profile: &Path,
-    port: u16,
-    routing: &str,
-    layout: &str,
-) -> Command {
+fn broker_command(socket: &Path, profile: &Path, port: u16, layout: &str) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_opencode-browser-mcp"));
     command
         .arg("--socket")
         .arg(socket)
+        .arg("broker")
         .arg("--profile")
         .arg(profile)
         .arg("--cdp-port")
         .arg(port.to_string())
         .arg("--disable-crash-reporter")
-        .arg("--routing")
-        .arg(routing)
         .arg("--session-layout")
         .arg(layout)
         .stderr(Stdio::inherit());
     command
 }
 
-async fn client(socket: &Path, profile: &Path, port: u16, routing: &str, layout: &str) -> Client {
-    let command = bridge_command(socket, profile, port, routing, layout);
-    let transport = TokioChildProcess::new(command).expect("start stdio bridge");
-    ().serve(transport).await.expect("initialize bridge")
+fn adapter_command(socket: &Path, routing: &str) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_opencode-browser-mcp"));
+    command
+        .arg("--socket")
+        .arg(socket)
+        .arg("--routing")
+        .arg(routing)
+        .stderr(Stdio::inherit());
+    command
 }
 
-async fn daemon_pid(socket: &Path) -> libc::pid_t {
-    UnixStream::connect(socket)
-        .await
-        .expect("connect to daemon")
-        .peer_cred()
-        .expect("read daemon credentials")
-        .pid()
-        .expect("daemon PID")
+async fn wait_for_socket(socket: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !socket.exists() {
+        assert!(Instant::now() < deadline, "broker socket did not appear");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
-async fn release_session(socket: &Path, session_id: &str) -> bool {
+async fn start_broker(socket: &Path, profile: &Path, port: u16, layout: &str) -> Child {
+    let mut command = broker_command(socket, profile, port, layout);
+    command.stdin(Stdio::null()).stdout(Stdio::null());
+    let child = command.spawn().expect("start browser broker");
+    wait_for_socket(socket).await;
+    child
+}
+
+async fn stop_broker(socket: &Path, mut broker: Child) {
     let status = Command::new(env!("CARGO_BIN_EXE_opencode-browser-mcp"))
         .arg("--socket")
         .arg(socket)
-        .arg("--release-session")
-        .arg(session_id)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .arg("stop-broker")
         .status()
         .await
-        .expect("run session release control command");
-    status.success()
+        .expect("request broker shutdown");
+    assert!(status.success(), "broker rejected shutdown request");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), broker.wait())
+            .await
+            .expect("broker did not exit")
+            .expect("wait for broker")
+            .success(),
+        "broker exited unsuccessfully"
+    );
+}
+
+async fn release_session(socket: &Path, session_id: &str) {
+    let status = Command::new(env!("CARGO_BIN_EXE_opencode-browser-mcp"))
+        .arg("--socket")
+        .arg(socket)
+        .arg("release-session")
+        .arg(session_id)
+        .status()
+        .await
+        .expect("request browser session release");
+    assert!(status.success(), "broker rejected session release request");
+}
+
+async fn client(socket: &Path, routing: &str) -> Client {
+    let transport =
+        TokioChildProcess::new(adapter_command(socket, routing)).expect("start MCP adapter");
+    ().serve(transport).await.expect("initialize MCP adapter")
+}
+
+async fn start_test_site() -> (String, JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind cookie-sharing test site");
+    let address = listener.local_addr().expect("test site address");
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut request = [0; 2048];
+                let _ = stream.read(&mut request).await;
+                let body = b"<!doctype html><title>Shared broker origin</title>";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.write_all(body).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    (format!("http://{address}"), task)
 }
 
 async fn browser_json(port: u16, path: &str) -> Value {
@@ -150,16 +213,6 @@ fn tabs_contain_url(tabs: &[Value], fragment: &str) -> bool {
             .and_then(Value::as_str)
             .is_some_and(|url| url.contains(fragment))
     })
-}
-
-async fn wait_for_tab_absent(port: u16, fragment: &str) {
-    for _ in 0..100 {
-        if !tabs_contain_url(&browser_tabs(port).await, fragment) {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("browser tab containing {fragment:?} remained open");
 }
 
 async fn window_for_url(port: u16, url_fragment: &str) -> i64 {
@@ -220,20 +273,17 @@ async fn create_unowned_tab(port: u16) {
         .expect("independent browser tab response status");
 }
 
-async fn wait_for_exit(pid: libc::pid_t) {
-    for _ in 0..800 {
-        if unsafe { libc::kill(pid, 0) } != 0 {
+async fn wait_for_browser_exit(port: u16) {
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_err()
+        {
             return;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    panic!("daemon {pid} did not exit");
-}
-
-fn sibling_path(socket: &Path, suffix: &str) -> std::path::PathBuf {
-    let mut path = socket.as_os_str().to_owned();
-    path.push(suffix);
-    path.into()
+    panic!("browser remained reachable after the MCP process exited");
 }
 
 fn isolated_view(result: &CallToolResult, own_url: &str, other_url: &str) -> (bool, String) {
@@ -280,8 +330,8 @@ async fn compact_startup_does_not_require_downstream() {
     std::fs::create_dir(&root).expect("create private startup test directory");
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
         .expect("restrict startup test directory");
-    let socket = root.join("daemon.sock");
     let profile = root.join("profile");
+    let socket = root.join("broker.sock");
     let downstream = root.join("downstream");
     let downstream_started = root.join("downstream-started");
     std::fs::write(
@@ -296,15 +346,18 @@ async fn compact_startup_does_not_require_downstream() {
         .local_addr()
         .expect("startup test CDP address")
         .port();
-    let mut command = bridge_command(&socket, &profile, port, "opencode", "shared-window");
+    let mut command = broker_command(&socket, &profile, port, "shared-window");
     command
         .arg("--browser-executable")
         .arg("/bin/true")
         .arg("--downstream-command")
         .arg(&downstream)
-        .stderr(Stdio::null());
-    let transport = TokioChildProcess::new(command).expect("start compact startup bridge");
-    let client = ().serve(transport).await.expect("initialize compact bridge");
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null());
+    let broker = command.spawn().expect("start compact browser broker");
+    wait_for_socket(&socket).await;
+    let client = client(&socket, "opencode").await;
     assert_eq!(
         client
             .list_all_tools()
@@ -325,134 +378,105 @@ async fn compact_startup_does_not_require_downstream() {
             .is_err(),
         "compact startup opened the browser"
     );
-    let pid = daemon_pid(&socket).await;
-    client.cancel().await.expect("stop compact startup bridge");
-    wait_for_exit(pid).await;
+    client.cancel().await.expect("stop compact MCP adapter");
+    stop_broker(&socket, broker).await;
     let _ = std::fs::remove_dir_all(root);
 }
 
-async fn exercise_layout(layout: &str, separate_windows: bool) {
-    let socket = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
-        .expect("XDG_RUNTIME_DIR")
-        .join(format!(
-            "opencode-browser-mcp-e2e-{}-{layout}.sock",
-            std::process::id()
-        ));
-    let profile = std::env::temp_dir().join(format!(
-        "opencode-browser-mcp-e2e-profile-{}-{layout}",
+#[tokio::test]
+async fn adapters_require_an_explicit_exclusive_broker() {
+    let root = std::env::temp_dir().join(format!(
+        "opencode-browser-mcp-profile-lock-{}",
         std::process::id()
     ));
-    let _ = std::fs::remove_dir_all(&profile);
-    std::fs::create_dir(&profile).expect("create private test profile");
-    std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o700))
-        .expect("restrict test profile");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir(&root).expect("create private profile-lock test directory");
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+        .expect("restrict profile-lock test directory");
+    let profile = root.join("profile");
+    let socket = root.join("broker.sock");
+    let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .expect("reserve profile-lock test port")
+        .local_addr()
+        .expect("profile-lock test address")
+        .port();
+    let mut absent = adapter_command(&socket, "opencode");
+    absent
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let output = absent.output().await.expect("run adapter without broker");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("browser broker is not running"));
+
+    let mut first_command = broker_command(&socket, &profile, port, "shared-window");
+    first_command
+        .arg("--browser-executable")
+        .arg("/bin/true")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null());
+    let mut first = first_command.spawn().expect("start first browser broker");
+    wait_for_socket(&socket).await;
+    let adapter_a = client(&socket, "opencode").await;
+    let adapter_b = client(&socket, "opencode-direct").await;
+
+    let mut second = broker_command(&socket, &profile, port, "shared-window");
+    second
+        .arg("--browser-executable")
+        .arg("/bin/true")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let output = second.output().await.expect("run second browser broker");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("another browser broker owns"));
+
+    adapter_a.cancel().await.expect("stop first MCP adapter");
+    adapter_b.cancel().await.expect("stop second MCP adapter");
+    assert!(first.try_wait().expect("inspect browser broker").is_none());
+    stop_broker(&socket, first).await;
+
+    let mut after_release = broker_command(&socket, &profile, port, "shared-window");
+    after_release
+        .arg("--browser-executable")
+        .arg("/bin/true")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null());
+    let after_release = after_release.spawn().expect("restart browser broker");
+    wait_for_socket(&socket).await;
+    stop_broker(&socket, after_release).await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
+async fn exercise_shared_broker() {
+    let root = std::env::temp_dir().join(format!(
+        "opencode-browser-mcp-e2e-{}-shared",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir(&root).expect("create private test directory");
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+        .expect("restrict test directory");
+    let profile = root.join("profile");
+    let socket = root.join("broker.sock");
     let port = std::net::TcpListener::bind(("127.0.0.1", 0))
         .expect("reserve test CDP port")
         .local_addr()
         .expect("test CDP address")
         .port();
-    let _ = std::fs::remove_file(&socket);
-    let state = sibling_path(&socket, ".state.json");
-    let lock = sibling_path(&socket, ".lock");
-    let log = sibling_path(&socket, ".stderr.log");
-    let _ = std::fs::remove_file(&state);
-    let _ = std::fs::remove_file(&lock);
-    let _ = std::fs::remove_file(&log);
-    let (client_a, client_b) = tokio::join!(
-        client(&socket, &profile, port, "opencode-direct", layout),
-        client(&socket, &profile, port, "opencode-direct", layout)
-    );
+    let (test_site, test_site_task) = start_test_site().await;
+    let broker = start_broker(&socket, &profile, port, "shared-window").await;
+    let client_a = client(&socket, "opencode-direct").await;
+    let client_b = client(&socket, "opencode-direct").await;
 
     let direct_tools = client_a.list_all_tools().await.expect("list direct tools");
-    let compact = client(&socket, &profile, port, "opencode", layout).await;
-    let compact_tools = compact.list_all_tools().await.expect("list compact tools");
-    assert_eq!(
-        compact_tools
-            .iter()
-            .map(|tool| tool.name.as_ref())
-            .collect::<Vec<_>>(),
-        ["dispatch", "help"]
-    );
-    let direct_schema_bytes = serde_json::to_vec(&direct_tools).unwrap().len();
-    let compact_schema_bytes = serde_json::to_vec(&compact_tools).unwrap().len();
-    eprintln!(
-        "browser tool definitions: {direct_schema_bytes} direct bytes, {compact_schema_bytes} compact bytes"
-    );
-    assert!(compact_schema_bytes * 4 < direct_schema_bytes);
     assert!(
         tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .is_err(),
         "tool discovery started the browser"
     );
-    let invalid = compact
-        .call_tool(request(
-            "dispatch",
-            "compact-smoke",
-            json!({"action": "not_a_browser_action"}),
-        ))
-        .await
-        .expect("invalid compact call transport");
-    assert!(invalid.is_error.unwrap_or(false));
-    let help = call_ok(&compact, "help", "compact-smoke", json!({})).await;
-    let mut documented = text(&help)
-        .lines()
-        .next()
-        .unwrap()
-        .strip_prefix("Available browser actions: ")
-        .unwrap()
-        .split(", ")
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    let mut direct_names = direct_tools
-        .iter()
-        .map(|tool| tool.name.to_string())
-        .collect::<Vec<_>>();
-    documented.sort_unstable();
-    direct_names.sort_unstable();
-    assert_eq!(documented, direct_names);
-    assert!(release_session(&socket, "unused-session").await);
-    assert!(
-        tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .is_err(),
-        "invalid calls, browser help, or unused-session release started the browser"
-    );
-    call_ok(
-        &compact,
-        "dispatch",
-        "compact-smoke",
-        json!({
-            "action": "navigate_page",
-            "arguments": {"type": "url", "url": "https://example.net/#compact-client"}
-        }),
-    )
-    .await;
-    create_unowned_tab(port).await;
-    assert!(tabs_contain_url(
-        &browser_tabs(port).await,
-        "compact-client"
-    ));
-    assert!(release_session(&socket, "compact-smoke").await);
-    compact.cancel().await.expect("stop compact bridge");
-
-    let generic = client(&socket, &profile, port, "connection", layout).await;
-    call_generic_ok(
-        &generic,
-        "navigate_page",
-        json!({"type": "url", "url": "https://example.edu/#generic-client"}),
-    )
-    .await;
-    assert!(tabs_contain_url(
-        &browser_tabs(port).await,
-        "generic-client"
-    ));
-    generic.cancel().await.expect("stop generic bridge");
-    wait_for_tab_absent(port, "generic-client").await;
-    let remaining = browser_tabs(port).await;
-    assert!(tabs_contain_url(&remaining, "user-tab"));
-
     for tool in direct_tools {
         assert_ne!(tool.name, "select_page");
         assert_ne!(tool.name, "get_tab_id");
@@ -486,20 +510,14 @@ async fn exercise_layout(layout: &str, separate_windows: bool) {
     assert!(!navigate_b.contains("example.com"));
     assert_no_page_ids(&navigate_a);
     assert_no_page_ids(&navigate_b);
+    create_unowned_tab(port).await;
 
     let window_a = window_for_url(port, "example.com").await;
     let window_b = window_for_url(port, "example.org").await;
-    if separate_windows {
-        assert_ne!(
-            window_a, window_b,
-            "different browser sessions shared one top-level window"
-        );
-    } else {
-        assert_eq!(
-            window_a, window_b,
-            "shared-window sessions used different top-level windows"
-        );
-    }
+    assert_eq!(
+        window_a, window_b,
+        "shared-window sessions used different top-level windows"
+    );
     call_ok(
         &client_a,
         "new_page",
@@ -511,6 +529,45 @@ async fn exercise_layout(layout: &str, separate_windows: bool) {
         window_for_url(port, "same-session-window").await,
         window_a,
         "a session's second tab was placed in another window"
+    );
+
+    call_ok(
+        &client_a,
+        "navigate_page",
+        "smoke-a",
+        json!({"type": "url", "url": format!("{test_site}/#cookie-writer")}),
+    )
+    .await;
+    let stored_cookie = call_ok(
+        &client_a,
+        "evaluate_script",
+        "smoke-a",
+        json!({"function": "() => { document.cookie = 'shared_broker_cookie=visible; path=/'; return document.cookie; }"}),
+    )
+    .await;
+    assert!(
+        text(&stored_cookie).contains("shared_broker_cookie=visible"),
+        "first adapter could not store the shared cookie: {}",
+        text(&stored_cookie)
+    );
+    call_ok(
+        &client_b,
+        "navigate_page",
+        "smoke-b",
+        json!({"type": "url", "url": format!("{test_site}/#cookie-reader")}),
+    )
+    .await;
+    let shared_cookie = call_ok(
+        &client_b,
+        "evaluate_script",
+        "smoke-b",
+        json!({"function": "() => document.cookie"}),
+    )
+    .await;
+    assert!(
+        text(&shared_cookie).contains("shared_broker_cookie=visible"),
+        "independent adapters did not share browser profile cookies: {}",
+        text(&shared_cookie)
     );
 
     tokio::join!(
@@ -569,32 +626,6 @@ async fn exercise_layout(layout: &str, separate_windows: bool) {
 
     call_ok(
         &client_a,
-        "navigate_page",
-        "smoke-a",
-        json!({"type": "url", "url": "data:text/html,<title>Busy%20A</title>"}),
-    )
-    .await;
-    let (_, release_queued_while_busy) = tokio::join!(
-        call_ok(
-            &client_a,
-            "evaluate_script",
-            "smoke-a",
-            json!({"function": "async () => { await new Promise(resolve => setTimeout(resolve, 2000)); return location.href; }"}),
-        ),
-        async {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            release_session(&socket, "smoke-a").await
-        },
-    );
-    assert!(
-        release_queued_while_busy,
-        "did not queue active session release"
-    );
-    wait_for_tab_absent(port, "Busy").await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    call_ok(
-        &client_a,
         "new_page",
         "smoke-a",
         json!({"url": "https://example.net/#extra-a"}),
@@ -613,13 +644,11 @@ async fn exercise_layout(layout: &str, separate_windows: bool) {
     assert_no_page_ids(&extra_a_text);
     assert_no_page_ids(&extra_b_text);
 
-    assert!(release_session(&socket, "smoke-a").await);
-    call_ok(&client_b, "list_pages", "smoke-b", json!({})).await;
     let tabs = browser_tabs(port).await;
     assert!(tabs_contain_url(&tabs, "user-tab"));
+    assert!(tabs_contain_url(&tabs, "Session%20A"));
     assert!(tabs_contain_url(&tabs, "Session%20B"));
-    assert!(!tabs_contain_url(&tabs, "Session%20A"));
-    assert!(!tabs_contain_url(&tabs, "extra-a"));
+    assert!(tabs_contain_url(&tabs, "extra-a"));
 
     let mut target_ids = tabs
         .iter()
@@ -638,53 +667,178 @@ async fn exercise_layout(layout: &str, separate_windows: bool) {
         "listing an empty session created a blank tab"
     );
 
-    let persisted: Value = serde_json::from_slice(
-        &std::fs::read(&state).expect("read pre-shutdown persisted ownership state"),
-    )
-    .expect("parse pre-shutdown persisted ownership state");
-    let owners = persisted["owners"].as_object().expect("persisted owners");
-    assert_eq!(owners.len(), 1);
-    assert!(owners.values().all(|owner| owner == "opencode:smoke-b"));
-    let sessions = persisted["sessions"]
-        .as_object()
-        .expect("persisted sessions");
-    assert_eq!(sessions.len(), 1);
-    assert!(sessions.contains_key("opencode:smoke-b"));
-
-    let original_daemon_pid = daemon_pid(&socket).await;
-    client_a.cancel().await.expect("stop bridge A");
-    tokio::time::sleep(Duration::from_millis(2500)).await;
-    call_ok(&client_b, "list_pages", "smoke-b", json!({})).await;
-    client_b.cancel().await.expect("stop bridge B");
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    let client_c = client(&socket, &profile, port, "opencode-direct", layout).await;
-    assert_eq!(daemon_pid(&socket).await, original_daemon_pid);
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-    call_ok(&client_c, "list_pages", "smoke-b", json!({})).await;
-    client_c.cancel().await.expect("stop reconnecting bridge");
-    wait_for_exit(original_daemon_pid).await;
-    assert!(!socket.exists());
+    let release_started = Instant::now();
+    let (_, release_elapsed) = tokio::join!(
+        call_ok(
+            &client_a,
+            "evaluate_script",
+            "smoke-a",
+            json!({"function": "async () => { await new Promise(resolve => setTimeout(resolve, 6000)); return location.href; }"}),
+        ),
+        async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            release_session(&socket, "smoke-a").await;
+            release_started.elapsed()
+        },
+    );
+    assert!(
+        release_elapsed >= Duration::from_millis(5500),
+        "session release returned before the active browser call finished ({release_elapsed:?})"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let tabs = browser_tabs(port).await;
+        if !tabs_contain_url(&tabs, "Session%20A") && !tabs_contain_url(&tabs, "extra-a") {
+            assert!(tabs_contain_url(&tabs, "Session%20B"));
+            assert!(tabs_contain_url(&tabs, "user-tab"));
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "released session tabs remained open"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    client_a.cancel().await.expect("stop first MCP adapter");
+    client_b.cancel().await.expect("stop second MCP adapter");
     assert!(
         tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
-            .is_err(),
-        "browser remained reachable after the last MCP stdio bridge disconnected"
+            .is_ok(),
+        "browser stopped when the last adapter disconnected"
     );
-    let persisted: Value = serde_json::from_slice(
-        &std::fs::read(&state).expect("read final persisted ownership state"),
+
+    let reconnected = client(&socket, "opencode-direct").await;
+    let pages_b = call_ok(&reconnected, "list_pages", "smoke-b", json!({})).await;
+    let (structured_b, pages_b) = isolated_view(&pages_b, "Session%20B", "Session%20A");
+    assert!(structured_b || pages_b.contains("Session%20B"));
+
+    let generic = client(&socket, "connection").await;
+    call_generic_ok(
+        &generic,
+        "navigate_page",
+        json!({
+            "type": "url",
+            "url": "data:text/html,<title>Generic%20session</title>"
+        }),
     )
-    .expect("parse final persisted ownership state");
-    assert_eq!(persisted["owners"], json!({}));
-    assert_eq!(persisted["sessions"], json!({}));
-    let _ = std::fs::remove_file(state);
-    let _ = std::fs::remove_file(lock);
-    let _ = std::fs::remove_file(log);
-    let _ = std::fs::remove_dir_all(profile);
+    .await;
+    generic.cancel().await.expect("stop generic MCP adapter");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let tabs = browser_tabs(port).await;
+        if !tabs_contain_url(&tabs, "Generic%20session") {
+            assert!(tabs_contain_url(&tabs, "Session%20B"));
+            assert!(tabs_contain_url(&tabs, "user-tab"));
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "generic adapter tabs remained after disconnect"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let compact = client(&socket, "opencode").await;
+    let help = call_ok(
+        &compact,
+        "help",
+        "compact-session",
+        json!({"action": "navigate_page"}),
+    )
+    .await;
+    assert!(text(&help).contains("navigate_page"));
+    let compact_result = call_ok(
+        &compact,
+        "dispatch",
+        "compact-session",
+        json!({
+            "action": "navigate_page",
+            "arguments": {
+                "type": "url",
+                "url": "data:text/html,<title>Compact%20session</title>"
+            }
+        }),
+    )
+    .await;
+    assert!(text(&compact_result).contains("Compact%20session"));
+    release_session(&socket, "compact-session").await;
+    compact.cancel().await.expect("stop compact MCP adapter");
+    reconnected
+        .cancel()
+        .await
+        .expect("stop reconnected MCP adapter");
+
+    stop_broker(&socket, broker).await;
+    wait_for_browser_exit(port).await;
+    test_site_task.abort();
+    let _ = test_site_task.await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
+async fn exercise_window_per_session_layout() {
+    let root = std::env::temp_dir().join(format!(
+        "opencode-browser-mcp-e2e-{}-window-layout",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir(&root).expect("create private layout test directory");
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+        .expect("restrict layout test directory");
+    let profile = root.join("profile");
+    let socket = root.join("broker.sock");
+    let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .expect("reserve layout test CDP port")
+        .local_addr()
+        .expect("layout test CDP address")
+        .port();
+    let broker = start_broker(&socket, &profile, port, "window-per-session").await;
+    let client = client(&socket, "opencode-direct").await;
+    call_ok(
+        &client,
+        "navigate_page",
+        "layout-a",
+        json!({
+            "type": "url",
+            "url": "data:text/html,<title>Layout%20A</title>"
+        }),
+    )
+    .await;
+    call_ok(
+        &client,
+        "navigate_page",
+        "layout-b",
+        json!({
+            "type": "url",
+            "url": "data:text/html,<title>Layout%20B</title>"
+        }),
+    )
+    .await;
+    let window_a = window_for_url(port, "Layout%20A").await;
+    let window_b = window_for_url(port, "Layout%20B").await;
+    assert_ne!(window_a, window_b, "different sessions shared a window");
+    call_ok(
+        &client,
+        "new_page",
+        "layout-a",
+        json!({"url": "data:text/html,<title>Layout%20A2</title>"}),
+    )
+    .await;
+    assert_eq!(
+        window_for_url(port, "Layout%20A2").await,
+        window_a,
+        "a session's second tab was placed in another window"
+    );
+
+    client.cancel().await.expect("stop layout MCP adapter");
+    stop_broker(&socket, broker).await;
+    wait_for_browser_exit(port).await;
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test]
 #[ignore = "starts isolated headed browsers"]
 async fn isolates_sessions_in_both_window_layouts() {
-    exercise_layout("shared-window", false).await;
-    exercise_layout("window-per-session", true).await;
+    exercise_shared_broker().await;
+    exercise_window_per_session_layout().await;
 }

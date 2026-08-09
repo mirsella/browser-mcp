@@ -4,79 +4,63 @@
 [![CI](https://github.com/mirsella/opencode-browser-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/mirsella/opencode-browser-mcp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**One browser profile. Separate tab ownership for every MCP session.**
+**One shared browser profile. Separate tab ownership for every MCP session.**
 
 This package is a local browser broker built around
 [`chrome-devtools-mcp`](https://github.com/ChromeDevTools/chrome-devtools-mcp).
-Concurrent agents share one managed Chromium-family browser and its signed-in
-profile, while a Rust daemon assigns each CDP tab to exactly one session.
+One explicit broker process owns the Chromium-family browser, profile, CDP
+connection, workers, and tab ownership state. OpenCode instances and generic MCP
+hosts connect through small stdio adapters over a private Unix socket.
 
-It works as a standard stdio MCP server. The bundled OpenCode plugin adds a
-stronger integration that multiplexes many OpenCode conversations through the
-same MCP connection without exposing routing details to the model.
+All adapters share cookies, logins, local storage, cache, extensions, and other
+profile data. They do not share tab control: the broker assigns each CDP tab to
+one routed session and filters every action and response by that ownership.
 
-The MCP daemon answers compact OpenCode initialization without starting its
-downstream worker or opening Chromium. Compact help, direct tool listing, or the
-first browser action initializes the tool catalog on demand. The first browser
-action then starts the managed browser and restores any matching ownership state.
-
-Tab control is isolated. Browser data is shared. See [security model](#security-model)
-before using a profile that contains sensitive accounts.
+The broker is never started implicitly. Its launch environment and browser
+configuration are explicit, so an unrelated OpenCode service cannot accidentally
+start Chromium with stale display variables. The broker stays alive when all
+adapters disconnect and stops only on a signal or an explicit control request.
 
 ## Why this exists
 
 | Setup | Result |
 | --- | --- |
-| One DevTools MCP server shared by every agent | Agents share current-page state and can collide with each other |
-| One browser per agent | Clean isolation, but every agent needs another browser and another login |
-| This project | One browser and profile, with daemon-enforced tab ownership per session |
+| One unmodified DevTools MCP worker shared by every agent | Agents collide through shared current-page state |
+| One browser per conversation or OpenCode instance | Clean isolation, but duplicated browsers, profiles, and logins |
+| This project | One shared browser and profile, with exact tab ownership per routed session |
 
-The daemon does not infer ownership from whichever page happens to be selected.
-It creates tabs through CDP, records the exact stable target ID, and treats that
-record as the authority for routing and cleanup.
+The broker does not infer ownership from the selected page. It creates tabs
+through CDP, records stable target IDs, and uses that record for routing and
+cleanup.
 
 ## Requirements
 
 - Linux x64
 - Bun for the default `chrome-devtools-mcp` worker launcher
-- Node.js 20.19+, 22.12+, or 23+ when installing or running through npm
+- Node.js 20.19+, 22.12+, or 23+ when running through npm
 - A compatible local Chromium-family browser
-- A graphical display server, unless headless mode is enabled
+- A graphical display server, unless the broker runs headless
+- `XDG_RUNTIME_DIR`, or an explicit socket inside a user-private directory
 - An MCP host, or OpenCode 1.18+ for the bundled plugin
-- `XDG_RUNTIME_DIR` for the default daemon socket, unless a custom socket is configured
 
 ## Installation
 
-The canonical npm package is `@mirsella/opencode-browser-mcp`. It includes the
-OpenCode plugin, browser skill, JavaScript launcher, and Linux x64 native binary.
-OpenCode users normally install it by adding the package to `opencode.json` as
-shown below; OpenCode resolves the npm package on restart.
-
-To run the npm CLI without installing it globally:
-
-```sh
-npx -y @mirsella/opencode-browser-mcp --help
-```
-
-Or install the CLI globally:
+The npm package includes the OpenCode plugin, browser skill, JavaScript launcher,
+and Linux x64 native binary:
 
 ```sh
 npm install --global @mirsella/opencode-browser-mcp
 opencode-browser-mcp --help
 ```
 
-The Cargo package and binary are both named `opencode-browser-mcp`. The crate is
-not currently published on crates.io; install the native MCP server from GitHub:
+The crate is not currently published on crates.io. Install the native binary
+from GitHub if the OpenCode plugin is not needed:
 
 ```sh
 cargo install --git https://github.com/mirsella/opencode-browser-mcp.git --locked opencode-browser-mcp
 ```
 
-The Cargo installation contains only the native generic MCP server. Use the npm
-package for the OpenCode plugin, compact tools, skill, and session lifecycle
-hooks.
-
-To build a source checkout:
+Build a source checkout:
 
 ```sh
 git clone https://github.com/mirsella/opencode-browser-mcp.git
@@ -86,21 +70,79 @@ cargo build --release
 ./target/release/opencode-browser-mcp --help
 ```
 
-For local OpenCode plugin development, reference the checkout directly after
-building it:
+## Start The Broker
 
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugin": [
-    "file:///absolute/path/to/opencode-browser-mcp/plugin/browser-routing.ts"
-  ]
-}
+Start one broker before starting OpenCode or another MCP host:
+
+```sh
+opencode-browser-mcp broker
 ```
 
-## OpenCode setup
+This is a foreground process. Run it in a terminal while testing, or supervise it
+with your user service manager for regular use. Browser options belong after the
+`broker` subcommand:
 
-Add the npm package to `opencode.json`:
+```sh
+opencode-browser-mcp broker \
+  --profile "$HOME/.config/opencode-browser-mcp/chromium" \
+  --session-layout window-per-session
+```
+
+The default socket is
+`$XDG_RUNTIME_DIR/opencode-browser-mcp/broker.sock`. To use another path, pass
+the same global option to the broker and every adapter:
+
+```sh
+opencode-browser-mcp --socket "$XDG_RUNTIME_DIR/my-browser/broker.sock" broker
+```
+
+The custom socket's parent directory must already exist, belong to the current
+user, and deny access to group and other users.
+
+Stop the broker cleanly from another terminal:
+
+```sh
+opencode-browser-mcp stop-broker
+```
+
+### systemd user service
+
+A user service keeps the browser available across separate OpenCode processes.
+Use an absolute executable path in
+`~/.config/systemd/user/opencode-browser-mcp.service`:
+
+```ini
+[Unit]
+Description=Shared browser MCP broker
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/opencode-browser-mcp broker
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
+```
+
+Before starting a headed broker, make sure the user manager has the current
+graphical-session environment:
+
+```sh
+systemctl --user import-environment DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_SESSION_TYPE XDG_CURRENT_DESKTOP
+systemctl --user daemon-reload
+systemctl --user enable --now opencode-browser-mcp.service
+```
+
+Set broker environment variables in the unit or an `EnvironmentFile` when
+needed. Restart the broker after changing browser settings. Adapters cannot
+override those settings.
+
+## OpenCode Setup
+
+Add the package to `opencode.json` after the broker is running:
 
 ```json
 {
@@ -109,35 +151,26 @@ Add the npm package to `opencode.json`:
 }
 ```
 
-Restart OpenCode after changing the configuration. The plugin:
+Restart OpenCode after changing its configuration. The plugin:
 
-- registers the local `browser` MCP server;
-- advertises one short browser skill and loads its instructions only when needed;
+- registers a local stdio adapter that connects to the existing broker;
 - injects the active OpenCode session ID after model argument generation;
-- releases the session's owned tabs when the agent turn ends or the session is deleted.
+- exposes compact browser tools unless existing permissions require direct tools;
+- releases owned tabs when an OpenCode session becomes idle or is deleted;
+- registers the bundled browser automation skill.
 
-The routing field is absent from every tool schema, so models do not need to
-know about it or spend output tokens supplying it.
+It never starts or configures the broker.
 
 ### Compact tools
 
-OpenCode sees only two small browser tool definitions by default:
+OpenCode sees two small browser tool definitions by default:
 
-- `browser_dispatch` executes any available browser action.
-- `browser_help` lists action names or loads the current schema for one action.
+- `browser_dispatch` executes one browser action.
+- `browser_help` lists actions or loads one action schema.
 
-The complete Chrome DevTools schemas are therefore absent from ordinary turns.
-When browser automation is needed, the agent loads the short skill and requests
-only the action definitions it needs. Generic MCP clients continue to receive
-the full direct tool surface.
-
-Compact mode uses `browser_dispatch` as its OpenCode permission boundary. If
-the plugin detects existing per-action `browser_*` permission or tool rules, it
-automatically falls back to direct tools so those rules keep working. Set
-`compactTools: false` explicitly when policies are generated by another plugin
-or otherwise unavailable during configuration.
-
-To expose every direct `browser_*` tool in OpenCode instead:
+The complete Chrome DevTools schemas stay out of ordinary turns. If the plugin
+detects per-action `browser_*` permission or tool rules, it automatically uses
+direct tools so those policies keep working. Compact mode can also be disabled:
 
 ```json
 {
@@ -148,8 +181,8 @@ To expose every direct `browser_*` tool in OpenCode instead:
 }
 ```
 
-To keep browser tabs between turns, disable completion cleanup and rely on the
-daemon's idle timeout instead:
+`releaseOnIdle` defaults to `true`. Set it to `false` to keep tabs between idle
+turns; deleting the OpenCode session still releases them:
 
 ```json
 {
@@ -160,65 +193,39 @@ daemon's idle timeout instead:
 }
 ```
 
-To give each active OpenCode session its own top-level browser window for visual
-organization, opt into `window-per-session`. This commonly pairs with retained
-tabs so the window stays available between turns:
+For a custom broker socket, configure the same path in the plugin:
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
-    [
-      "@mirsella/opencode-browser-mcp",
-      { "sessionLayout": "window-per-session", "releaseOnIdle": false }
-    ]
+    ["@mirsella/opencode-browser-mcp", { "socket": "/run/user/1000/my-browser/broker.sock" }]
   ]
 }
 ```
 
-`sessionLayout` defaults to `shared-window`. Window placement is best effort:
-the first broker-created tab requests a new window, and later tabs are created
-after activating one of that session's owned tabs. Chromium does not expose an
-atomic "create in window ID" operation, so manual tab moves, site-created
-popups, or other browser activity can change the visual grouping. The broker
-never moves or closes a tab merely to repair window placement.
+Browser profile, headless mode, CDP port, timeouts, and window layout are broker
+settings, not plugin settings.
 
-Browser windows are headed by default. Set the plugin option `headless: true`,
-pass `--headless`, or export `OPENCODE_BROWSER_HEADLESS=true` to run without a
-visible window. An explicit plugin value, including `headless: false`, overrides
-the environment for that MCP connection.
+### Concurrent OpenCode instances
 
-OpenCode 1.18 or newer is required.
+Every OpenCode instance may use the same plugin configuration and broker socket.
+Each gets an independent adapter connection, while OpenCode conversation IDs
+remain the tab-ownership keys. Cookies and other profile data are shared across
+all instances.
 
-## Generic MCP setup
+Reusing one live OpenCode session ID from two workspaces is rejected. This
+prevents unrelated clients from silently taking control of the same owned tabs.
 
-Run the package as a normal stdio MCP server:
+## Generic MCP Setup
 
-```sh
-npx -y @mirsella/opencode-browser-mcp
-```
-
-Generic MCP clients can also opt into separate visual windows per connection:
+The default command is a standard stdio MCP adapter in generic routing mode:
 
 ```sh
-npx -y @mirsella/opencode-browser-mcp --session-layout window-per-session
+opencode-browser-mcp
 ```
 
-For hosts that use JSON configuration, the equivalent shape is:
-
-```json
-{
-  "mcpServers": {
-    "browser": {
-      "command": "npx",
-      "args": ["-y", "@mirsella/opencode-browser-mcp"]
-    }
-  }
-}
-```
-
-After a global npm or Cargo installation, configure the installed binary
-directly instead:
+For JSON-based MCP hosts:
 
 ```json
 {
@@ -230,202 +237,162 @@ directly instead:
 }
 ```
 
-Each stdio connection gets its own browser session. Calls on that connection
-see only its owned tabs. When the connection closes, the daemon closes those
-tabs and leaves tabs owned by other connections alone.
+The broker must already be running. If its socket is unavailable, the adapter
+fails with a clear error and does not start a background process.
 
-Generic clients must not set `__opencode_session_id`. That field belongs to the
-OpenCode adapter and is rejected on ordinary MCP connections.
+Each generic adapter connection receives one unique browser session. Disconnecting
+it closes only its owned tabs; the broker, browser, profile, and other adapters
+remain alive. Generic clients must not set `__opencode_session_id`, which is
+reserved for OpenCode routing.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    G[Generic MCP client] -->|one session per connection| GB[stdio bridge]
-    O[OpenCode plugin] -->|many conversation IDs| OB[stdio bridge]
-    GB --> S[private Unix socket]
-    OB --> S
-    S --> D[Rust browser daemon]
-    D --> T[CDP target tracker]
-    D --> W1[session worker A]
-    D --> W2[session worker B]
-    W1 --> C[chrome-devtools-mcp]
-    W2 --> C
+    O1[OpenCode instance A] --> A1[stdio adapter]
+    O2[OpenCode instance B] --> A2[stdio adapter]
+    G[Generic MCP host] --> A3[stdio adapter]
+    A1 -->|private Unix socket| R[foreground broker]
+    A2 -->|private Unix socket| R
+    A3 -->|private Unix socket| R
+    R --> T[CDP target tracker]
+    R --> W[session worker pool]
+    W --> C[chrome-devtools-mcp]
     T --> B[managed browser]
     C --> B
-    B --> P[shared profile]
+    B --> P[shared locked profile]
 ```
 
-Each active browser session leases its own `chrome-devtools-mcp` worker.
-Reusable workers are kept in a bounded, workspace-keyed warm pool to avoid
-browser-level CDP reconnect churn and are health-checked before each lease.
-The compact two-tool surface is available before the downstream worker starts.
-Direct tool listing, compact help, and the first action trigger one daemon-owned
-tool discovery task and await its cached result. None of these operations opens
-the browser; Chromium still starts only for an actual browser action.
-Worker-local numeric page IDs never cross session boundaries. The daemon maps
-them to stable browser-level CDP tab targets and removes page selection tools
-from the public surface.
+Adapters only relay MCP bytes and identify their routing mode. The broker is the
+single authority for browser configuration and profile ownership. Socket peers
+must have the same Unix UID as the broker.
 
-Ownership state is written atomically beside the daemon socket. If the daemon
-crashes while the browser survives, it restores ownership only when the exact
-browser WebSocket generation and live tab targets still match.
+Each active browser session leases its own `chrome-devtools-mcp` worker. Reusable
+workers are kept in a bounded, workspace-keyed warm pool and health-checked
+before each lease. Compact tool listing is available before the downstream
+worker starts. Direct tool listing and compact help load the catalog lazily;
+neither operation opens Chromium.
 
-## Ownership guarantees
+Worker-local numeric page IDs never cross session boundaries. The broker maps
+them to stable browser-level CDP targets and removes page selection tools from
+the public surface.
+
+Ownership state is written atomically inside the browser profile. If the broker
+crashes while its browser survives, a replacement broker restores ownership only
+when the exact browser WebSocket generation and live targets still match.
+
+## Ownership Guarantees
 
 - A tab has at most one owner.
-- Sessions run concurrently through separate downstream workers.
+- Routed sessions execute concurrently through separate workers.
 - Popups inherit the owner of their opener tab.
-- Optional per-session windows are visual organization only; target ownership remains the routing authority.
-- A session cannot select, inspect, or close another session's tabs through this MCP server.
-- Manual and otherwise unowned tabs are never claimed during session cleanup.
-- Stale browser generations, malformed worker responses, ownership conflicts, and tracker disconnects fail closed.
-- Reusing one routed session ID from another workspace is rejected.
-- `pageId`, `select_page`, and the OpenCode routing field are not exposed to models.
+- A session cannot select, inspect, or close another session's tabs through the broker.
+- Manual and otherwise unowned tabs are never claimed during cleanup.
+- Stale generations, malformed responses, ownership conflicts, and tracker disconnects fail closed.
+- Worker page IDs, page-selection tools, and the OpenCode routing field are hidden from models.
+- Per-session windows are visual organization only; stable target ownership remains authoritative.
 
-These are routing guarantees, not an operating-system security boundary. Any
-local process that connects directly to the CDP port bypasses the broker.
+These are routing guarantees, not an operating-system security boundary. A local
+process that connects directly to the CDP port bypasses the broker.
 
-## Browser compatibility
+## Browser Compatibility
 
-The managed browser must be a Chromium-family browser with a Chrome-compatible
-browser-level CDP endpoint. In particular, this project relies on Chromium's
-`Target` discovery, flat sessions, tab targets, opener lineage, and
-`Target.createTarget` with `forTab`. Per-session window layout additionally uses
-`Target.createTarget` with `newWindow`, `Target.activateTarget`, and
-`Browser.getWindowForTarget`.
+The managed browser must provide a Chrome-compatible browser-level CDP endpoint.
+Google Chrome and Chrome for Testing are supported by the pinned
+`chrome-devtools-mcp@1.6.0`. Helium, Chromium, Brave, and Microsoft Edge are
+detected on a best-effort basis.
 
-Google Chrome and Chrome for Testing are the browsers officially supported by
-the pinned `chrome-devtools-mcp@1.6.0`. The launcher also detects Helium,
-Chromium, Brave, and Microsoft Edge. Those browsers are best-effort because
-their CDP behavior is not guaranteed by the upstream MCP project.
-
-Use any compatible local executable explicitly:
-
-```sh
-OPENCODE_BROWSER_EXECUTABLE=/path/to/browser \
-OPENCODE_BROWSER_PROFILE=/path/to/user-data-dir \
-npx -y @mirsella/opencode-browser-mcp
-```
-
-The executable must accept Chromium command-line flags. The profile value is a
-full user-data directory, not a named profile such as `Default`.
-
-Chrome 136 and newer ignore remote-debugging flags for Chrome's default data
-directory. For Google Chrome and Chrome for Testing, the default user-data
-directory is `$XDG_CONFIG_HOME/opencode-browser-mcp/google-chrome`, or
+The profile is a full user-data directory, not a named profile such as
+`Default`. Chrome 136 and newer ignore remote-debugging flags for Chrome's
+default data directory. For Google Chrome and Chrome for Testing, this package
+therefore defaults to
+`$XDG_CONFIG_HOME/opencode-browser-mcp/google-chrome`, or
 `~/.config/opencode-browser-mcp/google-chrome` when `XDG_CONFIG_HOME` is unset.
-Set `OPENCODE_BROWSER_PROFILE` to another non-default directory if you want a
-previously signed-in profile. The current release manages a loopback CDP
-endpoint; attaching to an arbitrary existing or remote endpoint is not
-supported.
+Set `OPENCODE_BROWSER_PROFILE` on the broker to use another non-default profile.
+Attaching to arbitrary existing or remote CDP endpoints is not supported.
 
 ## Lifecycle
 
 | Event | Behavior |
 | --- | --- |
-| MCP initializes, lists tools, or loads compact help | The daemon responds without starting Chromium |
-| First browser action | The managed browser and CDP ownership tracker start lazily |
-| Generic MCP connection closes | Its owned tabs and worker lease are released |
-| OpenCode turn becomes idle | Its owned tabs are released by default |
-| OpenCode session is deleted | Its owned tabs are released |
-| Release arrives during an active call | Cleanup is queued and runs after active work completes |
-| Session exceeds the idle timeout | The daemon retries cleanup as a fallback |
-| Last MCP stdio bridge disconnects | After two seconds, the daemon closes the managed browser and clears ownership |
-| Daemon crashes but browser survives | Matching generation state is recovered conservatively |
+| Broker starts | Profile and socket leases are acquired; Chromium remains stopped |
+| Adapter initializes or compact tools are listed | No downstream worker or browser is started |
+| Direct tools are listed or compact help is loaded | The downstream catalog starts lazily; Chromium stays stopped |
+| First browser action | The managed browser and ownership tracker start |
+| Generic adapter disconnects | Only that adapter's session and tabs are released |
+| OpenCode session becomes idle or is deleted | The plugin asks the broker to release that session |
+| All adapters disconnect | The broker and browser remain available |
+| Broker receives a stop request or signal | Active calls get up to five seconds to finish, then workers and browser close and leases are released |
+| Broker crashes but browser survives | Matching generation state can be recovered conservatively |
 
-`releaseOnIdle: false` keeps OpenCode tabs alive between turns. The default
-daemon idle timeout is 60 minutes.
-
-Closing a TUI attached to a long-lived OpenCode server does not necessarily
-close the server's shared MCP bridge. OpenCode currently exposes no plugin event
-for an individual attached client disconnect, so use turn-idle cleanup, session
-deletion, or the daemon idle timeout for per-session cleanup.
+The native idle timeout is a fallback for routed sessions and defaults to 60
+minutes. Set `OPENCODE_BROWSER_IDLE_MINUTES=0` on the broker to disable expiry.
 
 ## Configuration
+
+Global adapter and control configuration:
+
+| Environment variable | Default | Purpose |
+| --- | --- | --- |
+| `OPENCODE_BROWSER_SOCKET` | `$XDG_RUNTIME_DIR/opencode-browser-mcp/broker.sock` | Private broker socket used by all processes |
+| `RUST_LOG` | `opencode_browser_mcp=info` | Native process log filter |
+
+Broker-only configuration:
 
 | Environment variable | Default | Purpose |
 | --- | --- | --- |
 | `OPENCODE_BROWSER_EXECUTABLE` | auto-detected | Chromium-family browser executable |
-| `OPENCODE_BROWSER_PROFILE` | browser-dependent; see Browser compatibility | Shared browser data directory |
+| `OPENCODE_BROWSER_PROFILE` | browser-dependent | Shared browser data directory, exclusively locked by the broker |
 | `OPENCODE_BROWSER_HEADLESS` | `false` | Run Chromium without a visible window |
-| `OPENCODE_BROWSER_SOCKET` | `$XDG_RUNTIME_DIR/opencode-browser-mcp/daemon.sock` | Private daemon socket |
-| `OPENCODE_BROWSER_SESSION_LAYOUT` | `shared-window` | `shared-window` or best-effort `window-per-session` organization |
+| `OPENCODE_BROWSER_SESSION_LAYOUT` | `shared-window` | `shared-window` or best-effort `window-per-session` |
 | `OPENCODE_BROWSER_CDP_HOST` | `127.0.0.1` | CDP host; loopback only |
 | `OPENCODE_BROWSER_CDP_PORT` | `9222` | CDP port |
-| `OPENCODE_BROWSER_IDLE_MINUTES` | `60` | Fallback session cleanup; `0` disables expiry |
+| `OPENCODE_BROWSER_IDLE_MINUTES` | `60` | Routed-session cleanup; `0` disables expiry |
 | `OPENCODE_BROWSER_STARTUP_SECONDS` | `20` | Browser startup deadline |
 | `OPENCODE_BROWSER_OPERATION_SECONDS` | `540` | Browser operation deadline |
 | `OPENCODE_BROWSER_DOWNSTREAM_COMMAND` | `bunx` | `chrome-devtools-mcp` launcher |
 | `OPENCODE_BROWSER_DISABLE_CRASH_REPORTER` | `false` | Disable Chromium crash reporting |
-| `RUST_LOG` | `opencode_browser_mcp=info` | Native daemon log filter |
 
-The first client starts the daemon and fixes these values for its lifetime, but
-Chromium remains stopped until a browser action needs it. Later clients with a
-different daemon configuration are rejected.
+The broker reads browser settings once at startup. Adapter environments do not
+change a running broker.
 
-The default socket directory is created under `XDG_RUNTIME_DIR` with mode
-`0700`. A custom socket path does not create its parent; the parent must already
-exist, be owned by the current user, and have no group or other permissions. The
-browser profile must satisfy the same ownership and privacy requirements.
-
-For a socket path `<socket>`, runtime files are:
+The profile and socket directories must be owned by the current user and deny
+group/other access. Runtime files are:
 
 ```text
-<socket>
-<socket>.lock
-<socket>.state.json
-<socket>.stderr.log
+$XDG_RUNTIME_DIR/opencode-browser-mcp/broker.sock
+$XDG_RUNTIME_DIR/opencode-browser-mcp/broker.sock.lock
+<profile>/opencode-browser-mcp.lock
+<profile>/opencode-browser-mcp.state.json
 ```
 
-The browser profile also contains `opencode-browser-mcp.lock`. Environment
-overrides must be exported to the OpenCode process so the plugin and MCP server
-inherit them.
-
-CLI controls:
-
-```sh
-opencode-browser-mcp --help
-opencode-browser-mcp --version
-opencode-browser-mcp --stop-daemon
-```
-
-The routing modes are `connection` for generic MCP clients, `opencode` for the
-compact OpenCode interface, and `opencode-direct` for OpenCode with every direct
-tool exposed. The plugin selects the appropriate OpenCode mode automatically.
+The routing modes are `connection` for generic adapters, `opencode` for compact
+OpenCode tools, and `opencode-direct` for OpenCode with direct tools. The plugin
+selects its OpenCode mode automatically.
 
 ### Troubleshooting
 
-- If `XDG_RUNTIME_DIR` is unavailable, set `OPENCODE_BROWSER_SOCKET` to a socket
-  inside an existing private directory.
-- Permission errors for the socket or profile mean the path is not owned by the
-  current user or permits group/other access. Restrict the directory to `0700`.
-- A process already listening on the configured CDP port must belong to the
-  exact managed browser generation. Stop it or choose another
-  `OPENCODE_BROWSER_CDP_PORT`; arbitrary existing CDP endpoints are rejected.
-- A profile-lock error means another daemon is already using that profile.
-- Browser startup and daemon errors are written to `<socket>.stderr.log`.
-- If `chrome-devtools-mcp` cannot start, verify that `bunx` is available or set
-  `OPENCODE_BROWSER_DOWNSTREAM_COMMAND` to a compatible launcher, then restart
-  the OpenCode MCP connection; catalog initialization errors are cached for the
-  daemon lifetime.
-- The plugin refuses to replace an unrelated `mcp.browser` entry. Remove or
-  rename that MCP configuration before enabling this package.
+- “Browser broker is not running” means the adapter could not connect. Start the foreground broker or its user service and verify that both use the same socket.
+- A headed browser that reports a missing display means the broker service lacks the graphical-session environment. Import it into the user manager and restart the broker service.
+- A socket or profile lease error means another broker already owns it, or a stale process is still running. Do not bypass the locks.
+- A permission error means a socket/profile directory or runtime file is not private and owned by the current user.
+- A process on the configured CDP port must belong to the exact managed browser generation. Stop it or choose another port.
+- Broker and browser diagnostics are written to the broker's stderr or service journal. Adapter connection errors appear in the MCP host logs.
+- If downstream startup fails, verify `bunx` or configure `OPENCODE_BROWSER_DOWNSTREAM_COMMAND` on the broker.
+- The plugin refuses to replace an unrelated `mcp.browser` entry.
 
-## Security model
-
-The broker protects tab ownership only for clients that use its MCP interface.
+## Security Model
 
 | Protected by the broker | Shared by design | Outside the boundary |
 | --- | --- | --- |
 | Tab visibility, selection, and cleanup | Cookies, logins, storage, extensions, cache, permissions, and downloads | Direct access to the loopback CDP port |
-| Worker-local page selection state | Browser process and profile | Other processes running as the same user |
+| Worker-local page selection state | Browser process and profile | Other processes running as the same Unix user |
 | Generation-scoped ownership recovery | Network and website content | Prompt injection from pages |
-| Private daemon socket and state files | Workspace access granted to the MCP host | OS, container, or VM isolation |
+| Private same-UID socket and profile lock | Workspace access granted to the MCP host | OS, container, or VM isolation |
 
-The downstream worker disables usage statistics and CrUX field-data requests.
-It also disables update checks and redacts headers that upstream classifies as
-sensitive. URLs, bodies, and other headers can still appear in tool output.
+The downstream worker disables usage statistics, CrUX requests, and update
+checks, and redacts headers that upstream classifies as sensitive. URLs, bodies,
+and other headers can still appear in tool output.
 
 Read [`SECURITY.md`](SECURITY.md) before using a profile with sensitive data.
 
@@ -433,13 +400,12 @@ Read [`SECURITY.md`](SECURITY.md) before using a profile with sensitive data.
 
 - The published native binary supports Linux x64 only.
 - Browser windows are headed by default; headless mode is optional.
-- Browser profile data is shared between sessions.
 - The CDP endpoint is unauthenticated loopback TCP.
 - Browser content is untrusted input and can contain prompt injection.
-- The target ownership model requires Chromium-specific CDP behavior.
+- The ownership model requires Chromium-specific CDP behavior.
 - Browser tools rely on experimental interfaces from `chrome-devtools-mcp@1.6.0`.
-- `isolatedContext` is intentionally disabled because it conflicts with shared-profile ownership.
-- A fresh existing CDP endpoint and remote CDP endpoints are not supported.
+- `isolatedContext` is disabled because it conflicts with shared-profile ownership.
+- Arbitrary existing and remote CDP endpoints are not supported.
 
 ## Development
 
@@ -451,26 +417,22 @@ bun test tests/plugin.test.ts
 cargo test --release --test e2e -- --ignored --nocapture
 ```
 
-The headed E2E test uses a temporary profile and CDP port. Building the npm
-artifact requires Rust 1.89 or newer and the musl target:
-
-```sh
-rustup target add x86_64-unknown-linux-musl
-npm pack
-```
+The headed E2E starts explicit brokers with temporary profiles, sockets, and CDP
+ports. It checks cookie sharing, tab isolation, concurrent calls, release during
+an active call, reconnecting adapters, generic cleanup, compact dispatch, both
+window layouts, and clean browser shutdown.
 
 | Path | Responsibility |
 | --- | --- |
-| `plugin/` | OpenCode routing and lifecycle adapter |
+| `plugin/` | OpenCode adapter registration, session routing, and cleanup controls |
 | `bin/` | npm launcher for the native binary |
-| `src/daemon.rs` | stdio bridges, Unix socket daemon, connection routing, and controls |
+| `src/broker.rs` | Unix adapter bridge, foreground broker lifecycle, routing, and profile/socket leases |
 | `src/cdp.rs` | stable CDP target tracking and ownership |
-| `src/main.rs` | browser supervision, session workers, and response filtering |
+| `src/main.rs` | CLI, browser supervision, workers, and response filtering |
 | `src/persistence.rs` | atomic generation-scoped ownership state |
-| `tests/e2e.rs` | real-browser isolation and cleanup coverage |
+| `tests/e2e.rs` | shared-broker, isolation, routing, and shutdown coverage |
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the development and release
-workflow.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the development and release workflow.
 
 ## License
 

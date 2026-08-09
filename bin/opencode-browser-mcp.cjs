@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
-const { existsSync } = require("node:fs");
+const { X_OK } = require("node:constants");
+const { accessSync, chmodSync, existsSync } = require("node:fs");
 const { join, resolve } = require("node:path");
 const { spawn } = require("node:child_process");
 
@@ -20,6 +21,17 @@ const binary = candidates.find(existsSync);
 if (!binary) {
 	console.error("opencode-browser-mcp native binary is missing; run `cargo build --release`");
 	process.exit(1);
+}
+
+try {
+	accessSync(binary, X_OK);
+} catch {
+	try {
+		chmodSync(binary, 0o755);
+	} catch (error) {
+		console.error(`opencode-browser-mcp native binary is not executable: ${error.message}`);
+		process.exit(1);
+	}
 }
 
 const child = spawn(binary, process.argv.slice(2), {

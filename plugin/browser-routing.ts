@@ -25,14 +25,8 @@ type ConfigWithPolicies = {
 
 type BrowserRoutingOptions = {
 	compactTools?: boolean;
-	headless?: boolean;
 	releaseOnIdle?: boolean;
-	sessionLayout?: "shared-window" | "window-per-session";
-};
-
-type PendingRelease = {
-	deleted: boolean;
-	task: Promise<boolean>;
+	socket?: string;
 };
 
 function matchesToolPattern(pattern: string, tool: string): boolean {
@@ -61,37 +55,31 @@ function requiresDirectTools(config: ConfigWithPolicies): boolean {
 }
 
 export const BrowserRouting: Plugin = async ({ $ }, options) => {
-	const { compactTools = true, headless, releaseOnIdle = true, sessionLayout } = (options ?? {}) as BrowserRoutingOptions;
+	const { compactTools = true, releaseOnIdle = true, socket } = (options ?? {}) as BrowserRoutingOptions;
 	if (typeof compactTools !== "boolean") throw new Error("compactTools must be a boolean");
-	if (headless !== undefined && typeof headless !== "boolean") throw new Error("headless must be a boolean");
 	if (typeof releaseOnIdle !== "boolean") throw new Error("releaseOnIdle must be a boolean");
-	if (sessionLayout !== undefined && sessionLayout !== "shared-window" && sessionLayout !== "window-per-session")
-		throw new Error('sessionLayout must be "shared-window" or "window-per-session"');
+	if (socket !== undefined && (typeof socket !== "string" || socket.length === 0)) {
+		throw new Error("socket must be a non-empty string");
+	}
+	const commandPrefix = [MCP_CLI, ...(socket === undefined ? [] : ["--socket", socket])];
 	const usedSessions = new Set<string>();
-	const pendingReleases = new Map<string, PendingRelease>();
-	const release = (sessionID: string, deleted = false) => {
+	const pendingReleases = new Map<string, Promise<boolean>>();
+	const release = (sessionID: string) => {
 		const pending = pendingReleases.get(sessionID);
-		if (pending) {
-			pending.deleted ||= deleted;
-			return pending;
-		}
-		const next: PendingRelease = {
-			deleted,
-			task: (async () => {
-				try {
-					const result = await $`${MCP_CLI} --release-session ${sessionID}`.quiet().nothrow();
-					if (result.exitCode === 0) return true;
-					console.error(
-						`Failed to release browser session ${sessionID}: ${String(result.stderr).trim()}`,
-					);
-				} catch (error) {
-					console.error(`Failed to release browser session ${sessionID}`, error);
-				}
-				return false;
-			})(),
-		};
+		if (pending) return pending;
+		const command = [...commandPrefix, "release-session", sessionID];
+		const next = (async () => {
+			try {
+				const result = await $`${command}`.quiet().nothrow();
+				if (result.exitCode === 0) return true;
+				console.error(`Failed to release browser session ${sessionID}: ${String(result.stderr).trim()}`);
+			} catch (error) {
+				console.error(`Failed to release browser session ${sessionID}`, error);
+			}
+			return false;
+		})();
 		pendingReleases.set(sessionID, next);
-		void next.task.finally(() => {
+		void next.finally(() => {
 			if (pendingReleases.get(sessionID) === next) pendingReleases.delete(sessionID);
 		});
 		return next;
@@ -117,12 +105,9 @@ export const BrowserRouting: Plugin = async ({ $ }, options) => {
 					"@mirsella/opencode-browser-mcp cannot replace the existing mcp.browser configuration",
 				);
 			}
-			const command = [MCP_CLI, "--routing", compact ? "opencode" : "opencode-direct"];
-			if (sessionLayout !== undefined) command.push("--session-layout", sessionLayout);
-			if (headless !== undefined) command.push("--headless", String(headless));
 			config.mcp.browser = {
 				type: "local",
-				command,
+				command: [...commandPrefix, "--routing", compact ? "opencode" : "opencode-direct"],
 				enabled: true,
 				timeout: 600_000,
 			};
@@ -133,19 +118,19 @@ export const BrowserRouting: Plugin = async ({ $ }, options) => {
 			if (!output.args || typeof output.args !== "object" || Array.isArray(output.args)) {
 				throw new Error("browser tool call has invalid arguments");
 			}
-			await pendingReleases.get(input.sessionID)?.task;
+			await pendingReleases.get(input.sessionID);
 			if (input.tool !== "browser_help") usedSessions.add(input.sessionID);
 			(output.args as Record<string, unknown>)[SESSION_KEY] = input.sessionID;
 		},
 		event: async ({ event }) => {
-			if (releaseOnIdle && event.type === "session.idle" && usedSessions.delete(event.properties.sessionID)) {
-				const pending = release(event.properties.sessionID);
-				if (!(await pending.task) && !pending.deleted) usedSessions.add(event.properties.sessionID);
+			if (releaseOnIdle && event.type === "session.idle" && usedSessions.has(event.properties.sessionID)) {
+				if (await release(event.properties.sessionID)) usedSessions.delete(event.properties.sessionID);
 			}
 			if (event.type === "session.deleted") {
 				const id = event.properties.info.id;
 				usedSessions.delete(id);
-				await release(id, true).task;
+				const pending = pendingReleases.get(id);
+				if (!pending || !(await pending)) await release(id);
 			}
 		},
 	};
