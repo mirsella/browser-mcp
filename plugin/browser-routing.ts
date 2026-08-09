@@ -25,6 +25,7 @@ type ConfigWithPolicies = {
 
 type BrowserRoutingOptions = {
 	compactTools?: boolean;
+	headless?: boolean;
 	releaseOnIdle?: boolean;
 	sessionLayout?: "shared-window" | "window-per-session";
 };
@@ -60,8 +61,9 @@ function requiresDirectTools(config: ConfigWithPolicies): boolean {
 }
 
 export const BrowserRouting: Plugin = async ({ $ }, options) => {
-	const { compactTools = true, releaseOnIdle = true, sessionLayout } = (options ?? {}) as BrowserRoutingOptions;
+	const { compactTools = true, headless, releaseOnIdle = true, sessionLayout } = (options ?? {}) as BrowserRoutingOptions;
 	if (typeof compactTools !== "boolean") throw new Error("compactTools must be a boolean");
+	if (headless !== undefined && typeof headless !== "boolean") throw new Error("headless must be a boolean");
 	if (typeof releaseOnIdle !== "boolean") throw new Error("releaseOnIdle must be a boolean");
 	if (sessionLayout !== undefined && sessionLayout !== "shared-window" && sessionLayout !== "window-per-session")
 		throw new Error('sessionLayout must be "shared-window" or "window-per-session"');
@@ -117,6 +119,7 @@ export const BrowserRouting: Plugin = async ({ $ }, options) => {
 			}
 			const command = [MCP_CLI, "--routing", compact ? "opencode" : "opencode-direct"];
 			if (sessionLayout !== undefined) command.push("--session-layout", sessionLayout);
+			if (headless !== undefined) command.push("--headless", String(headless));
 			config.mcp.browser = {
 				type: "local",
 				command,

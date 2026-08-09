@@ -14,7 +14,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{Parser, ValueEnum};
+use clap::{ArgAction, Parser, ValueEnum};
 use futures_util::{FutureExt, future::BoxFuture, future::Shared};
 use reqwest::{Client, Url, redirect::Policy};
 #[allow(deprecated)]
@@ -172,6 +172,15 @@ struct Config {
         default_value_os_t = default_browser_profile()
     )]
     profile: PathBuf,
+    #[arg(
+        long,
+        env = "OPENCODE_BROWSER_HEADLESS",
+        default_value_t = false,
+        action = ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    headless: bool,
     #[arg(long, env = "OPENCODE_BROWSER_DISABLE_CRASH_REPORTER")]
     disable_crash_reporter: bool,
     #[arg(long, env = "OPENCODE_BROWSER_CDP_HOST", default_value = "127.0.0.1")]
@@ -208,7 +217,7 @@ impl Config {
         }
 
         let mut identity = Vec::new();
-        field(&mut identity, b"daemon-config-v3");
+        field(&mut identity, b"daemon-config-v4");
         field(&mut identity, env!("CARGO_PKG_VERSION").as_bytes());
         let executable = std::fs::metadata("/proc/self/exe")
             .context("failed to identify the browser MCP executable")?;
@@ -219,6 +228,7 @@ impl Config {
             self.browser_executable.as_os_str().as_bytes(),
         );
         field(&mut identity, self.profile.as_os_str().as_bytes());
+        field(&mut identity, &[self.headless.into()]);
         field(&mut identity, &[self.disable_crash_reporter.into()]);
         field(
             &mut identity,
@@ -339,12 +349,15 @@ impl BrowserSupervisor {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .kill_on_drop(true);
+            if self.config.headless {
+                command.arg("--headless=new");
+            }
             if self.config.disable_crash_reporter {
                 command
                     .arg("--disable-breakpad")
                     .arg("--disable-crash-reporter");
             }
-            info!(executable = %self.config.browser_executable.display(), profile = %self.config.profile.display(), "starting browser");
+            info!(executable = %self.config.browser_executable.display(), profile = %self.config.profile.display(), headless = self.config.headless, "starting browser");
             state.process = Some(command.spawn().context("failed to start browser")?);
         }
         match self.wait_until_ready().await {
@@ -1864,6 +1877,20 @@ fn validate_config(config: &Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn browser_is_headed_by_default_and_headless_is_configurable() {
+        assert!(!Config::try_parse_from(["test"]).unwrap().headless);
+        assert!(
+            Config::try_parse_from(["test", "--headless"])
+                .unwrap()
+                .headless
+        );
+        assert!(
+            !Config::try_parse_from(["test", "--headless=false"])
+                .unwrap()
+                .headless
+        );
+    }
     #[test]
     fn removes_page_id_from_schema_and_required_fields() {
         let mut schema = json!({"type":"object","properties":{"pageId":{"type":"number"},"url":{"type":"string"}},"required":["pageId","url"]}).as_object().unwrap().clone();

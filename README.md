@@ -41,7 +41,7 @@ record as the authority for routing and cleanup.
 - Bun for the default `chrome-devtools-mcp` worker launcher
 - Node.js 20.19+, 22.12+, or 23+ when installing or running through npm
 - A compatible local Chromium-family browser
-- A graphical display server; headless mode is not supported
+- A graphical display server, unless headless mode is enabled
 - An MCP host, or OpenCode 1.18+ for the bundled plugin
 - `XDG_RUNTIME_DIR` for the default daemon socket, unless a custom socket is configured
 
@@ -182,6 +182,11 @@ after activating one of that session's owned tabs. Chromium does not expose an
 atomic "create in window ID" operation, so manual tab moves, site-created
 popups, or other browser activity can change the visual grouping. The broker
 never moves or closes a tab merely to repair window placement.
+
+Browser windows are headed by default. Set the plugin option `headless: true`,
+pass `--headless`, or export `OPENCODE_BROWSER_HEADLESS=true` to run without a
+visible window. An explicit plugin value, including `headless: false`, overrides
+the environment for that MCP connection.
 
 OpenCode 1.18 or newer is required.
 
@@ -343,6 +348,7 @@ deletion, or the daemon idle timeout for per-session cleanup.
 | --- | --- | --- |
 | `OPENCODE_BROWSER_EXECUTABLE` | auto-detected | Chromium-family browser executable |
 | `OPENCODE_BROWSER_PROFILE` | browser-dependent; see Browser compatibility | Shared browser data directory |
+| `OPENCODE_BROWSER_HEADLESS` | `false` | Run Chromium without a visible window |
 | `OPENCODE_BROWSER_SOCKET` | `$XDG_RUNTIME_DIR/opencode-browser-mcp/daemon.sock` | Private daemon socket |
 | `OPENCODE_BROWSER_SESSION_LAYOUT` | `shared-window` | `shared-window` or best-effort `window-per-session` organization |
 | `OPENCODE_BROWSER_CDP_HOST` | `127.0.0.1` | CDP host; loopback only |
@@ -426,7 +432,7 @@ Read [`SECURITY.md`](SECURITY.md) before using a profile with sensitive data.
 ## Limitations
 
 - The published native binary supports Linux x64 only.
-- Browser windows are headed; there is no headless option yet.
+- Browser windows are headed by default; headless mode is optional.
 - Browser profile data is shared between sessions.
 - The CDP endpoint is unauthenticated loopback TCP.
 - Browser content is untrusted input and can contain prompt injection.
