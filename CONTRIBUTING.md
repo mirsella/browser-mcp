@@ -30,15 +30,15 @@ cleanup, persistence, profile locking, or process shutdown:
 cargo test --release --test e2e -- --ignored --nocapture
 ```
 
-The E2E test starts foreground brokers with temporary profiles, private sockets,
-and CDP ports. It connects independent OpenCode and generic adapters to the same
-broker and verifies shared cookies, tab isolation, compact dispatch, concurrent
-calls, release during an active call, reconnecting adapters, unowned-tab
-preservation, lazy Chromium activation, per-session window placement, broker
-lease contention, and clean browser shutdown. The regular integration suite
-also verifies that adapters do not auto-start an absent broker.
+The E2E test starts adapters with temporary profiles, private sockets, and CDP
+ports. It verifies automatic race-safe broker startup, shared cookies, tab
+isolation, compact dispatch, concurrent calls, release during an active call,
+reconnecting adapters, unowned-tab preservation, lazy Chromium activation,
+per-session window placement, and automatic browser shutdown. The regular
+integration suite verifies that one adapter disconnect cannot stop a broker
+still used by another adapter.
 
-Check the npm artifact when changing package files or the native launcher:
+Check the npm artifact when changing package files or the native binary:
 
 ```sh
 rustup target add x86_64-unknown-linux-musl
@@ -54,21 +54,21 @@ npm pack --dry-run
 - Cleanup closes only exact targets owned by the retiring session.
 - Browser generation changes invalidate ownership instead of guessing.
 - Ownership conflicts and malformed downstream responses fail closed.
-- Generic MCP routing and OpenCode routing remain separate adapter modes.
-- One explicit foreground broker owns the browser configuration, profile lease,
-  socket lease, workers, and browser lifecycle.
-- Adapters relay stdio and routing only. They must never start a broker or
-  override its browser configuration.
+- One auto-managed broker owns the browser configuration, profile lease, socket
+  lease, workers, and browser lifecycle.
+- The first adapter starts the broker. Concurrent startup must converge on the
+  lease winner rather than clone a browser or profile.
 - Independent adapters may share one broker and profile. Their tab ownership
   remains isolated while browser profile data is shared deliberately.
 - A second broker must fail clearly rather than share or clone an active profile
   or socket.
-- Generic MCP clients keep direct tools; compact OpenCode tools disclose one
-  current action schema at a time without duplicating upstream definitions.
+- Compact OpenCode tools disclose one current action schema at a time without
+  duplicating upstream definitions.
 - Per-action OpenCode permission or tool rules force direct mode rather than
   silently broadening access through the compact dispatcher.
 - Tool discovery and compact help must not activate the browser runtime.
-- Adapter disconnect releases a generic connection but must not stop the broker.
+- The broker exits only after every adapter disconnects and the reconnect grace
+  expires.
 - Broker shutdown must reject new calls and give active calls up to five seconds
   to finish before closing workers and the browser.
 - Window layout is best-effort presentation. Stable target ownership remains

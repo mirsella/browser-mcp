@@ -1,7 +1,8 @@
 use std::{
     collections::{HashMap, HashSet},
+    ffi::OsString,
     os::unix::fs::PermissionsExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::{
         Arc, OnceLock,
@@ -11,7 +12,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Args, Parser, Subcommand};
 use futures_util::{FutureExt, future::BoxFuture, future::Shared};
 use reqwest::{Client, Url, redirect::Policy};
 #[allow(deprecated)]
@@ -25,6 +26,7 @@ use rmcp::{
     service::{PeerRequestOptions, RequestContext, RunningService},
     transport::TokioChildProcess,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{
     process::{Child, Command},
@@ -41,14 +43,19 @@ const WORKER_HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_SESSION_ID_BYTES: usize = 256;
 const MAX_POOLED_WORKERS: usize = 8;
 const MAX_VERSION_RESPONSE_BYTES: usize = 64 * 1024;
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
-enum RoutingMode {
-    #[default]
-    Connection,
-    OpencodeDirect,
-    Opencode,
-}
+const GRAPHICAL_ENVIRONMENT_TIMEOUT: Duration = Duration::from_secs(2);
+const GRAPHICAL_ENVIRONMENT_KEYS: &[&str] = &[
+    "DBUS_SESSION_BUS_ADDRESS",
+    "DESKTOP_SESSION",
+    "DISPLAY",
+    "GDK_BACKEND",
+    "OZONE_PLATFORM",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "XDG_CURRENT_DESKTOP",
+    "XDG_RUNTIME_DIR",
+    "XDG_SESSION_TYPE",
+];
 
 fn default_browser_executable() -> PathBuf {
     const BROWSERS: &[&str] = &[
@@ -127,26 +134,27 @@ use persistence::{OwnershipPersistence, PersistedSession, RestoredState};
 #[derive(Debug, Parser)]
 #[command(version, about = "Session-isolated MCP for Chromium-family browsers")]
 struct Cli {
-    #[arg(long, value_enum, default_value_t)]
-    routing: RoutingMode,
-    #[arg(long, global = true, env = "OPENCODE_BROWSER_SOCKET")]
-    socket: Option<PathBuf>,
+    #[arg(long, hide = true)]
+    direct_tools: bool,
+    #[command(flatten)]
+    config: Config,
     #[command(subcommand)]
     command: Option<ProcessMode>,
 }
 
 #[derive(Debug, Subcommand)]
 enum ProcessMode {
-    /// Run the shared browser broker in the foreground.
-    Broker(Config),
-    /// Ask the running broker to shut down.
-    StopBroker,
+    #[command(hide = true)]
+    ManagedBroker,
     /// Release the tabs owned by an OpenCode session.
+    #[command(hide = true)]
     ReleaseSession { session_id: String },
 }
 
-#[derive(Debug, Args)]
+#[derive(Clone, Debug, Args, Deserialize, Eq, PartialEq, Serialize)]
 struct Config {
+    #[arg(skip = current_graphical_environment())]
+    graphical_environment: HashMap<String, OsString>,
     #[arg(
         long,
         value_enum,
@@ -203,6 +211,82 @@ impl Config {
     fn browser_url(&self) -> String {
         format!("http://{}:{}", self.cdp_host, self.cdp_port)
     }
+
+    async fn resolve(&mut self) -> Result<()> {
+        if self.headless {
+            self.graphical_environment.clear();
+        } else {
+            self.graphical_environment = graphical_environment(&self.graphical_environment).await?;
+        }
+
+        self.browser_executable = resolve_executable(&self.browser_executable, "browser")?;
+        self.downstream_command = resolve_executable(&self.downstream_command, "downstream")?;
+        self.profile = canonicalize_path(&self.profile)?;
+        if self.cdp_host == "localhost" {
+            self.cdp_host = "127.0.0.1".to_owned();
+        }
+        Ok(())
+    }
+}
+
+fn resolve_executable(executable: &Path, name: &str) -> Result<PathBuf> {
+    let path = if executable.components().count() == 1 {
+        std::env::var_os("PATH")
+            .and_then(|path| {
+                std::env::split_paths(&path)
+                    .map(|directory| directory.join(executable))
+                    .find(|candidate| candidate.is_file())
+            })
+            .ok_or_else(|| {
+                anyhow!(
+                    "{name} executable was not found in PATH: {}",
+                    executable.display()
+                )
+            })?
+    } else {
+        executable.to_path_buf()
+    };
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .context("failed to resolve the current directory")?
+            .join(path)
+    };
+    let parent = absolute
+        .parent()
+        .ok_or_else(|| anyhow!("{name} executable has no parent: {}", absolute.display()))?;
+    let file_name = absolute
+        .file_name()
+        .ok_or_else(|| anyhow!("{name} executable has no file name: {}", absolute.display()))?;
+    Ok(std::fs::canonicalize(parent)
+        .with_context(|| format!("failed to resolve {name} executable {}", absolute.display()))?
+        .join(file_name))
+}
+
+fn canonicalize_path(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("failed to resolve the current directory")?
+            .join(path)
+    };
+    match std::fs::canonicalize(&absolute) {
+        Ok(resolved) => return Ok(resolved),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to resolve {}", absolute.display()));
+        }
+    }
+
+    let parent = absolute
+        .parent()
+        .ok_or_else(|| anyhow!("path has no existing ancestor: {}", absolute.display()))?;
+    let name = absolute
+        .file_name()
+        .ok_or_else(|| anyhow!("path has no final component: {}", absolute.display()))?;
+    Ok(canonicalize_path(parent)?.join(name))
 }
 
 struct BrowserSupervisor {
@@ -306,6 +390,10 @@ impl BrowserSupervisor {
                 .kill_on_drop(true);
             if self.config.headless {
                 command.arg("--headless=new");
+            } else {
+                for (key, value) in &self.config.graphical_environment {
+                    command.env(key, value);
+                }
             }
             if self.config.disable_crash_reporter {
                 command
@@ -404,6 +492,59 @@ impl BrowserSupervisor {
         }
         Ok(())
     }
+}
+
+fn parse_graphical_environment(output: &[u8]) -> HashMap<String, OsString> {
+    String::from_utf8_lossy(output)
+        .lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            (GRAPHICAL_ENVIRONMENT_KEYS.contains(&key) && !value.is_empty())
+                .then(|| (key.to_owned(), OsString::from(value)))
+        })
+        .collect()
+}
+
+fn current_graphical_environment() -> HashMap<String, OsString> {
+    GRAPHICAL_ENVIRONMENT_KEYS
+        .iter()
+        .filter_map(|key| {
+            std::env::var_os(key)
+                .filter(|value| !value.is_empty())
+                .map(|value| ((*key).to_owned(), value))
+        })
+        .collect()
+}
+
+async fn graphical_environment(
+    current: &HashMap<String, OsString>,
+) -> Result<HashMap<String, OsString>> {
+    let mut environment = current.clone();
+
+    let manager_environment = match timeout(
+        GRAPHICAL_ENVIRONMENT_TIMEOUT,
+        Command::new("systemctl")
+            .arg("--user")
+            .arg("show-environment")
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output(),
+    )
+    .await
+    {
+        Ok(Ok(output)) if output.status.success() => parse_graphical_environment(&output.stdout),
+        _ => HashMap::new(),
+    };
+    for (key, value) in manager_environment {
+        environment.entry(key).or_insert(value);
+    }
+
+    if !environment.contains_key("DISPLAY") && !environment.contains_key("WAYLAND_DISPLAY") {
+        bail!(
+            "headed browser startup requires DISPLAY or WAYLAND_DISPLAY; set OPENCODE_BROWSER_HEADLESS=true when no graphical session is available"
+        );
+    }
+    Ok(environment)
 }
 
 async fn terminate_child(child: &mut Child) {
@@ -1833,21 +1974,50 @@ mod tests {
     fn broker_config(arguments: &[&str]) -> Config {
         let cli = Cli::try_parse_from(
             std::iter::once("test")
-                .chain(std::iter::once("broker"))
-                .chain(arguments.iter().copied()),
+                .chain(arguments.iter().copied())
+                .chain(std::iter::once("managed-broker")),
         )
         .unwrap();
-        let Some(ProcessMode::Broker(config)) = cli.command else {
+        let Some(ProcessMode::ManagedBroker) = cli.command else {
             panic!("expected broker configuration");
         };
-        config
+        cli.config
     }
 
     #[test]
     fn browser_is_headed_by_default_and_headless_is_configurable() {
         assert!(!broker_config(&[]).headless);
-        assert!(broker_config(&["--headless"]).headless);
+        assert!(broker_config(&["--headless=true"]).headless);
         assert!(!broker_config(&["--headless=false"]).headless);
+    }
+    #[test]
+    fn user_manager_environment_is_allowlisted() {
+        let environment = parse_graphical_environment(
+            b"DISPLAY=:1\nWAYLAND_DISPLAY=wayland-0\nSECRET_TOKEN=not-allowed\nEMPTY=\n",
+        );
+        assert_eq!(environment.get("DISPLAY"), Some(&OsString::from(":1")));
+        assert_eq!(
+            environment.get("WAYLAND_DISPLAY"),
+            Some(&OsString::from("wayland-0"))
+        );
+        assert!(!environment.contains_key("SECRET_TOKEN"));
+        assert!(!environment.contains_key("EMPTY"));
+    }
+    #[test]
+    fn profile_resolution_preserves_symlink_parent_semantics() {
+        let root = std::env::temp_dir().join(format!(
+            "opencode-browser-mcp-path-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let real = root.join("real");
+        std::fs::create_dir_all(real.join("work")).unwrap();
+        std::os::unix::fs::symlink(real.join("work"), root.join("linked-work")).unwrap();
+
+        let resolved = canonicalize_path(&root.join("linked-work/../profile")).unwrap();
+        assert_eq!(resolved, real.join("profile"));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn removes_page_id_from_schema_and_required_fields() {

@@ -13,6 +13,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use clap::ValueEnum;
 use futures_util::{SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{
     sync::{Mutex, mpsc, oneshot, watch},
@@ -27,7 +28,8 @@ pub(crate) type TargetId = String;
 type BrowserSessionId = String;
 const TRACKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
 pub(crate) enum SessionLayout {
     #[default]
     SharedWindow,

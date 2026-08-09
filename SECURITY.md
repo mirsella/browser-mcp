@@ -43,8 +43,8 @@ provide it, but it cannot prevent prompt injection.
 
 - Use a dedicated browser user-data directory for sensitive automation.
 - Do not bypass or remove the profile or socket locks to run another broker.
-- Run one supervised broker and connect concurrent MCP adapters through its
-  private socket.
+- Let the packaged adapters share the auto-managed broker through its private
+  socket. Do not start another browser against the same profile.
 - Do not expose the CDP port beyond loopback.
 - Do not run untrusted local processes while a sensitive profile is open.
 - Use OS, container, or VM isolation when local users or workloads do not trust each other.

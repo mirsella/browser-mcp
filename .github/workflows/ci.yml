@@ -43,5 +43,5 @@ jobs:
           cd /tmp/opencode-browser-mcp-package-test
           bun init -y
           bun add "$GITHUB_WORKSPACE/$tarball"
-          bun -e 'import plugin from "@mirsella/opencode-browser-mcp/server"; if (typeof plugin !== "function") process.exit(1)'
-          ./node_modules/.bin/opencode-browser-mcp --version
+          bun -e 'import plugin from "@mirsella/opencode-browser-mcp"; if (typeof plugin !== "function") process.exit(1)'
+          ./node_modules/@mirsella/opencode-browser-mcp/vendor/opencode-browser-mcp --version

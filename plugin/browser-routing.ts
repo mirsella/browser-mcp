@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 
 const SESSION_KEY = "__opencode_session_id";
 const SKILLS_PATH = fileURLToPath(new URL("../skills", import.meta.url));
-const MCP_CLI = fileURLToPath(new URL("../bin/opencode-browser-mcp.cjs", import.meta.url));
+const MCP_CLI = fileURLToPath(new URL("../vendor/opencode-browser-mcp", import.meta.url));
 const DISPATCH_TOOL = "browser_dispatch";
 const DIRECT_TOOLS = `
 	browser_click browser_close_page browser_drag browser_emulate browser_evaluate_script browser_fill browser_fill_form
@@ -26,7 +26,6 @@ type ConfigWithPolicies = {
 type BrowserRoutingOptions = {
 	compactTools?: boolean;
 	releaseOnIdle?: boolean;
-	socket?: string;
 };
 
 function matchesToolPattern(pattern: string, tool: string): boolean {
@@ -55,19 +54,15 @@ function requiresDirectTools(config: ConfigWithPolicies): boolean {
 }
 
 export const BrowserRouting: Plugin = async ({ $ }, options) => {
-	const { compactTools = true, releaseOnIdle = true, socket } = (options ?? {}) as BrowserRoutingOptions;
+	const { compactTools = true, releaseOnIdle = true } = (options ?? {}) as BrowserRoutingOptions;
 	if (typeof compactTools !== "boolean") throw new Error("compactTools must be a boolean");
 	if (typeof releaseOnIdle !== "boolean") throw new Error("releaseOnIdle must be a boolean");
-	if (socket !== undefined && (typeof socket !== "string" || socket.length === 0)) {
-		throw new Error("socket must be a non-empty string");
-	}
-	const commandPrefix = [MCP_CLI, ...(socket === undefined ? [] : ["--socket", socket])];
 	const usedSessions = new Set<string>();
 	const pendingReleases = new Map<string, Promise<boolean>>();
 	const release = (sessionID: string) => {
 		const pending = pendingReleases.get(sessionID);
 		if (pending) return pending;
-		const command = [...commandPrefix, "release-session", sessionID];
+		const command = [MCP_CLI, "release-session", sessionID];
 		const next = (async () => {
 			try {
 				const result = await $`${command}`.quiet().nothrow();
@@ -107,7 +102,7 @@ export const BrowserRouting: Plugin = async ({ $ }, options) => {
 			}
 			config.mcp.browser = {
 				type: "local",
-				command: [...commandPrefix, "--routing", compact ? "opencode" : "opencode-direct"],
+				command: compact ? [MCP_CLI] : [MCP_CLI, "--direct-tools"],
 				enabled: true,
 				timeout: 600_000,
 			};

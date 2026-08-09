@@ -18,7 +18,6 @@ async function hooks(
 	options?: {
 		compactTools?: boolean;
 		releaseOnIdle?: boolean;
-		socket?: string;
 	},
 ) {
 	const calls: unknown[][] = [];
@@ -31,13 +30,11 @@ async function hooks(
 
 function expectRouting(
 	config: { mcp: { browser: { command: unknown[] } } },
-	routing: string,
-	socket?: string,
+	directTools: boolean,
 ) {
-	const command: unknown[] = [expect.any(String)];
-	if (socket) command.push("--socket", socket);
-	command.push("--routing", routing);
-	expect(config.mcp.browser.command).toEqual(command);
+	const [executable, ...arguments_] = config.mcp.browser.command;
+	expect(String(executable).endsWith("/vendor/opencode-browser-mcp")).toBeTrue();
+	expect(arguments_).toEqual(directTools ? ["--direct-tools"] : []);
 }
 
 describe("BrowserRouting", () => {
@@ -46,7 +43,7 @@ describe("BrowserRouting", () => {
 		const config = { skills: { paths: ["/existing"] } } as never;
 		await plugin.config?.(config);
 		await plugin.config?.(config);
-		expectRouting(config, "opencode");
+		expectRouting(config, false);
 		expect(config.skills.paths).toHaveLength(2);
 
 		const output = { args: { action: "navigate_page", arguments: { url: "https://example.com" } } };
@@ -68,40 +65,34 @@ describe("BrowserRouting", () => {
 	});
 
 	test("uses direct tools for partial browser policies", async () => {
-		for (const [pattern, routing] of [
-			["*_evaluate_scrip?", "opencode-direct"],
-			["browser_d*", "opencode-direct"],
-			["browser_*", "opencode"],
-			["read_*", "opencode"],
+		for (const [pattern, directTools] of [
+			["*_evaluate_scrip?", true],
+			["browser_d*", true],
+			["browser_*", false],
+			["read_*", false],
 		]) {
 			const { plugin } = await hooks();
 			const config = { permission: { [pattern]: "deny" } } as never;
 			await plugin.config?.(config);
-			expectRouting(config, routing);
+			expectRouting(config, directTools);
 		}
 		const { plugin } = await hooks([], { compactTools: false });
 		const config = {} as never;
 		await plugin.config?.(config);
-		expectRouting(config, "opencode-direct");
+		expectRouting(config, true);
 	});
 
-	test("configures and validates the broker socket", async () => {
-		const socket = "/run/user/1000/browser.sock";
-		const { plugin, calls } = await hooks([], { socket });
-		const config = {} as never;
-		await plugin.config?.(config);
-		expectRouting(config, "opencode", socket);
+	test("cleans deleted sessions restored from an earlier plugin process", async () => {
+		const { plugin, calls } = await hooks();
 		await plugin.event?.({
 			event: { type: "session.deleted", properties: { info: { id: "session-a" } } },
 		} as never);
+		expect(calls).toHaveLength(1);
 		expect(calls[0]?.[1]).toEqual([
 			expect.any(String),
-			"--socket",
-			socket,
 			"release-session",
 			"session-a",
 		]);
-		expect(hooks([], { socket: "" })).rejects.toThrow("socket must be a non-empty string");
 	});
 
 	test("does not treat compact help as a used browser session", async () => {
