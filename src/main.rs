@@ -56,12 +56,9 @@ const GRAPHICAL_ENVIRONMENT_KEYS: &[&str] = &[
     "XDG_RUNTIME_DIR",
     "XDG_SESSION_TYPE",
 ];
-
 fn default_browser_executable() -> PathBuf {
-    const BROWSERS: &[&str] = &[
-        "helium",
-        "chromium",
-        "chromium-browser",
+    const CHROMIUM: &[&str] = &["chromium", "chromium-browser"];
+    const ALTERNATIVES: &[&str] = &[
         "google-chrome-stable",
         "google-chrome",
         "chrome-for-testing",
@@ -72,45 +69,56 @@ fn default_browser_executable() -> PathBuf {
         "microsoft-edge",
         "microsoft-edge-beta",
         "microsoft-edge-dev",
+        "helium-browser",
+        "helium",
     ];
+    let path = std::env::var_os("PATH");
     let mut candidates = Vec::new();
-    if let Some(path) = std::env::var_os("PATH") {
-        for browser in BROWSERS {
-            candidates
-                .extend(std::env::split_paths(&path).map(|directory| directory.join(browser)));
+    let add_path_candidates = |candidates: &mut Vec<PathBuf>, browsers: &[&str]| {
+        if let Some(path) = path.as_deref() {
+            for browser in browsers {
+                candidates
+                    .extend(std::env::split_paths(path).map(|directory| directory.join(browser)));
+            }
         }
-    }
+    };
+    add_path_candidates(&mut candidates, CHROMIUM);
     candidates.extend([
-        PathBuf::from("/opt/helium-browser-bin/helium-wrapper"),
-        PathBuf::from("/usr/local/bin/helium"),
-        PathBuf::from("/usr/bin/helium"),
         PathBuf::from("/usr/bin/chromium"),
         PathBuf::from("/usr/bin/chromium-browser"),
+    ]);
+    add_path_candidates(&mut candidates, ALTERNATIVES);
+    candidates.extend([
         PathBuf::from("/usr/bin/google-chrome-stable"),
         PathBuf::from("/usr/bin/google-chrome"),
         PathBuf::from("/usr/bin/brave-browser"),
         PathBuf::from("/usr/bin/microsoft-edge-stable"),
+        PathBuf::from("/usr/bin/helium-browser"),
+        PathBuf::from("/usr/local/bin/helium-browser"),
+        PathBuf::from("/opt/helium-browser-bin/helium-wrapper"),
+        PathBuf::from("/usr/local/bin/helium"),
+        PathBuf::from("/usr/bin/helium"),
     ]);
     candidates
         .into_iter()
-        .find(|path| path.is_file())
+        .find(|path| is_executable_file(path))
         .unwrap_or_else(|| PathBuf::from("chromium"))
 }
 
-fn default_browser_profile() -> PathBuf {
-    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+fn config_home() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .unwrap_or_else(|| PathBuf::from(".config"));
-    let executable = std::env::var_os("OPENCODE_BROWSER_EXECUTABLE")
-        .map(PathBuf::from)
-        .unwrap_or_else(default_browser_executable);
+        .unwrap_or_else(|| PathBuf::from(".config"))
+}
+
+fn browser_profile(config_home: &Path, executable: &Path) -> PathBuf {
     let name = executable
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_default();
     match name {
-        "helium" | "helium-wrapper" => config_home.join("net.imput.helium"),
+        "helium" | "helium-browser" | "helium-wrapper" => config_home.join("net.imput.helium"),
         "chrome-for-testing" | "google-chrome" | "google-chrome-stable" => {
             config_home.join("opencode-browser-mcp/google-chrome")
         }
@@ -136,6 +144,8 @@ use persistence::{OwnershipPersistence, PersistedSession, RestoredState};
 struct Cli {
     #[arg(long, hide = true)]
     direct_tools: bool,
+    #[arg(long = "profile", env = "OPENCODE_BROWSER_PROFILE")]
+    profile_override: Option<PathBuf>,
     #[command(flatten)]
     config: Config,
     #[command(subcommand)]
@@ -168,11 +178,7 @@ struct Config {
         default_value_os_t = default_browser_executable()
     )]
     browser_executable: PathBuf,
-    #[arg(
-        long,
-        env = "OPENCODE_BROWSER_PROFILE",
-        default_value_os_t = default_browser_profile()
-    )]
+    #[arg(skip)]
     profile: PathBuf,
     #[arg(
         long,
@@ -212,7 +218,7 @@ impl Config {
         format!("http://{}:{}", self.cdp_host, self.cdp_port)
     }
 
-    async fn resolve(&mut self) -> Result<()> {
+    async fn resolve(&mut self, profile_override: Option<PathBuf>) -> Result<()> {
         if self.headless {
             self.graphical_environment.clear();
         } else {
@@ -221,7 +227,10 @@ impl Config {
 
         self.browser_executable = resolve_executable(&self.browser_executable, "browser")?;
         self.downstream_command = resolve_executable(&self.downstream_command, "downstream")?;
-        self.profile = canonicalize_path(&self.profile)?;
+        self.profile = canonicalize_path(
+            &profile_override
+                .unwrap_or_else(|| browser_profile(&config_home(), &self.browser_executable)),
+        )?;
         if self.cdp_host == "localhost" {
             self.cdp_host = "127.0.0.1".to_owned();
         }
@@ -235,7 +244,7 @@ fn resolve_executable(executable: &Path, name: &str) -> Result<PathBuf> {
             .and_then(|path| {
                 std::env::split_paths(&path)
                     .map(|directory| directory.join(executable))
-                    .find(|candidate| candidate.is_file())
+                    .find(|candidate| is_executable_file(candidate))
             })
             .ok_or_else(|| {
                 anyhow!(
@@ -262,6 +271,11 @@ fn resolve_executable(executable: &Path, name: &str) -> Result<PathBuf> {
     Ok(std::fs::canonicalize(parent)
         .with_context(|| format!("failed to resolve {name} executable {}", absolute.display()))?
         .join(file_name))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
 fn canonicalize_path(path: &Path) -> Result<PathBuf> {
@@ -1939,11 +1953,7 @@ async fn main() -> Result<()> {
     broker::run(Cli::parse()).await
 }
 fn validate_config(config: &Config) -> Result<()> {
-    let executable = std::fs::metadata(&config.browser_executable);
-    if !executable
-        .as_ref()
-        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-    {
+    if !is_executable_file(&config.browser_executable) {
         bail!(
             "browser executable is missing or not executable: {}",
             config.browser_executable.display()
@@ -1971,13 +1981,17 @@ fn validate_config(config: &Config) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn broker_config(arguments: &[&str]) -> Config {
-        let cli = Cli::try_parse_from(
+    fn parsed_cli(arguments: &[&str]) -> Cli {
+        Cli::try_parse_from(
             std::iter::once("test")
                 .chain(arguments.iter().copied())
                 .chain(std::iter::once("managed-broker")),
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    fn broker_config(arguments: &[&str]) -> Config {
+        let cli = parsed_cli(arguments);
         let Some(ProcessMode::ManagedBroker) = cli.command else {
             panic!("expected broker configuration");
         };
@@ -1989,6 +2003,28 @@ mod tests {
         assert!(!broker_config(&[]).headless);
         assert!(broker_config(&["--headless=true"]).headless);
         assert!(!broker_config(&["--headless=false"]).headless);
+    }
+    #[tokio::test]
+    async fn profile_override_is_resolved_and_serialized() {
+        let profile = std::env::temp_dir().join("opencode-browser-mcp-profile-override");
+        let mut cli = parsed_cli(&[
+            "--headless=true",
+            "--browser-executable=/bin/true",
+            "--downstream-command=/bin/true",
+            &format!("--profile={}", profile.display()),
+        ]);
+        cli.config.resolve(cli.profile_override).await.unwrap();
+        assert_eq!(cli.config.profile, profile);
+        let restored: Config =
+            serde_json::from_str(&serde_json::to_string(&cli.config).unwrap()).unwrap();
+        assert_eq!(restored.profile, profile);
+    }
+    #[test]
+    fn helium_browser_uses_the_helium_profile() {
+        assert_eq!(
+            browser_profile(Path::new("/config"), Path::new("/usr/bin/helium-browser")),
+            PathBuf::from("/config/net.imput.helium")
+        );
     }
     #[test]
     fn user_manager_environment_is_allowlisted() {

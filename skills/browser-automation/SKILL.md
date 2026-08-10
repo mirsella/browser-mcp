@@ -13,6 +13,9 @@ OpenCode normally exposes two compact tools:
 - `browser_help` lists action names or loads the current schema for one action.
 - `browser_dispatch` executes an action with `{ action, arguments }`.
 
+For compact `browser_dispatch`, put every action-specific field inside `arguments`,
+not beside it. For example, use `{ "action": "navigate_page", "arguments": { "url": "https://example.com" } }`.
+
 Common actions include `navigate_page`, `take_snapshot`, `click`, `fill_form`,
 `take_screenshot`, `evaluate_script`, `list_console_messages`, and
 `list_network_requests`. Call `browser_help` for an action before using it when

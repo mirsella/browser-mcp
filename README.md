@@ -44,7 +44,7 @@ The plugin:
 - registers the packaged browser MCP adapter;
 - injects the active OpenCode session ID after model argument generation;
 - exposes compact browser tools unless existing permissions require direct tools;
-- releases owned tabs when an OpenCode session becomes idle or is deleted;
+- releases owned tabs when an OpenCode session is deleted;
 - registers the bundled browser automation skill.
 
 OpenCode sees two compact tools by default:
@@ -61,18 +61,6 @@ disabled explicitly:
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
     ["@mirsella/opencode-browser-mcp", { "compactTools": false }]
-  ]
-}
-```
-
-`releaseOnIdle` defaults to `true`. Set it to `false` to keep tabs between idle
-turns. Deleting the OpenCode session still releases them.
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugin": [
-    ["@mirsella/opencode-browser-mcp", { "releaseOnIdle": false }]
   ]
 }
 ```
@@ -118,6 +106,8 @@ loopback CDP port.
 ## Browser and profile
 
 The plugin detects Chromium, Google Chrome, Helium, Brave, and Microsoft Edge.
+Chromium is preferred by default; `OPENCODE_BROWSER_EXECUTABLE` overrides
+automatic detection.
 Google Chrome 136 and newer ignore remote-debugging flags for its default data
 directory, so Chrome uses a dedicated directory under
 `~/.config/opencode-browser-mcp` by default. Other detected browsers retain their
@@ -149,7 +139,9 @@ Optional environment variables inherited from OpenCode:
 | First adapter connects | One internal broker acquires the socket and profile leases |
 | Tools are listed | Chromium remains stopped |
 | First browser action | Chromium and the ownership tracker start |
-| OpenCode session becomes idle or is deleted | Only that session's owned tabs close |
+| OpenCode turn becomes idle | Owned tabs remain available for the next turn |
+| OpenCode session is deleted | Only that session's owned tabs close |
+| Routed session reaches the configured inactivity timeout | Fallback cleanup closes that session's owned tabs; defaults to 60 minutes and `0` disables it |
 | Another OpenCode instance connects | It shares the broker and profile with isolated tab ownership |
 | Final adapter disconnects | The broker waits briefly, closes Chromium, and exits |
 | Broker exits unexpectedly | A later adapter starts a replacement and recovery fails closed unless the exact browser generation matches |

@@ -52,6 +52,7 @@ const MAX_OPENCODE_SESSION_ID_BYTES: usize = MAX_SESSION_ID_BYTES - OPENCODE_PRE
 pub(super) async fn run(cli: Cli) -> Result<()> {
     let Cli {
         direct_tools,
+        profile_override,
         mut config,
         command,
     } = cli;
@@ -67,12 +68,12 @@ pub(super) async fn run(cli: Cli) -> Result<()> {
             run_managed_broker(Arc::new(config), paths).await
         }
         Some(ProcessMode::ReleaseSession { session_id }) => {
-            config.resolve().await?;
+            config.resolve(profile_override).await?;
             let paths = RuntimePaths::new(&config)?;
             release_session(&paths, &config, &session_id).await
         }
         None => {
-            config.resolve().await?;
+            config.resolve(profile_override).await?;
             let paths = RuntimePaths::new(&config)?;
             bridge(paths, direct_tools, config).await
         }
@@ -610,11 +611,11 @@ fn compact_tools() -> Vec<Tool> {
             "action": {
                 "type": "string",
                 "minLength": 1,
-                "description": "Browser action name. Use browser_help when its arguments are unknown."
+                "description": "Browser action name."
             },
             "arguments": {
                 "type": "object",
-                "description": "Arguments for the action. Omit when none are needed."
+                "description": "Arguments for the selected action. Omit when none are needed."
             }
         },
         "required": ["action"],
@@ -640,7 +641,7 @@ fn compact_tools() -> Vec<Tool> {
     vec![
         Tool::new(
             "dispatch",
-            "Execute a browser action. Use browser_help first when its arguments are unknown.",
+            "Execute a browser action. Put every action-specific field inside arguments; for example: {\"action\":\"navigate_page\",\"arguments\":{\"url\":\"https://example.com\"}}. Use browser_help first when arguments are unknown.",
             dispatch_schema,
         )
         .with_annotations(
@@ -665,7 +666,7 @@ fn compact_tools() -> Vec<Tool> {
     ]
 }
 
-fn only_fields(arguments: &serde_json::Map<String, Value>, allowed: &[&str]) -> Result<()> {
+fn validate_fields(arguments: &serde_json::Map<String, Value>, allowed: &[&str]) -> Result<()> {
     if let Some(field) = arguments
         .keys()
         .find(|field| !allowed.contains(&field.as_str()))
@@ -680,7 +681,9 @@ fn expand_dispatch(
     tools: &[Tool],
 ) -> Result<CallToolRequestParams> {
     let mut envelope = request.arguments.take().unwrap_or_default();
-    only_fields(&envelope, &["action", "arguments"])?;
+    validate_fields(&envelope, &["action", "arguments"]).map_err(|error| {
+        anyhow!("{error}; action-specific fields must be nested under \"arguments\"")
+    })?;
     let action = envelope
         .remove("action")
         .and_then(|value| value.as_str().map(str::to_owned))
@@ -704,7 +707,7 @@ fn expand_dispatch(
 
 fn compact_help(request: CallToolRequestParams, tools: &[Tool]) -> Result<CallToolResult> {
     let mut arguments = request.arguments.unwrap_or_default();
-    only_fields(&arguments, &["action"])?;
+    validate_fields(&arguments, &["action"])?;
     let action = match arguments.remove("action") {
         Some(Value::String(action)) if !action.is_empty() => Some(action),
         Some(_) => bail!("browser_help action must be a non-empty string"),
@@ -1088,13 +1091,24 @@ mod tests {
             json!({}),
             json!({"action": "missing"}),
             json!({"action": "navigate_page", "arguments": []}),
-            json!({"action": "navigate_page", "extra": true}),
             json!({"action": "navigate_page", "arguments": {(SESSION_KEY): "forged"}}),
         ] {
             let request = CallToolRequestParams::new("dispatch")
                 .with_arguments(arguments.as_object().unwrap().clone());
             assert!(expand_dispatch(request, &tools).is_err());
         }
+        let misplaced = CallToolRequestParams::new("dispatch").with_arguments(
+            json!({"action": "navigate_page", "url": "https://example.com"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        assert!(
+            expand_dispatch(misplaced, &tools)
+                .unwrap_err()
+                .to_string()
+                .contains("must be nested under \"arguments\"")
+        );
     }
 
     #[test]

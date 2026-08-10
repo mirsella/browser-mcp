@@ -25,7 +25,6 @@ type ConfigWithPolicies = {
 
 type BrowserRoutingOptions = {
 	compactTools?: boolean;
-	releaseOnIdle?: boolean;
 };
 
 function matchesToolPattern(pattern: string, tool: string): boolean {
@@ -54,31 +53,8 @@ function requiresDirectTools(config: ConfigWithPolicies): boolean {
 }
 
 const server: Plugin = async ({ $ }, options) => {
-	const { compactTools = true, releaseOnIdle = true } = (options ?? {}) as BrowserRoutingOptions;
+	const { compactTools = true } = (options ?? {}) as BrowserRoutingOptions;
 	if (typeof compactTools !== "boolean") throw new Error("compactTools must be a boolean");
-	if (typeof releaseOnIdle !== "boolean") throw new Error("releaseOnIdle must be a boolean");
-	const usedSessions = new Set<string>();
-	const pendingReleases = new Map<string, Promise<boolean>>();
-	const release = (sessionID: string) => {
-		const pending = pendingReleases.get(sessionID);
-		if (pending) return pending;
-		const command = [MCP_CLI, "release-session", sessionID];
-		const next = (async () => {
-			try {
-				const result = await $`${command}`.quiet().nothrow();
-				if (result.exitCode === 0) return true;
-				console.error(`Failed to release browser session ${sessionID}: ${String(result.stderr).trim()}`);
-			} catch (error) {
-				console.error(`Failed to release browser session ${sessionID}`, error);
-			}
-			return false;
-		})();
-		pendingReleases.set(sessionID, next);
-		void next.finally(() => {
-			if (pendingReleases.get(sessionID) === next) pendingReleases.delete(sessionID);
-		});
-		return next;
-	};
 
 	return {
 		config: async (config) => {
@@ -113,19 +89,21 @@ const server: Plugin = async ({ $ }, options) => {
 			if (!output.args || typeof output.args !== "object" || Array.isArray(output.args)) {
 				throw new Error("browser tool call has invalid arguments");
 			}
-			await pendingReleases.get(input.sessionID);
-			if (input.tool !== "browser_help") usedSessions.add(input.sessionID);
 			(output.args as Record<string, unknown>)[SESSION_KEY] = input.sessionID;
 		},
 		event: async ({ event }) => {
-			if (releaseOnIdle && event.type === "session.idle" && usedSessions.has(event.properties.sessionID)) {
-				if (await release(event.properties.sessionID)) usedSessions.delete(event.properties.sessionID);
-			}
-			if (event.type === "session.deleted") {
-				const id = event.properties.info.id;
-				usedSessions.delete(id);
-				const pending = pendingReleases.get(id);
-				if (!pending || !(await pending)) await release(id);
+			if (event.type !== "session.deleted") return;
+			const sessionID = event.properties.info.id;
+			try {
+				const result = await $`${[MCP_CLI, "release-session", sessionID]}`.quiet().nothrow();
+				if (result.exitCode !== 0) {
+					const stderr = String(result.stderr).trim();
+					console.error(
+						`Failed to release browser session ${sessionID} with exit code ${result.exitCode}${stderr ? `: ${stderr}` : ""}`,
+					);
+				}
+			} catch (error) {
+				console.error(`Failed to release browser session ${sessionID}`, error);
 			}
 		},
 	};
