@@ -1,10 +1,10 @@
 {
   "name": "@mirsella/opencode-browser-mcp",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Session-isolated browser automation over MCP and Chrome DevTools Protocol",
   "type": "module",
   "exports": {
-    ".": "./plugin/browser-routing.ts"
+    "./server": "./plugin/browser-routing.ts"
   },
   "bin": {
     "opencode-browser-mcp": "vendor/opencode-browser-mcp"
@@ -52,7 +52,7 @@
     "opencode": ">=1.18.0"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "1.4.6"
+    "@opencode-ai/plugin": "1.18.11"
   },
   "publishConfig": {
     "access": "public"

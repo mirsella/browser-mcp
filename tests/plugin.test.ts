@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { BrowserRouting } from "../plugin/browser-routing";
+import BrowserPlugin from "@mirsella/opencode-browser-mcp/server";
 
 type ShellResult = { exitCode: number; stdout: string; stderr: string };
 const successful = Promise.resolve<ShellResult>({ exitCode: 0, stdout: "", stderr: "" });
@@ -21,7 +21,7 @@ async function hooks(
 	},
 ) {
 	const calls: unknown[][] = [];
-	const plugin = await BrowserRouting(
+	const plugin = await BrowserPlugin.server(
 		{ $: shell(results, calls), directory: "/workspace", worktree: "/workspace" } as never,
 		options,
 	);
@@ -38,7 +38,8 @@ function expectRouting(
 }
 
 describe("BrowserRouting", () => {
-	test("registers compact routing and injects the session ID", async () => {
+	test("exports the module, registers compact routing, and injects the session ID", async () => {
+		expect(BrowserPlugin.id).toBe("@mirsella/opencode-browser-mcp");
 		const { plugin } = await hooks();
 		const config = { skills: { paths: ["/existing"] } } as never;
 		await plugin.config?.(config);

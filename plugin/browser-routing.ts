@@ -1,4 +1,4 @@
-import type { Plugin } from "@opencode-ai/plugin";
+import type { Plugin, PluginModule } from "@opencode-ai/plugin";
 import { fileURLToPath } from "node:url";
 
 const SESSION_KEY = "__opencode_session_id";
@@ -53,7 +53,7 @@ function requiresDirectTools(config: ConfigWithPolicies): boolean {
 	);
 }
 
-export const BrowserRouting: Plugin = async ({ $ }, options) => {
+const server: Plugin = async ({ $ }, options) => {
 	const { compactTools = true, releaseOnIdle = true } = (options ?? {}) as BrowserRoutingOptions;
 	if (typeof compactTools !== "boolean") throw new Error("compactTools must be a boolean");
 	if (typeof releaseOnIdle !== "boolean") throw new Error("releaseOnIdle must be a boolean");
@@ -131,4 +131,4 @@ export const BrowserRouting: Plugin = async ({ $ }, options) => {
 	};
 };
 
-export default BrowserRouting;
+export default { id: "@mirsella/opencode-browser-mcp", server } satisfies PluginModule;
