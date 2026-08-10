@@ -25,6 +25,8 @@ jobs:
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
 
+      - uses: oven-sh/setup-bun@v2
+
       - run: cargo fmt --check
       - run: cargo test --all-targets
       - run: cargo clippy --all-targets -- -D warnings
