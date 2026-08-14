@@ -469,6 +469,8 @@ async fn exercise_shared_broker() {
     std::fs::create_dir(&root).expect("create private test directory");
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
         .expect("restrict test directory");
+    let broker_launch = root.join("broker-launch");
+    std::fs::create_dir(&broker_launch).expect("create broker launch directory");
     let profile = root.join("profile");
     let socket = broker_socket(&profile);
     let port = std::net::TcpListener::bind(("127.0.0.1", 0))
@@ -477,10 +479,19 @@ async fn exercise_shared_broker() {
         .expect("test CDP address")
         .port();
     let (test_site, test_site_task) = start_test_site().await;
+    let mut starter = adapter_command(&root, false, &profile, port, "shared-window");
+    starter.current_dir(&broker_launch);
+    let starter = TokioChildProcess::new(starter).expect("start broker-launching MCP adapter");
+    let starter = ().serve(starter).await.expect("initialize MCP adapter");
     let client_a = client(&root, true, &profile, port, "shared-window").await;
     let client_b = client(&root, true, &profile, port, "shared-window").await;
+    starter.cancel().await.expect("stop starter MCP adapter");
+    std::fs::remove_dir(&broker_launch).expect("remove broker launch directory");
 
-    let direct_tools = client_a.list_all_tools().await.expect("list direct tools");
+    let direct_tools = client_a
+        .list_all_tools()
+        .await
+        .expect("list direct tools after removing the broker launch directory");
     assert!(
         tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await

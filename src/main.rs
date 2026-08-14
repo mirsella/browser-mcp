@@ -762,15 +762,16 @@ struct CatalogLoader {
 }
 
 impl CatalogLoader {
-    async fn get(&self) -> Result<Arc<ToolCatalog>> {
+    async fn get(&self, workspace: &Path) -> Result<Arc<ToolCatalog>> {
         let future = self
             .future
             .get_or_init(|| {
                 let config = self.config.clone();
                 let worker_pool = self.worker_pool.clone();
                 let cancel = self.cancel.subscribe();
+                let workspace = workspace.to_path_buf();
                 let future = async move {
-                    let result = discover_catalog(&config, &worker_pool, cancel).await;
+                    let result = discover_catalog(&config, &worker_pool, workspace, cancel).await;
                     if let Err(error) = &result {
                         warn!(%error, "Chrome DevTools tool catalog initialization failed");
                     }
@@ -803,6 +804,7 @@ impl CatalogLoader {
 async fn discover_catalog(
     config: &Config,
     worker_pool: &WorkerPool,
+    workspace: PathBuf,
     mut cancel: watch::Receiver<bool>,
 ) -> Result<ToolCatalog> {
     async fn cancelled(cancel: &mut watch::Receiver<bool>) {
@@ -815,7 +817,6 @@ async fn discover_catalog(
     if *cancel.borrow() {
         bail!("Chrome DevTools tool catalog initialization stopped");
     }
-    let workspace = std::env::current_dir().context("failed to determine the MCP workspace")?;
     let worker = tokio::select! {
         biased;
         _ = cancelled(&mut cancel) => bail!("Chrome DevTools tool catalog initialization stopped"),

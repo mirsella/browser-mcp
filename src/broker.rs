@@ -752,7 +752,7 @@ impl ServerHandler for Connection {
         } else {
             self.proxy
                 .catalog
-                .get()
+                .get(&self.workspace)
                 .await
                 .map_err(|error| rmcp::ErrorData::internal_error(error.to_string(), None))?
                 .tools
@@ -782,7 +782,7 @@ impl ServerHandler for Connection {
         };
         let result: Result<_> = async {
             let (id, mut request) = route_request(request)?;
-            let catalog = self.proxy.catalog.get().await?;
+            let catalog = self.proxy.catalog.get(&self.workspace).await?;
             if self.compact {
                 match request.name.as_ref() {
                     "dispatch" => request = expand_dispatch(request, &catalog.tools)?,
