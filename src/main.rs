@@ -1719,7 +1719,7 @@ impl BrowserProxy {
         Ok(())
     }
 
-    async fn stop_workers(&self) {
+    async fn shutdown(&self, preserve_browser: bool) -> Result<()> {
         self.catalog.shutdown().await;
         let slots = self.sessions.lock().await.drain().collect::<Vec<_>>();
         let mut sessions = Vec::new();
@@ -1735,19 +1735,13 @@ impl BrowserProxy {
         )
         .await;
         self.stop_pooled_workers().await;
-    }
-
-    async fn prepare_upgrade(&self) -> Result<()> {
-        self.stop_workers().await;
-        if let Some(tracker) = self.tracker.write().await.take() {
-            tracker.shutdown().await;
+        if preserve_browser {
+            if let Some(tracker) = self.tracker.write().await.take() {
+                tracker.shutdown().await;
+            }
+            self.supervisor.handoff_process().await;
+            return Ok(());
         }
-        self.supervisor.handoff_process().await;
-        Ok(())
-    }
-
-    async fn shutdown(&self) -> Result<()> {
-        self.stop_workers().await;
         let tracker = match self.tracker.write().await.take() {
             Some(tracker) => tracker,
             None => {

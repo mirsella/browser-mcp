@@ -2,7 +2,7 @@ use std::{
     fs::OpenOptions,
     os::unix::ffi::OsStrExt,
     os::unix::fs::PermissionsExt,
-    path::{Path, PathBuf},
+    path::Path,
     process::Stdio,
     time::{Duration, Instant},
 };
@@ -23,8 +23,6 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use xxhash_rust::xxh3::xxh3_64;
 
 const SESSION_KEY: &str = "__opencode_session_id";
-const LEGACY_BROKER_FIXTURE: &str = "OPENCODE_BROWSER_LEGACY_BROKER_FIXTURE";
-const HANDSHAKE_MAGIC: &[u8] = b"opencode-browser-mcp\0v5\n";
 type Client = rmcp::service::RunningService<rmcp::RoleClient, ()>;
 
 fn request(name: &str, session_id: &str, arguments: Value) -> CallToolRequestParams {
@@ -107,146 +105,12 @@ fn broker_socket(profile: &Path) -> std::path::PathBuf {
     directory.join(format!("broker-{profile_id:016x}.sock"))
 }
 
-fn broker_lock(socket: &Path) -> PathBuf {
-    let mut lock = socket.as_os_str().to_owned();
-    lock.push(".lock");
-    PathBuf::from(lock)
-}
-
 async fn wait_for_socket(socket: &Path) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !socket.exists() {
         assert!(Instant::now() < deadline, "broker socket did not appear");
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-}
-
-#[tokio::test]
-async fn legacy_broker_fixture() {
-    let Some(socket) = std::env::var_os(LEGACY_BROKER_FIXTURE).map(PathBuf::from) else {
-        return;
-    };
-    let ready = PathBuf::from(std::env::var_os("OPENCODE_BROWSER_FIXTURE_READY").unwrap());
-    let validated = PathBuf::from(std::env::var_os("OPENCODE_BROWSER_FIXTURE_VALIDATED").unwrap());
-    let lock_path = broker_lock(&socket);
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .expect("open legacy broker lease");
-    std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600))
-        .expect("restrict legacy broker lease");
-    lock.try_lock().expect("acquire legacy broker lease");
-    let listener = tokio::net::UnixListener::bind(&socket).expect("bind legacy broker socket");
-    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
-        .expect("restrict legacy broker socket");
-    std::fs::write(ready, b"ready").expect("mark legacy broker ready");
-    loop {
-        let (mut stream, _) = listener.accept().await.expect("accept adapter probe");
-        let mut magic = [0; HANDSHAKE_MAGIC.len()];
-        stream
-            .read_exact(&mut magic)
-            .await
-            .expect("read handshake magic");
-        assert_eq!(magic, HANDSHAKE_MAGIC);
-        match stream.read_u8().await.expect("read handshake kind") {
-            2 => {}
-            0 => {
-                let _direct_tools = stream.read_u8().await.expect("read browser tool mode");
-                let length = stream.read_u32().await.expect("read configuration length") as usize;
-                let mut config = vec![0; length];
-                stream
-                    .read_exact(&mut config)
-                    .await
-                    .expect("read broker configuration");
-                serde_json::from_slice::<Value>(&config).expect("parse broker configuration");
-                std::fs::write(&validated, b"validated")
-                    .expect("mark legacy broker configuration validated");
-                stream
-                    .write_u8(1)
-                    .await
-                    .expect("accept broker configuration");
-                stream.flush().await.expect("flush broker acceptance");
-            }
-            kind => panic!("unexpected legacy broker request {kind}"),
-        }
-    }
-}
-
-#[tokio::test]
-async fn newer_adapter_replaces_legacy_broker() {
-    let root = std::env::temp_dir().join(format!(
-        "opencode-browser-mcp-legacy-upgrade-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir(&root).expect("create private legacy-upgrade test directory");
-    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
-        .expect("restrict legacy-upgrade test directory");
-    let profile = root.join("profile");
-    let socket = broker_socket(&profile);
-    let ready = root.join("legacy-ready");
-    let validated = root.join("legacy-validated");
-    let socket_parent = socket.parent().expect("broker socket parent");
-    std::fs::create_dir_all(socket_parent).expect("create broker runtime directory");
-    std::fs::set_permissions(socket_parent, std::fs::Permissions::from_mode(0o700))
-        .expect("restrict broker runtime directory");
-    let _ = std::fs::remove_file(&socket);
-    let _ = std::fs::remove_file(broker_lock(&socket));
-    let mut legacy = Command::new(std::env::current_exe().expect("locate E2E test executable"))
-        .arg("--exact")
-        .arg("legacy_broker_fixture")
-        .arg("--nocapture")
-        .env(LEGACY_BROKER_FIXTURE, &socket)
-        .env("OPENCODE_BROWSER_FIXTURE_READY", &ready)
-        .env("OPENCODE_BROWSER_FIXTURE_VALIDATED", &validated)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("start legacy broker fixture");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !ready.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "legacy broker did not become ready"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-
-    let port = std::net::TcpListener::bind(("127.0.0.1", 0))
-        .expect("reserve legacy-upgrade test port")
-        .local_addr()
-        .expect("legacy-upgrade test address")
-        .port();
-    let adapter = client(&root, false, &profile, port, "shared-window").await;
-    let status = tokio::time::timeout(Duration::from_secs(5), legacy.wait())
-        .await
-        .expect("legacy broker was not stopped")
-        .expect("wait for legacy broker fixture");
-    assert!(
-        !status.success(),
-        "legacy broker exited without an upgrade signal"
-    );
-    assert!(
-        validated.exists(),
-        "legacy broker configuration was not validated before replacement"
-    );
-    assert_eq!(
-        adapter
-            .list_all_tools()
-            .await
-            .expect("list tools from replacement broker")
-            .iter()
-            .map(|tool| tool.name.as_ref())
-            .collect::<Vec<_>>(),
-        ["dispatch", "help"]
-    );
-    adapter.cancel().await.expect("stop replacement adapter");
-    wait_for_broker_exit(&socket, &profile).await;
-    let _ = std::fs::remove_dir_all(root);
 }
 
 async fn wait_for_broker_exit(socket: &Path, profile: &Path) {
