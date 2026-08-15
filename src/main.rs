@@ -506,6 +506,13 @@ impl BrowserSupervisor {
         }
         Ok(())
     }
+
+    async fn handoff_process(&self) {
+        if let Some(process) = self.state.lock().await.process.take() {
+            // The replacement broker adopts this browser through its persisted CDP generation.
+            std::mem::forget(process);
+        }
+    }
 }
 
 fn parse_graphical_environment(output: &[u8]) -> HashMap<String, OsString> {
@@ -1712,7 +1719,7 @@ impl BrowserProxy {
         Ok(())
     }
 
-    async fn shutdown(&self) -> Result<()> {
+    async fn stop_workers(&self) {
         self.catalog.shutdown().await;
         let slots = self.sessions.lock().await.drain().collect::<Vec<_>>();
         let mut sessions = Vec::new();
@@ -1728,6 +1735,19 @@ impl BrowserProxy {
         )
         .await;
         self.stop_pooled_workers().await;
+    }
+
+    async fn prepare_upgrade(&self) -> Result<()> {
+        self.stop_workers().await;
+        if let Some(tracker) = self.tracker.write().await.take() {
+            tracker.shutdown().await;
+        }
+        self.supervisor.handoff_process().await;
+        Ok(())
+    }
+
+    async fn shutdown(&self) -> Result<()> {
+        self.stop_workers().await;
         let tracker = match self.tracker.write().await.take() {
             Some(tracker) => tracker,
             None => {

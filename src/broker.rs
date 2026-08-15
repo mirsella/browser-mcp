@@ -1,10 +1,12 @@
 use std::{
+    cmp::Ordering as CmpOrdering,
     fs::{self, File, OpenOptions},
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
     os::unix::ffi::OsStrExt,
     os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -24,6 +26,7 @@ use rmcp::{
     },
     service::RequestContext,
 };
+use semver::Version;
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, copy},
@@ -45,9 +48,20 @@ const HANDSHAKE_MAGIC: &[u8] = b"opencode-browser-mcp\0v5\n";
 const MANAGED_CONFIG_ENV: &str = "OPENCODE_BROWSER_INTERNAL_CONFIG";
 const CONNECT_HANDSHAKE: u8 = 0;
 const RELEASE_HANDSHAKE: u8 = 1;
+const VERSION_HANDSHAKE: u8 = 2;
+const UPGRADE_HANDSHAKE: u8 = 3;
+const VERSION_RESPONSE: u8 = 1;
+const MAX_VERSION_BYTES: usize = 256;
 const MAX_CONFIG_BYTES: usize = 16 * 1024;
 const OPENCODE_PREFIX: &str = "opencode:";
 const MAX_OPENCODE_SESSION_ID_BYTES: usize = MAX_SESSION_ID_BYTES - OPENCODE_PREFIX.len();
+static PACKAGE_VERSION: LazyLock<Version> = LazyLock::new(|| {
+    Version::parse(env!("CARGO_PKG_VERSION")).expect("package version must be valid SemVer")
+});
+
+fn broker_is_current(version: &Version) -> bool {
+    version.cmp_precedence(&PACKAGE_VERSION) != CmpOrdering::Less
+}
 
 pub(super) async fn run(cli: Cli) -> Result<()> {
     let Cli {
@@ -74,6 +88,7 @@ pub(super) async fn run(cli: Cli) -> Result<()> {
         }
         None => {
             config.resolve(profile_override).await?;
+            validate_config(&config)?;
             let paths = RuntimePaths::new(&config)?;
             bridge(paths, direct_tools, config).await
         }
@@ -151,7 +166,7 @@ fn validate_private_directory(directory: &Path) -> Result<()> {
 }
 
 async fn bridge(paths: RuntimePaths, direct_tools: bool, config: Config) -> Result<()> {
-    let mut stream = connect_or_start(&paths, &config).await?;
+    let mut stream = connect_or_start(&paths, &config, true).await?;
     validate_broker_peer(&stream)?;
     client_handshake(&mut stream, direct_tools, config).await?;
     let mut stdin = tokio::io::stdin();
@@ -167,11 +182,15 @@ async fn bridge(paths: RuntimePaths, direct_tools: bool, config: Config) -> Resu
     Ok(())
 }
 
-async fn connect_or_start(paths: &RuntimePaths, config: &Config) -> Result<UnixStream> {
+async fn connect_or_start(
+    paths: &RuntimePaths,
+    config: &Config,
+    require_current: bool,
+) -> Result<UnixStream> {
     let deadline = Instant::now() + BROKER_START_TIMEOUT;
     let mut child: Option<tokio::process::Child> = None;
     loop {
-        if let Some(stream) = connect_or_absent(&paths.socket).await? {
+        if let Some(mut stream) = connect_or_absent(&paths.socket).await? {
             if let Some(mut child) = child.take() {
                 tokio::spawn(async move {
                     if let Err(error) = child.wait().await {
@@ -179,7 +198,28 @@ async fn connect_or_start(paths: &RuntimePaths, config: &Config) -> Result<UnixS
                     }
                 });
             }
-            return Ok(stream);
+            if !require_current {
+                return Ok(stream);
+            }
+            let peer = broker_peer(&stream);
+            match broker_version(&mut stream).await? {
+                Some(version) if broker_is_current(&version) => {
+                    return Ok(stream);
+                }
+                Some(version) => {
+                    info!(broker_version = %version, adapter_version = %*PACKAGE_VERSION, "requesting browser broker upgrade");
+                    request_upgrade(&mut stream, config).await?;
+                }
+                None => {
+                    let observed = peer?;
+                    let Some(peer) = compatible_legacy_peer(paths, config, &observed).await? else {
+                        continue;
+                    };
+                    info!(pid = peer.pid, adapter_version = %*PACKAGE_VERSION, "replacing legacy browser broker");
+                    signal_peer(&peer, libc::SIGTERM)?;
+                }
+            }
+            drop(stream);
         }
         if lease_is_available(&paths.lock)? && child.is_none() {
             paths.prepare_parent()?;
@@ -206,6 +246,81 @@ async fn connect_or_start(paths: &RuntimePaths, config: &Config) -> Result<UnixS
         }
         sleep(Duration::from_millis(50)).await;
     }
+}
+
+struct BrokerPeer {
+    pid: libc::pid_t,
+    pidfd: OwnedFd,
+}
+
+fn broker_peer(stream: &UnixStream) -> Result<BrokerPeer> {
+    let pid = peer_pid(stream)?;
+    let mut fd = -1;
+    let mut length = std::mem::size_of_val(&fd) as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERPIDFD,
+            (&raw mut fd).cast(),
+            &raw mut length,
+        )
+    };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to get a stable browser broker process handle");
+    }
+    if fd < 0 || length as usize != std::mem::size_of_val(&fd) {
+        if fd >= 0 {
+            unsafe { libc::close(fd) };
+        }
+        bail!("browser broker returned an invalid process handle");
+    }
+    Ok(BrokerPeer {
+        pid,
+        pidfd: unsafe { OwnedFd::from_raw_fd(fd) },
+    })
+}
+
+async fn compatible_legacy_peer(
+    paths: &RuntimePaths,
+    config: &Config,
+    observed: &BrokerPeer,
+) -> Result<Option<BrokerPeer>> {
+    let Some(mut stream) = connect_or_absent(&paths.socket).await? else {
+        return Ok(None);
+    };
+    let peer = broker_peer(&stream)?;
+    if peer.pid != observed.pid || !peer_is_alive(observed)? {
+        return Ok(None);
+    }
+    // Connect is understood by every v5 broker and validates its full configuration.
+    client_handshake(&mut stream, false, config.clone()).await?;
+    Ok(Some(peer))
+}
+
+fn peer_is_alive(peer: &BrokerPeer) -> Result<bool> {
+    signal_peer(peer, 0)
+}
+
+fn signal_peer(peer: &BrokerPeer, signal: libc::c_int) -> Result<bool> {
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            peer.pidfd.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if result == -1 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(false);
+        }
+        return Err(error).context("failed to signal legacy browser broker");
+    }
+    Ok(true)
 }
 
 fn spawn_managed_broker(config: &Config) -> Result<tokio::process::Child> {
@@ -256,6 +371,11 @@ async fn run_managed_broker(config: Arc<Config>, paths: RuntimePaths) -> Result<
     run_broker(config, paths, socket_lease).await
 }
 
+enum BrokerExit {
+    Shutdown,
+    Upgrade,
+}
+
 async fn run_broker(config: Arc<Config>, paths: RuntimePaths, _socket_lease: File) -> Result<()> {
     let _profile_lease = profile_lease(&config.profile)?;
     let persistence = OwnershipPersistence::open(config.profile.join(STATE_FILE))?;
@@ -299,7 +419,7 @@ async fn run_broker(config: Arc<Config>, paths: RuntimePaths, _socket_lease: Fil
     let exit = loop {
         tokio::select! {
             biased;
-            _ = &mut signal => break Ok(()),
+            _ = &mut signal => break Ok(BrokerExit::Shutdown),
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
                     active_connections += 1;
@@ -317,13 +437,17 @@ async fn run_broker(config: Arc<Config>, paths: RuntimePaths, _socket_lease: Fil
                 match result {
                     Err(error) => warn!(%error, "connection task panicked"),
                     Ok(Err(error)) => warn!(%error, "browser broker connection failed"),
-                    Ok(Ok(())) => {}
+                    Ok(Ok(ConnectionExit::Closed)) => {}
+                    Ok(Ok(ConnectionExit::Upgrade)) => {
+                        info!(version = %*PACKAGE_VERSION, "browser broker stopping for upgrade");
+                        break Ok(BrokerExit::Upgrade);
+                    }
                 }
                 if active_connections == 0 {
                     idle.as_mut().reset(Instant::now() + MANAGED_IDLE_GRACE);
                 }
             }
-            _ = &mut idle, if active_connections == 0 => break Ok(()),
+            _ = &mut idle, if active_connections == 0 => break Ok(BrokerExit::Shutdown),
         }
     };
     drop(listener);
@@ -336,11 +460,20 @@ async fn run_broker(config: Arc<Config>, paths: RuntimePaths, _socket_lease: Fil
             break;
         }
     }
-    connections.abort_all();
+    connections.shutdown().await;
     proxy.catalog.cancel();
     cleanup.abort();
     let _ = cleanup.await;
-    exit.and(shutdown_proxy(&proxy).await)
+    match exit {
+        Ok(BrokerExit::Shutdown) => shutdown_proxy(&proxy).await,
+        Ok(BrokerExit::Upgrade) => proxy.prepare_upgrade().await,
+        Err(error) => {
+            if let Err(shutdown_error) = shutdown_proxy(&proxy).await {
+                warn!(%shutdown_error, "browser proxy shutdown after broker failure was incomplete");
+            }
+            Err(error)
+        }
+    }
 }
 
 fn profile_lease(profile: &Path) -> Result<File> {
@@ -810,7 +943,7 @@ async fn serve_connection(
     stream: UnixStream,
     mut shutdown: watch::Receiver<bool>,
     config: Arc<Config>,
-) -> Result<()> {
+) -> Result<ConnectionExit> {
     let mut stream = stream;
     let pid = peer_pid(&stream)?;
     let compact = match server_handshake(&mut stream, &config).await? {
@@ -822,7 +955,11 @@ async fn serve_connection(
             stream.write_u8(u8::from(result.is_ok())).await?;
             stream.flush().await?;
             result?;
-            return Ok(());
+            return Ok(ConnectionExit::Closed);
+        }
+        HandshakeRequest::Upgrade { .. } => return Ok(ConnectionExit::Upgrade),
+        HandshakeRequest::Version => {
+            unreachable!("version preface is consumed by server_handshake")
         }
     };
     let workspace = peer_workspace(pid)?;
@@ -852,7 +989,12 @@ async fn serve_connection(
     .context("MCP connection failed");
     lifecycle.close_and_wait().await;
     result?;
-    Ok(())
+    Ok(ConnectionExit::Closed)
+}
+
+enum ConnectionExit {
+    Closed,
+    Upgrade,
 }
 
 async fn client_handshake(
@@ -875,19 +1017,90 @@ async fn client_handshake(
     .context("timed out negotiating with browser broker")?
 }
 
+async fn broker_version(stream: &mut UnixStream) -> Result<Option<Version>> {
+    timeout(HANDSHAKE_TIMEOUT, async {
+        write_handshake(stream, &HandshakeRequest::Version).await?;
+        let marker = match stream.read_u8().await {
+            Ok(marker) => marker,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::BrokenPipe
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if marker != VERSION_RESPONSE {
+            bail!("browser broker returned an invalid version response");
+        }
+        let version =
+            read_bounded_string(stream, MAX_VERSION_BYTES, "browser broker version").await?;
+        Ok(Some(
+            Version::parse(&version).context("browser broker returned an invalid version")?,
+        ))
+    })
+    .await
+    .context("timed out checking browser broker version")?
+}
+
+async fn request_upgrade(stream: &mut UnixStream, config: &Config) -> Result<()> {
+    timeout(HANDSHAKE_TIMEOUT, async {
+        write_handshake(
+            stream,
+            &HandshakeRequest::Upgrade {
+                version: PACKAGE_VERSION.to_string(),
+                config: config.clone(),
+            },
+        )
+        .await?;
+        expect_acceptance(stream, "upgrade").await
+    })
+    .await
+    .context("timed out requesting browser broker upgrade")?
+}
+
 async fn server_handshake(stream: &mut UnixStream, config: &Config) -> Result<HandshakeRequest> {
     timeout(HANDSHAKE_TIMEOUT, async {
-        let request = read_handshake(stream).await?;
-        if request.config() != config {
-            stream.write_u8(2).await?;
-            stream.flush().await?;
-            bail!("browser configuration does not match the running managed broker");
+        let mut version_seen = false;
+        loop {
+            let request = read_handshake(stream).await?;
+            if matches!(request, HandshakeRequest::Version) {
+                if version_seen {
+                    bail!("browser broker version was requested more than once");
+                }
+                version_seen = true;
+                stream.write_u8(VERSION_RESPONSE).await?;
+                write_bounded_string(stream, env!("CARGO_PKG_VERSION"), MAX_VERSION_BYTES).await?;
+                stream.flush().await?;
+                continue;
+            }
+            if request.config() != Some(config) {
+                stream.write_u8(2).await?;
+                stream.flush().await?;
+                bail!("browser configuration does not match the running managed broker");
+            }
+            if let HandshakeRequest::Upgrade { version, .. } = &request {
+                let requested =
+                    Version::parse(version).context("invalid requested broker version")?;
+                if requested.cmp_precedence(&PACKAGE_VERSION) != CmpOrdering::Greater {
+                    stream.write_u8(2).await?;
+                    stream.flush().await?;
+                    bail!("browser broker upgrade was not requested by a newer adapter");
+                }
+                stream.write_u8(1).await?;
+                stream.flush().await?;
+                return Ok(request);
+            }
+            if matches!(request, HandshakeRequest::Connect { .. }) {
+                stream.write_u8(1).await?;
+                stream.flush().await?;
+            }
+            return Ok(request);
         }
-        if matches!(request, HandshakeRequest::Connect { .. }) {
-            stream.write_u8(1).await?;
-            stream.flush().await?;
-        }
-        Ok(request)
     })
     .await
     .context("timed out negotiating browser broker connection")?
@@ -896,12 +1109,17 @@ async fn server_handshake(stream: &mut UnixStream, config: &Config) -> Result<Ha
 enum HandshakeRequest {
     Connect { direct_tools: bool, config: Config },
     Release { session_id: String, config: Config },
+    Version,
+    Upgrade { version: String, config: Config },
 }
 
 impl HandshakeRequest {
-    fn config(&self) -> &Config {
+    fn config(&self) -> Option<&Config> {
         match self {
-            Self::Connect { config, .. } | Self::Release { config, .. } => config,
+            Self::Connect { config, .. }
+            | Self::Release { config, .. }
+            | Self::Upgrade { config, .. } => Some(config),
+            Self::Version => None,
         }
     }
 }
@@ -925,6 +1143,12 @@ async fn write_handshake(stream: &mut UnixStream, request: &HandshakeRequest) ->
             stream.write_u8(RELEASE_HANDSHAKE).await?;
             stream.write_u32(bytes.len() as u32).await?;
             stream.write_all(bytes).await?;
+            write_config(stream, config).await?;
+        }
+        HandshakeRequest::Version => stream.write_u8(VERSION_HANDSHAKE).await?,
+        HandshakeRequest::Upgrade { version, config } => {
+            stream.write_u8(UPGRADE_HANDSHAKE).await?;
+            write_bounded_string(stream, version, MAX_VERSION_BYTES).await?;
             write_config(stream, config).await?;
         }
     }
@@ -963,8 +1187,38 @@ async fn read_handshake(stream: &mut UnixStream) -> Result<HandshakeRequest> {
                 config: read_config(stream).await?,
             })
         }
+        VERSION_HANDSHAKE => Ok(HandshakeRequest::Version),
+        UPGRADE_HANDSHAKE => Ok(HandshakeRequest::Upgrade {
+            version: read_bounded_string(stream, MAX_VERSION_BYTES, "requested broker version")
+                .await?,
+            config: read_config(stream).await?,
+        }),
         _ => bail!("invalid browser broker request"),
     }
+}
+
+async fn write_bounded_string(stream: &mut UnixStream, value: &str, maximum: usize) -> Result<()> {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || bytes.len() > maximum {
+        bail!("broker handshake string has an invalid length");
+    }
+    stream.write_u16(bytes.len() as u16).await?;
+    stream.write_all(bytes).await?;
+    Ok(())
+}
+
+async fn read_bounded_string(
+    stream: &mut UnixStream,
+    maximum: usize,
+    description: &str,
+) -> Result<String> {
+    let length = stream.read_u16().await? as usize;
+    if length == 0 || length > maximum {
+        bail!("invalid {description} length");
+    }
+    let mut bytes = vec![0; length];
+    stream.read_exact(&mut bytes).await?;
+    String::from_utf8(bytes).with_context(|| format!("{description} is not UTF-8"))
 }
 
 async fn write_config(stream: &mut UnixStream, config: &Config) -> Result<()> {
@@ -1017,25 +1271,53 @@ async fn release_session(paths: &RuntimePaths, config: &Config, session_id: &str
     if session_id.is_empty() || session_id.len() > MAX_OPENCODE_SESSION_ID_BYTES {
         bail!("invalid browser session identifier");
     }
-    let mut stream = connect_or_start(paths, config).await?;
-    validate_broker_peer(&stream)?;
     timeout(RELEASE_CONTROL_TIMEOUT, async {
-        write_handshake(
-            &mut stream,
-            &HandshakeRequest::Release {
-                session_id: session_id.to_owned(),
-                config: config.clone(),
-            },
-        )
-        .await?;
-        expect_acceptance(&mut stream, "session release").await
+        loop {
+            let result = async {
+                let mut stream = connect_or_start(paths, config, false).await?;
+                validate_broker_peer(&stream)?;
+                write_handshake(
+                    &mut stream,
+                    &HandshakeRequest::Release {
+                        session_id: session_id.to_owned(),
+                        config: config.clone(),
+                    },
+                )
+                .await?;
+                expect_acceptance(&mut stream, "session release").await
+            }
+            .await;
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) if is_transient_disconnect(&error) => {
+                    sleep(Duration::from_millis(50)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     })
     .await
     .context("timed out waiting for browser session release")?
 }
 
+fn is_transient_disconnect(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::NotConnected
+            )
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
     use serde_json::{Value, json};
 
     use super::*;
@@ -1164,5 +1446,68 @@ mod tests {
             .await
             .expect("connection close timed out")
             .expect("connection close task failed");
+    }
+
+    #[test]
+    fn only_older_brokers_require_replacement() {
+        let current = PACKAGE_VERSION.clone();
+        let mut older = current.clone();
+        if older.patch > 0 {
+            older.patch -= 1;
+        } else if older.minor > 0 {
+            older.minor -= 1;
+            older.patch = u64::MAX;
+        } else {
+            older.major = older
+                .major
+                .checked_sub(1)
+                .expect("test package has a predecessor");
+            older.minor = u64::MAX;
+            older.patch = u64::MAX;
+        }
+        let mut newer = current.clone();
+        newer.patch = newer
+            .patch
+            .checked_add(1)
+            .expect("test package patch version");
+        assert!(!broker_is_current(&older));
+        assert!(broker_is_current(&current));
+        assert!(broker_is_current(&newer));
+    }
+
+    #[tokio::test]
+    async fn version_preface_allows_a_newer_adapter_to_request_upgrade() {
+        let config = Cli::try_parse_from(["opencode-browser-mcp", "--headless=true"])
+            .expect("parse test configuration")
+            .config;
+        let (mut client, mut server) = UnixStream::pair().expect("create broker socket pair");
+        let server_config = config.clone();
+        let serving = tokio::spawn(async move {
+            server_handshake(&mut server, &server_config)
+                .await
+                .expect("serve upgrade handshake")
+        });
+        assert_eq!(
+            broker_version(&mut client)
+                .await
+                .expect("request broker version"),
+            Some(PACKAGE_VERSION.clone())
+        );
+        write_handshake(
+            &mut client,
+            &HandshakeRequest::Upgrade {
+                version: "999.0.0".to_owned(),
+                config,
+            },
+        )
+        .await
+        .expect("request broker upgrade");
+        expect_acceptance(&mut client, "test upgrade")
+            .await
+            .expect("accept broker upgrade");
+        assert!(matches!(
+            serving.await.expect("join broker handshake"),
+            HandshakeRequest::Upgrade { .. }
+        ));
     }
 }
