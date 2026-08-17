@@ -570,10 +570,7 @@ impl TargetTracker {
                     None
                 }
             };
-            if let Err(error) = self
-                .command("Target.activateTarget", json!({"targetId": anchor}), None)
-                .await
-            {
+            if let Err(error) = self.activate_target(anchor).await {
                 warn!(%error, session_id = %session, tab = anchor, "could not activate session window before tab creation");
             }
             window
@@ -608,6 +605,9 @@ impl TargetTracker {
             self.fail_closed().await;
             return Err(error);
         }
+        if !background && let Err(error) = self.activate_target(&tab).await {
+            warn!(%error, session_id = %session, tab, "could not focus new browser tab");
+        }
         drop(_creation);
         if let Some(expected_window) = expected_window {
             match self.target_window(&tab).await {
@@ -622,6 +622,12 @@ impl TargetTracker {
             }
         }
         Ok(tab)
+    }
+
+    async fn activate_target(&self, tab: &str) -> Result<()> {
+        self.command("Target.activateTarget", json!({"targetId": tab}), None)
+            .await
+            .map(|_| ())
     }
 
     async fn target_window(&self, tab: &str) -> Result<i64> {

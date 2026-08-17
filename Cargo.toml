@@ -1,6 +1,6 @@
 [package]
 name = "opencode-browser-mcp"
-version = "0.7.2"
+version = "0.7.3"
 edition = "2024"
 rust-version = "1.89"
 description = "Session-isolated browser automation over MCP and Chrome DevTools Protocol"

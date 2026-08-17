@@ -395,6 +395,7 @@ impl BrowserSupervisor {
                     self.config.cdp_host
                 ))
                 .arg(format!("--remote-debugging-port={}", self.config.cdp_port))
+                .arg("--no-startup-window")
                 .arg("--no-first-run")
                 .arg("--no-default-browser-check")
                 .arg("--disable-popup-blocking")
@@ -1465,6 +1466,12 @@ impl BrowserProxy {
         explicit_current: Option<&str>,
     ) -> Result<()> {
         tracker.synchronize().await?;
+        if tracker.owned_tabs(id).await?.is_empty() {
+            // Chrome DevTools MCP has no valid page listing before the first tab exists.
+            session.pages.local_to_tab.clear();
+            session.persisted.current_tab = None;
+            return Ok(());
+        }
         let (pages, selected) = self.list_snapshot(session).await?;
         let mut mappings = HashMap::new();
         for page in pages {
@@ -1523,7 +1530,7 @@ impl BrowserProxy {
                 tracker,
                 id,
                 session,
-                json!({"url": INTERNAL_URL, "background": true})
+                json!({"url": INTERNAL_URL, "background": false})
                     .as_object()
                     .expect("object")
                     .clone(),
