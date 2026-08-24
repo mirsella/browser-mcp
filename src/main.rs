@@ -1785,10 +1785,6 @@ fn remove_schema_property(schema: &mut JsonObject, property: &str) -> bool {
     }
     removed
 }
-fn content_text(content: &ContentBlock) -> Option<&str> {
-    content.as_text().map(|text| text.text.as_str())
-}
-
 fn parse_tab_id(result: &CallToolResult) -> Result<TargetId> {
     result
         .structured_content
@@ -1800,38 +1796,12 @@ fn parse_tab_id(result: &CallToolResult) -> Result<TargetId> {
         .ok_or_else(|| anyhow!("missing nonempty structured_content.tabId"))
 }
 
-fn page_line(line: &str) -> Result<(u64, String, bool)> {
-    let line = line.trim();
-    let (id, text) = line
-        .split_once(": ")
-        .ok_or_else(|| anyhow!("malformed page line: {line}"))?;
-    let id = id
-        .parse()
-        .with_context(|| format!("invalid page ID in {line}"))?;
-    let mut text = text.to_owned();
-    let selected = text.rfind(" [selected]").is_some_and(|position| {
-        let suffix = &text[position + " [selected]".len()..];
-        suffix.is_empty() || suffix.starts_with(" isolatedContext=")
-    });
-    if selected {
-        let position = text.rfind(" [selected]").expect("selected marker exists");
-        text.replace_range(position..position + " [selected]".len(), "");
-    }
-    if text.is_empty() {
-        bail!("malformed page line: {line}");
-    }
-    Ok((id, text, selected))
-}
-
-fn structured_page_snapshot(
-    result: &CallToolResult,
-) -> Result<Option<(HashSet<u64>, Option<u64>)>> {
-    let Some(structured) = result.structured_content.as_ref() else {
-        return Ok(None);
-    };
-    let Some(pages) = structured.get("pages") else {
-        return Ok(None);
-    };
+fn parse_pages(result: &CallToolResult) -> Result<(HashSet<u64>, Option<u64>)> {
+    let pages = result
+        .structured_content
+        .as_ref()
+        .and_then(|structured| structured.get("pages"))
+        .ok_or_else(|| anyhow!("missing structured page list"))?;
     let pages = pages
         .as_array()
         .ok_or_else(|| anyhow!("structured page list is not an array"))?;
@@ -1848,57 +1818,21 @@ fn structured_page_snapshot(
         if !ids.insert(id) {
             bail!("duplicate page ID {id}");
         }
-        if page.get("selected").and_then(Value::as_bool) == Some(true)
-            && selected.replace(id).is_some()
-        {
+        let is_selected = page
+            .get("selected")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| anyhow!("structured page entry has no selected state"))?;
+        if is_selected && selected.replace(id).is_some() {
             bail!("structured page list has multiple selected pages");
         }
     }
-    Ok(Some((ids, selected)))
-}
-
-fn parse_pages(result: &CallToolResult) -> Result<(HashSet<u64>, Option<u64>)> {
-    if let Some(snapshot) = structured_page_snapshot(result)? {
-        return Ok(snapshot);
-    }
-    let mut pages = HashSet::new();
-    let mut selected = None;
-    let mut found = false;
-    for content in &result.content {
-        let Some(text) = content_text(content) else {
-            continue;
-        };
-        let mut inside = false;
-        for line in text.lines() {
-            let trimmed = line.trim();
-            if trimmed == "## Pages" || trimmed == "Pages:" {
-                inside = true;
-                found = true;
-                continue;
-            }
-            if inside && trimmed.starts_with("## ") {
-                inside = false;
-            }
-            if inside && !trimmed.is_empty() {
-                let (id, _, is_selected) = page_line(line)?;
-                if !pages.insert(id) {
-                    bail!("duplicate page ID {id}");
-                }
-                if is_selected {
-                    selected = Some(id);
-                }
-            }
-        }
-    }
-    if !found {
-        bail!("Chrome DevTools did not return a page section");
-    }
-    Ok((pages, selected))
+    Ok((ids, selected))
 }
 fn filter_page_content(
     mut result: CallToolResult,
     allowed: &HashSet<u64>,
 ) -> Result<CallToolResult> {
+    let mut structured_page_lines = None;
     if let Some(structured) = result.structured_content.as_mut()
         && let Some(pages) = structured.get_mut("pages")
     {
@@ -1906,19 +1840,52 @@ fn filter_page_content(
             .as_array_mut()
             .ok_or_else(|| anyhow!("structured page list is not an array"))?;
         let mut filtered = Vec::new();
+        let mut lines = Vec::new();
         for page in std::mem::take(pages) {
-            let mut page = page
-                .as_object()
-                .cloned()
-                .ok_or_else(|| anyhow!("structured page entry is not an object"))?;
+            let Value::Object(mut page) = page else {
+                bail!("structured page entry is not an object");
+            };
             let id = page
                 .remove("id")
                 .and_then(|id| id.as_u64())
                 .ok_or_else(|| anyhow!("structured page entry has no numeric ID"))?;
             if allowed.contains(&id) {
+                let url = page
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("structured page entry has no URL"))?;
+                let title = page
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("structured page entry has no title"))?;
+                let selected = page
+                    .get("selected")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| anyhow!("structured page entry has no selected state"))?;
+                let label = if title.is_empty() {
+                    url.to_owned()
+                } else {
+                    format!("{title} ({url})")
+                };
+                let mut line = if label.is_empty() {
+                    "-".to_owned()
+                } else {
+                    format!("- {label}")
+                };
+                if selected {
+                    line.push_str(" [selected]");
+                }
+                if let Some(context) = page.get("isolatedContext") {
+                    let context = context.as_str().ok_or_else(|| {
+                        anyhow!("structured page entry has invalid isolated context")
+                    })?;
+                    line.push_str(&format!(" isolatedContext={context}"));
+                }
+                lines.push(line);
                 filtered.push(Value::Object(page));
             }
         }
+        structured_page_lines = Some(lines);
         *pages = filtered;
     }
     for content in &mut result.content {
@@ -1932,20 +1899,19 @@ fn filter_page_content(
             if trimmed == "## Pages" || trimmed == "Pages:" {
                 inside = true;
                 filtered.push(line.to_owned());
+                filtered.extend(
+                    structured_page_lines
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("page response has no structured page list"))?
+                        .iter()
+                        .cloned(),
+                );
                 continue;
             }
             if inside && trimmed.starts_with("## ") {
                 inside = false;
             }
             if inside && !trimmed.is_empty() {
-                let (id, page, selected) = page_line(line)?;
-                if allowed.contains(&id) {
-                    filtered.push(if selected {
-                        format!("- {page} [selected]")
-                    } else {
-                        format!("- {page}")
-                    });
-                }
                 continue;
             }
             filtered.push(line.to_owned());
@@ -1994,6 +1960,10 @@ fn validate_config(config: &Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn content_text(content: &ContentBlock) -> Option<&str> {
+        content.as_text().map(|text| text.text.as_str())
+    }
 
     fn parsed_cli(arguments: &[&str]) -> Cli {
         Cli::try_parse_from(
@@ -2077,28 +2047,8 @@ mod tests {
         assert_eq!(schema["required"], json!(["url"]));
     }
     #[test]
-    fn parses_only_strict_page_sections() {
-        let result = CallToolResult::success(vec![ContentBlock::text(
-            "# response\n## Pages\n1: https://one.test/\n22: https://two.test/ [selected]\n## Done",
-        )]);
-        let (pages, selected) = parse_pages(&result).unwrap();
-        assert_eq!(pages, HashSet::from([1, 22]));
-        assert_eq!(selected, Some(22));
-    }
-    #[test]
-    fn parses_selected_page_with_isolated_context_suffix() {
-        let result = CallToolResult::success(vec![ContentBlock::text(
-            "## Pages\n7: https://one.test/\n8: https://two.test/ [selected] isolatedContext=private",
-        )]);
-        let (pages, selected) = parse_pages(&result).unwrap();
-        assert_eq!(pages, HashSet::from([7, 8]));
-        assert_eq!(selected, Some(8));
-    }
-    #[test]
-    fn structured_pages_are_authoritative() {
-        let mut result = CallToolResult::success(vec![ContentBlock::text(
-            "## Pages\n99: https://stale.test/ [selected]",
-        )]);
+    fn parses_structured_pages() {
+        let mut result = CallToolResult::success(vec![]);
         result.structured_content = Some(json!({
             "pages": [
                 {"id": 1, "url": "https://one.test/", "selected": false},
@@ -2110,7 +2060,7 @@ mod tests {
         assert_eq!(selected, Some(2));
     }
     #[test]
-    fn malformed_page_lines_fail_closed() {
+    fn page_text_without_structured_data_fails_closed() {
         let result = CallToolResult::success(vec![ContentBlock::text("## Pages\nnot a page")]);
         assert!(parse_pages(&result).is_err());
         assert!(filter_page_content(result, &HashSet::new()).is_err());
@@ -2122,8 +2072,8 @@ mod tests {
         )]);
         result.structured_content = Some(json!({
             "pages": [
-                {"id": 1, "url": "https://one.test/", "selected": false},
-                {"id": 2, "url": "https://two.test/", "selected": true}
+                {"id": 1, "url": "https://one.test/", "title": "", "selected": false},
+                {"id": 2, "url": "https://two.test/", "title": "", "selected": true}
             ],
             "unrelated": "preserved"
         }));
@@ -2135,9 +2085,22 @@ mod tests {
         assert_eq!(
             filtered.structured_content,
             Some(json!({
-                "pages": [{"url": "https://two.test/", "selected": true}],
+                "pages": [{"url": "https://two.test/", "title": "", "selected": true}],
                 "unrelated": "preserved"
             }))
+        );
+    }
+    #[test]
+    fn structured_pages_replace_transient_malformed_text() {
+        let mut result = CallToolResult::success(vec![ContentBlock::text("## Pages\n3: ")]);
+        result.structured_content = Some(json!({
+            "pages": [{"id": 3, "url": "", "title": "", "selected": false}]
+        }));
+        let filtered = filter_page_content(result, &HashSet::from([3])).unwrap();
+        assert_eq!(content_text(&filtered.content[0]), Some("## Pages\n-"));
+        assert_eq!(
+            filtered.structured_content,
+            Some(json!({"pages": [{"url": "", "title": "", "selected": false}]}))
         );
     }
     #[test]
