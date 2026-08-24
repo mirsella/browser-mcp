@@ -1899,11 +1899,6 @@ fn filter_page_content(
     mut result: CallToolResult,
     allowed: &HashSet<u64>,
 ) -> Result<CallToolResult> {
-    let structured_pages_are_authoritative = result
-        .structured_content
-        .as_ref()
-        .and_then(|structured| structured.get("pages"))
-        .is_some();
     if let Some(structured) = result.structured_content.as_mut()
         && let Some(pages) = structured.get_mut("pages")
     {
@@ -1943,9 +1938,6 @@ fn filter_page_content(
                 inside = false;
             }
             if inside && !trimmed.is_empty() {
-                if structured_pages_are_authoritative {
-                    continue;
-                }
                 let (id, page, selected) = page_line(line)?;
                 if allowed.contains(&id) {
                     filtered.push(if selected {
@@ -2136,16 +2128,17 @@ mod tests {
             "unrelated": "preserved"
         }));
         let filtered = filter_page_content(result, &HashSet::from([2])).unwrap();
-        let text = content_text(&filtered.content[0]).unwrap();
-        assert!(!text.contains("one.test"));
-        assert!(!text.contains("2:"));
-        assert!(!text.contains("two.test"));
-        let structured = filtered.structured_content.unwrap();
-        let pages = structured["pages"].as_array().unwrap();
-        assert_eq!(pages.len(), 1);
-        assert_eq!(pages[0]["url"], "https://two.test/");
-        assert!(pages[0].get("id").is_none());
-        assert_eq!(structured["unrelated"], "preserved");
+        assert_eq!(
+            content_text(&filtered.content[0]),
+            Some("# response\n## Pages\n- https://two.test/ [selected]")
+        );
+        assert_eq!(
+            filtered.structured_content,
+            Some(json!({
+                "pages": [{"url": "https://two.test/", "selected": true}],
+                "unrelated": "preserved"
+            }))
+        );
     }
     #[test]
     fn error_content_without_page_section_is_not_filtered() {

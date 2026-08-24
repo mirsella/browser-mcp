@@ -298,30 +298,39 @@ async fn wait_for_browser_exit(port: u16) {
     panic!("browser remained reachable after the MCP process exited");
 }
 
-fn isolated_view(result: &CallToolResult, own_url: &str, other_url: &str) -> (bool, String) {
-    let Some(pages) = result
+fn isolated_view(result: &CallToolResult, own_url: &str, other_url: &str) -> String {
+    if let Some(pages) = result
         .structured_content
         .as_ref()
         .and_then(|value| value.get("pages"))
         .and_then(Value::as_array)
-    else {
-        return (false, text(result));
-    };
-    assert!(!pages.is_empty());
-    for page in pages {
-        let page = page.as_object().expect("structured page object");
-        assert!(!page.contains_key("id"));
+    {
+        assert!(!pages.is_empty());
+        for page in pages {
+            let page = page.as_object().expect("structured page object");
+            assert!(!page.contains_key("id"));
+        }
+        let serialized = Value::Array(pages.clone()).to_string();
+        assert!(
+            serialized.contains(own_url),
+            "structured pages did not contain {own_url}: {serialized}"
+        );
+        assert!(
+            !serialized.contains(other_url),
+            "structured pages exposed {other_url}: {serialized}"
+        );
     }
-    let serialized = Value::Array(pages.clone()).to_string();
+
+    let text = text(result);
     assert!(
-        serialized.contains(own_url),
-        "structured pages did not contain {own_url}: {serialized}"
+        text.contains(own_url),
+        "page text did not contain {own_url}: {text}"
     );
     assert!(
-        !serialized.contains(other_url),
-        "structured pages exposed {other_url}: {serialized}"
+        !text.contains(other_url),
+        "page text exposed {other_url}: {text}"
     );
-    (true, text(result))
+    text
 }
 
 fn assert_no_page_ids(text: &str) {
@@ -523,12 +532,8 @@ async fn exercise_shared_broker() {
             json!({"type": "url", "url": "https://example.org/"}),
         ),
     );
-    let (structured_a, navigate_a) = isolated_view(&navigate_a, "example.com", "example.org");
-    let (structured_b, navigate_b) = isolated_view(&navigate_b, "example.org", "example.com");
-    assert!(structured_a || navigate_a.contains("example.com"));
-    assert!(structured_b || navigate_b.contains("example.org"));
-    assert!(!navigate_a.contains("example.org"));
-    assert!(!navigate_b.contains("example.com"));
+    let navigate_a = isolated_view(&navigate_a, "example.com", "example.org");
+    let navigate_b = isolated_view(&navigate_b, "example.org", "example.com");
     assert_no_page_ids(&navigate_a);
     assert_no_page_ids(&navigate_b);
     create_unowned_tab(port).await;
@@ -632,16 +637,8 @@ async fn exercise_shared_broker() {
         call_ok(&client_a, "list_pages", "smoke-a", json!({})),
         call_ok(&client_b, "list_pages", "smoke-b", json!({})),
     );
-    let (structured_a, pages_a) = isolated_view(&pages_a, "Session%20A", "Session%20B");
-    let (structured_b, pages_b) = isolated_view(&pages_b, "Session%20B", "Session%20A");
-    assert_eq!(
-        structured_a, structured_b,
-        "sessions returned inconsistent structured page data"
-    );
-    assert!(structured_a || pages_a.contains("Session%20A"));
-    assert!(!pages_a.contains("Session%20B"));
-    assert!(structured_b || pages_b.contains("Session%20B"));
-    assert!(!pages_b.contains("Session%20A"));
+    let pages_a = isolated_view(&pages_a, "Session%20A", "Session%20B");
+    let pages_b = isolated_view(&pages_b, "Session%20B", "Session%20A");
     assert_no_page_ids(&pages_a);
     assert_no_page_ids(&pages_b);
 
@@ -654,14 +651,8 @@ async fn exercise_shared_broker() {
     .await;
     let extra_a = call_ok(&client_a, "list_pages", "smoke-a", json!({})).await;
     let extra_b = call_ok(&client_b, "list_pages", "smoke-b", json!({})).await;
-    let (extra_a_structured, extra_a_text) = isolated_view(&extra_a, "extra-a", "Session%20B");
-    let (extra_b_structured, extra_b_text) = isolated_view(&extra_b, "Session%20B", "extra-a");
-    assert!(
-        extra_a_structured || extra_a_text.contains("extra-a"),
-        "second page was not created or attributed: {extra_a_text}"
-    );
-    assert!(!extra_b_text.contains("extra-a"));
-    assert!(extra_b_structured || extra_b_text.contains("Session%20B"));
+    let extra_a_text = isolated_view(&extra_a, "extra-a", "Session%20B");
+    let extra_b_text = isolated_view(&extra_b, "Session%20B", "extra-a");
     assert_no_page_ids(&extra_a_text);
     assert_no_page_ids(&extra_b_text);
 
@@ -731,8 +722,7 @@ async fn exercise_shared_broker() {
 
     let reconnected = client(&root, true, &profile, port, "shared-window").await;
     let pages_b = call_ok(&reconnected, "list_pages", "smoke-b", json!({})).await;
-    let (structured_b, pages_b) = isolated_view(&pages_b, "Session%20B", "Session%20A");
-    assert!(structured_b || pages_b.contains("Session%20B"));
+    isolated_view(&pages_b, "Session%20B", "Session%20A");
 
     let compact = client(&root, false, &profile, port, "shared-window").await;
     let help = call_ok(
