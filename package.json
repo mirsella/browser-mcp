@@ -1,6 +1,6 @@
 {
   "name": "@mirsella/opencode-browser-mcp",
-  "version": "0.7.5",
+  "version": "0.7.6",
   "description": "Session-isolated browser automation over MCP and Chrome DevTools Protocol",
   "type": "module",
   "exports": {
