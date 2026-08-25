@@ -26,10 +26,11 @@ them directly with the same workflow.
 
 ## Workflow
 
-1. Navigate, then inspect the page before interacting.
-2. Use the latest snapshot to identify elements and references. Refresh it after navigation or meaningful DOM changes.
-3. Perform the smallest interaction needed, then inspect the result.
-4. Verify consequential actions from visible state or relevant diagnostics.
+1. Reuse the current page by default. Use `navigate_page` to change URLs or reload after code or deployment changes. Use `new_page` only when simultaneous pages are necessary, and close temporary pages when finished.
+2. Navigate, then inspect the page before interacting.
+3. Use the latest snapshot to identify elements and references. Refresh it after navigation or meaningful DOM changes.
+4. Perform the smallest interaction needed, then inspect the result.
+5. Verify consequential actions from visible state or relevant diagnostics.
 
 Use screenshots when visual appearance, responsive layout, rendering, or image output matters. Prefer snapshots for locating elements and understanding page structure.
 
