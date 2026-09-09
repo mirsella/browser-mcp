@@ -42,6 +42,11 @@ const WORKER_START_TIMEOUT: Duration = Duration::from_secs(30);
 const WORKER_HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_SESSION_ID_BYTES: usize = 256;
 const MAX_POOLED_WORKERS: usize = 8;
+const MAX_PAGES_PER_SESSION_DEFAULT: usize = 5;
+const MAX_PAGES_PER_SESSION_HARD_LIMIT: usize = 32;
+const fn default_max_pages_per_session() -> usize {
+    MAX_PAGES_PER_SESSION_DEFAULT
+}
 const MAX_VERSION_RESPONSE_BYTES: usize = 64 * 1024;
 const GRAPHICAL_ENVIRONMENT_TIMEOUT: Duration = Duration::from_secs(2);
 const GRAPHICAL_ENVIRONMENT_KEYS: &[&str] = &[
@@ -195,8 +200,11 @@ struct Config {
     cdp_host: String,
     #[arg(long, env = "OPENCODE_BROWSER_CDP_PORT", default_value_t = 9222)]
     cdp_port: u16,
-    #[arg(long, env = "OPENCODE_BROWSER_IDLE_MINUTES", default_value_t = 60)]
+    #[arg(long, env = "OPENCODE_BROWSER_IDLE_MINUTES", default_value_t = 30)]
     idle_minutes: u64,
+    #[arg(long, env = "OPENCODE_BROWSER_MAX_PAGES", default_value_t = MAX_PAGES_PER_SESSION_DEFAULT)]
+    #[serde(default = "default_max_pages_per_session")]
+    max_pages_per_session: usize,
     #[arg(long, env = "OPENCODE_BROWSER_STARTUP_SECONDS", default_value_t = 20)]
     startup_seconds: u64,
     #[arg(
@@ -1575,6 +1583,7 @@ impl BrowserProxy {
                 background,
                 self.config.session_layout,
                 session.persisted.current_tab.as_deref(),
+                self.config.max_pages_per_session,
             )
             .await?;
         let established = timeout(WORKER_STOP_TIMEOUT, async {
@@ -1948,6 +1957,13 @@ fn validate_config(config: &Config) -> Result<()> {
     if config.idle_minutes == 0 {
         warn!("idle expiration is disabled; cleanup-pending sessions will still be retried");
     }
+    if config.max_pages_per_session == 0
+        || config.max_pages_per_session > MAX_PAGES_PER_SESSION_HARD_LIMIT
+    {
+        bail!(
+            "browser max pages per session must be between 1 and {MAX_PAGES_PER_SESSION_HARD_LIMIT}"
+        );
+    }
     if config.startup_seconds == 0 || config.startup_seconds > 300 {
         bail!("browser startup timeout must be between 1 and 300 seconds");
     }
@@ -1982,6 +1998,33 @@ mod tests {
         cli.config
     }
 
+    #[test]
+    fn session_limits_default_to_five_pages_and_thirty_idle_minutes() {
+        let config = broker_config(&[]);
+        assert_eq!(config.max_pages_per_session, MAX_PAGES_PER_SESSION_DEFAULT);
+        assert_eq!(config.idle_minutes, 30);
+    }
+    #[test]
+    fn max_pages_per_session_is_configurable_and_validated() {
+        let mut config = broker_config(&["--browser-executable=/bin/true"]);
+        assert!(validate_config(&config).is_ok());
+        config.max_pages_per_session = 0;
+        assert!(validate_config(&config).is_err());
+        config.max_pages_per_session = MAX_PAGES_PER_SESSION_HARD_LIMIT + 1;
+        assert!(validate_config(&config).is_err());
+        config.max_pages_per_session = MAX_PAGES_PER_SESSION_DEFAULT;
+        assert!(validate_config(&config).is_ok());
+    }
+    #[test]
+    fn max_pages_per_session_deserializes_without_the_field() {
+        let mut value = serde_json::to_value(broker_config(&[])).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("max_pages_per_session");
+        let config: Config = serde_json::from_value(value).unwrap();
+        assert_eq!(config.max_pages_per_session, MAX_PAGES_PER_SESSION_DEFAULT);
+    }
     #[test]
     fn browser_is_headed_by_default_and_headless_is_configurable() {
         assert!(!broker_config(&[]).headless);

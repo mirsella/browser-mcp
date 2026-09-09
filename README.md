@@ -127,7 +127,8 @@ Optional environment variables inherited from OpenCode:
 | `OPENCODE_BROWSER_HEADLESS` | `false` | Run without a visible window |
 | `OPENCODE_BROWSER_SESSION_LAYOUT` | `shared-window` | `shared-window` or `window-per-session` |
 | `OPENCODE_BROWSER_CDP_PORT` | `9222` | Loopback CDP port |
-| `OPENCODE_BROWSER_IDLE_MINUTES` | `60` | Fallback cleanup for routed sessions |
+| `OPENCODE_BROWSER_IDLE_MINUTES` | `30` | Fallback cleanup for routed sessions |
+| `OPENCODE_BROWSER_MAX_PAGES` | `5` | Max owned tabs per OpenCode session |
 | `OPENCODE_BROWSER_STARTUP_SECONDS` | `20` | Browser startup deadline |
 | `OPENCODE_BROWSER_OPERATION_SECONDS` | `540` | Browser operation deadline |
 | `OPENCODE_BROWSER_DOWNSTREAM_COMMAND` | `bunx` | DevTools MCP launcher |
@@ -141,7 +142,8 @@ Optional environment variables inherited from OpenCode:
 | First browser action | Chromium and the ownership tracker start |
 | OpenCode turn becomes idle | Owned tabs remain available for the next turn |
 | OpenCode session is deleted | Only that session's owned tabs close |
-| Routed session reaches the configured inactivity timeout | Fallback cleanup closes that session's owned tabs; defaults to 60 minutes and `0` disables it |
+| Each session owns at most 5 pages | `new_page` beyond the cap fails; reuse a page with `navigate_page` or free one with `close_page` |
+| Routed session reaches the configured inactivity timeout | Fallback cleanup closes that session's owned tabs; defaults to 30 minutes and `0` disables it |
 | Another OpenCode instance connects | It shares the broker and profile with isolated tab ownership |
 | Final adapter disconnects | The broker waits briefly, closes Chromium, and exits |
 | Broker exits unexpectedly | A later adapter starts a replacement and recovery fails closed unless the exact browser generation matches |

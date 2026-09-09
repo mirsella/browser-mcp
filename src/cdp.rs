@@ -52,6 +52,7 @@ enum OwnershipError {
     UnknownTarget(TargetId),
     OwnerConflict { target: TargetId },
     NotOwner { target: TargetId },
+    TooManyPages { owned: usize, max: usize },
 }
 
 impl std::fmt::Display for OwnershipError {
@@ -70,11 +71,25 @@ impl std::fmt::Display for OwnershipError {
             Self::NotOwner { target } => {
                 write!(formatter, "browser session does not own target {target}")
             }
+            Self::TooManyPages { owned, max } => write!(
+                formatter,
+                "browser session already owns {owned} pages (max {max}); close the current page with close_page or reuse a page with navigate_page instead of new_page"
+            ),
         }
     }
 }
 
 impl std::error::Error for OwnershipError {}
+
+/// Enforces the per-session page cap for newly created tabs. Popup and
+/// recovery claims bypass this: they adopt pre-existing targets rather
+/// than growing the session.
+fn ensure_page_capacity(owned: usize, max: usize) -> Result<()> {
+    if owned >= max {
+        return Err(OwnershipError::TooManyPages { owned, max }.into());
+    }
+    Ok(())
+}
 
 #[derive(Default)]
 struct State {
@@ -255,6 +270,19 @@ impl State {
         }
         self.owners.insert(tab.into(), session.into());
         self.propagate_owners()
+    }
+
+    /// All tabs owned by `session`, in stable order. This is the single
+    /// traversal behind page listing and creation-time capacity checks.
+    fn session_tabs(&self, session: &str) -> Vec<TargetId> {
+        let mut tabs = self
+            .owners
+            .iter()
+            .filter(|(_, owner)| owner.as_str() == session)
+            .map(|(tab, _)| tab.clone())
+            .collect::<Vec<_>>();
+        tabs.sort();
+        tabs
     }
 
     /// Removes one session and all of its descendants, without affecting
@@ -491,16 +519,7 @@ impl TargetTracker {
     }
 
     pub async fn owned_tabs(&self, session: &str) -> Result<Vec<TargetId>> {
-        let mut tabs = self
-            .available()
-            .await?
-            .owners
-            .iter()
-            .filter(|(_, owner)| owner.as_str() == session)
-            .map(|(tab, _)| tab.clone())
-            .collect::<Vec<_>>();
-        tabs.sort();
-        Ok(tabs)
+        Ok(self.available().await?.session_tabs(session))
     }
 
     pub async fn is_live_tab(&self, tab: &str) -> Result<bool> {
@@ -543,21 +562,25 @@ impl TargetTracker {
         background: bool,
         layout: SessionLayout,
         preferred_anchor: Option<&str>,
+        max_pages: usize,
     ) -> Result<TargetId> {
-        let state = self.available().await?;
-        if state.retired_sessions.contains(session) {
-            bail!("browser session {session} is retiring");
-        }
-        drop(state);
+        let owned = {
+            let state = self.available().await?;
+            if state.retired_sessions.contains(session) {
+                bail!("browser session {session} is retiring");
+            }
+            let owned = state.session_tabs(session);
+            ensure_page_capacity(owned.len(), max_pages)?;
+            owned
+        };
         let (_creation, anchor) = match layout {
             SessionLayout::SharedWindow => (None, None),
             SessionLayout::WindowPerSession => {
                 let creation = self.tab_creation.lock().await;
-                let owned = self.owned_tabs(session).await?;
                 let anchor = preferred_anchor
                     .filter(|preferred| owned.iter().any(|tab| tab == preferred))
                     .map(str::to_owned)
-                    .or_else(|| owned.into_iter().next());
+                    .or_else(|| owned.first().cloned());
                 (Some(creation), anchor)
             }
         };
@@ -1271,5 +1294,17 @@ mod tests {
         let error = state.claim_tab("session-a", "late-tab").unwrap_err();
         assert!(error.to_string().contains("retiring"));
         assert!(!state.owners.contains_key("late-tab"));
+    }
+
+    #[test]
+    fn page_capacity_counts_only_the_requesting_session() {
+        let mut state = State::default();
+        state.owners.insert("tab-b".into(), "session-a".into());
+        state.owners.insert("tab-a".into(), "session-a".into());
+        state.owners.insert("tab-c".into(), "session-b".into());
+        assert_eq!(state.session_tabs("session-a"), ["tab-a", "tab-b"]);
+        assert!(ensure_page_capacity(2, 3).is_ok());
+        let error = ensure_page_capacity(2, 2).unwrap_err();
+        assert!(error.to_string().contains("already owns 2 pages (max 2)"));
     }
 }
