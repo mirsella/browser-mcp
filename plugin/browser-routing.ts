@@ -24,21 +24,19 @@ type ConfigWithPolicies = {
 };
 
 type BrowserRoutingOptions = {
+	enabled?: boolean;
 	compactTools?: boolean;
 };
-
-function matchesToolPattern(pattern: string, tool: string): boolean {
-	const expression = pattern
-		.replace(/[.+^${}()|[\]\\]/g, "\\$&")
-		.replaceAll("*", ".*")
-		.replaceAll("?", ".");
-	return new RegExp(`^${expression}$`).test(tool);
-}
 
 function hasPartialBrowserPolicy(value: unknown): boolean {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
 	return Object.keys(value).some((pattern) => {
-		const matches = (tool: string) => matchesToolPattern(pattern, tool);
+		const expression = pattern
+			.replace(/[.+^${}()|[\]\\]/g, "\\$&")
+			.replaceAll("*", ".*")
+			.replaceAll("?", ".");
+		const regex = new RegExp(`^${expression}$`);
+		const matches = (tool: string) => regex.test(tool);
 		return DIRECT_TOOLS.some(matches) && !(matches(DISPATCH_TOOL) && DIRECT_TOOLS.every(matches));
 	});
 }
@@ -53,35 +51,43 @@ function requiresDirectTools(config: ConfigWithPolicies): boolean {
 }
 
 const server: Plugin = async ({ $ }, options) => {
-	const { compactTools = true } = (options ?? {}) as BrowserRoutingOptions;
+	const { enabled = false, compactTools = true } = (options ?? {}) as BrowserRoutingOptions;
+	if (typeof enabled !== "boolean") throw new Error("enabled must be a boolean");
 	if (typeof compactTools !== "boolean") throw new Error("compactTools must be a boolean");
 
 	return {
 		config: async (config) => {
 			const extended = config as typeof config & ConfigWithPolicies;
 			const compact = compactTools && !requiresDirectTools(extended);
-			if (compactTools && !compact) {
-				console.warn(
-					"@mirsella/opencode-browser-mcp disabled compact tools to preserve per-action browser permissions",
-				);
-			}
-			extended.skills ??= {};
-			extended.skills.paths ??= [];
-			if (!extended.skills.paths.includes(SKILLS_PATH)) extended.skills.paths.push(SKILLS_PATH);
 
 			config.mcp ??= {};
 			const existing = config.mcp.browser;
-			if (existing && (existing.type !== "local" || existing.command?.[0] !== MCP_CLI)) {
+			if (
+				existing &&
+				((existing.type !== undefined && existing.type !== "local") ||
+					(existing.command?.[0] !== undefined && existing.command[0] !== MCP_CLI))
+			) {
 				throw new Error(
 					"@mirsella/opencode-browser-mcp cannot replace the existing mcp.browser configuration",
 				);
 			}
+			const requestedEnabled = existing?.enabled ?? enabled;
 			config.mcp.browser = {
 				type: "local",
 				command: compact ? [MCP_CLI] : [MCP_CLI, "--direct-tools"],
-				enabled: true,
+				enabled: requestedEnabled,
 				timeout: 600_000,
 			};
+			if (!requestedEnabled) return;
+			if (compactTools && !compact) {
+				console.warn(
+					"@mirsella/opencode-browser-mcp uses direct tools to preserve per-action browser permissions",
+				);
+			}
+
+			extended.skills ??= {};
+			extended.skills.paths ??= [];
+			if (!extended.skills.paths.includes(SKILLS_PATH)) extended.skills.paths.push(SKILLS_PATH);
 		},
 		"tool.execute.before": async (input, output) => {
 			if (!input.tool.startsWith("browser_")) return;

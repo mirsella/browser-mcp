@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import BrowserPlugin from "@mirsella/opencode-browser-mcp/server";
 
-async function hooks(options?: { compactTools?: boolean }) {
+async function hooks(options?: { enabled?: boolean; compactTools?: boolean }) {
 	const calls: unknown[][] = [];
 	const shell = ((strings: TemplateStringsArray, ...values: unknown[]) => {
 		calls.push([strings, ...values]);
@@ -27,14 +27,19 @@ function expectRouting(
 	expect(arguments_).toEqual(directTools ? ["--direct-tools"] : []);
 }
 
+function browserEnabled(config: { mcp?: { browser?: { enabled?: unknown } } }): unknown {
+	return config.mcp?.browser?.enabled;
+}
+
 describe("BrowserRouting", () => {
 	test("exports the module, registers compact routing, and injects the session ID", async () => {
 		expect(BrowserPlugin.id).toBe("@mirsella/opencode-browser-mcp");
-		const { plugin } = await hooks();
+		const { plugin } = await hooks({ enabled: true });
 		const config = { skills: { paths: ["/existing"] } } as never;
 		await plugin.config?.(config);
 		await plugin.config?.(config);
 		expectRouting(config, false);
+		expect(browserEnabled(config)).toBeTrue();
 		expect(config.skills.paths).toHaveLength(2);
 
 		const output = { args: { action: "navigate_page", arguments: { url: "https://example.com" } } };
@@ -53,6 +58,31 @@ describe("BrowserRouting", () => {
 				{ args: [] },
 			),
 		).rejects.toThrow("invalid arguments");
+	});
+
+	test("is disabled by default and skips the skill", async () => {
+		const { plugin } = await hooks();
+		const config = { skills: { paths: ["/existing"] } } as never;
+		await plugin.config?.(config);
+		expect(browserEnabled(config)).toBeFalse();
+		expectRouting(config, false);
+		expect(config.skills.paths).toHaveLength(1);
+		await expect(
+			hooks({ enabled: "true" } as never),
+		).rejects.toThrow("enabled must be a boolean");
+	});
+
+	test("explicit mcp.browser settings take precedence", async () => {
+		const { plugin } = await hooks({ enabled: true });
+		const disabled = { mcp: { browser: { enabled: false } }, skills: { paths: [] as string[] } } as never;
+		await plugin.config?.(disabled);
+		expect(browserEnabled(disabled)).toBeFalse();
+		expect((disabled as { skills: { paths: string[] } }).skills.paths).toHaveLength(0);
+
+		const optedIn = { mcp: { browser: { enabled: true } } } as never;
+		await plugin.config?.(optedIn);
+		expectRouting(optedIn, false);
+		expect(browserEnabled(optedIn)).toBeTrue();
 	});
 
 	test("uses direct tools for partial browser policies", async () => {

@@ -20,12 +20,14 @@ logins, local storage, cache, and extensions.
 
 ## Setup
 
-Add the plugin to `opencode.json`:
+Add the plugin to `opencode.json`. The browser server is disabled by default,
+so the entry shows up in `opencode mcp list` as disabled and the skill is
+skipped. Opt in with plugin options:
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["@mirsella/opencode-browser-mcp"]
+  "plugin": [["@mirsella/opencode-browser-mcp", { "enabled": true }]]
 }
 ```
 
@@ -41,11 +43,11 @@ then closes the browser and exits shortly after the final adapter disconnects.
 
 The plugin:
 
-- registers the packaged browser MCP adapter;
+- registers the packaged browser MCP adapter (disabled unless opted in);
 - injects the active OpenCode session ID after model argument generation;
 - exposes compact browser tools unless existing permissions require direct tools;
 - releases owned tabs when an OpenCode session is deleted;
-- registers the bundled browser automation skill.
+- registers the bundled browser automation skill when the server is enabled.
 
 OpenCode sees two compact tools by default:
 
@@ -53,14 +55,21 @@ OpenCode sees two compact tools by default:
 - `browser_help` lists actions or loads one action schema.
 
 If the plugin detects per-action `browser_*` permission or tool rules, it uses
-direct tools so those policies continue to work. Compact mode can also be
-disabled explicitly:
+direct tools so those policies continue to work.
+
+Settings:
+
+- `enabled` (default `false`): start the server and load the skill. An
+  explicit `mcp.browser` entry with `"enabled": true` also opts in, without
+  plugin options.
+- `compactTools` (default `true`): keep `browser_dispatch` and `browser_help`
+  instead of the direct tools. Set it to `false` to always use direct tools:
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
-    ["@mirsella/opencode-browser-mcp", { "compactTools": false }]
+    ["@mirsella/opencode-browser-mcp", { "enabled": true, "compactTools": false }]
   ]
 }
 ```
