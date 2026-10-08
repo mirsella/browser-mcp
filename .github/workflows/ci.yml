@@ -30,7 +30,7 @@ jobs:
       - name: Test real browser routing
         env:
           OPENCODE_BROWSER_EXECUTABLE: /usr/bin/google-chrome
-        run: xvfb-run -a cargo test --release --test e2e -- --ignored --nocapture
+        run: xvfb-run -a cargo test --release --test e2e -- --ignored --nocapture --test-threads=1
       - name: Check package versions
         run: test "$(node -p 'require("./package.json").version')" = "$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
       - run: cargo build --release --target x86_64-unknown-linux-musl

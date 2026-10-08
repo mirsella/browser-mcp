@@ -138,7 +138,6 @@ const server: Plugin = async ({ $, client, directory }, options) => {
 				throw new Error("browser tool call has invalid arguments");
 			}
 			(output.args as Record<string, unknown>)[SESSION_KEY] = input.sessionID;
-			await recover();
 		},
 		"chat.message": async () => {
 			await recover();

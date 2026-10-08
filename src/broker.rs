@@ -20,9 +20,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use rmcp::{
     RoleClient, ServerHandler, ServiceExt,
     model::{
-        CallToolRequest, CallToolRequestParams, CallToolResponse, CallToolResult, ClientRequest,
-        ContentBlock, Implementation, ListToolsRequest, ListToolsResult, PaginatedRequestParams,
-        PingRequest, ServerCapabilities, ServerInfo, ServerResult, Tool, ToolAnnotations,
+        CallToolRequest, CallToolRequestParams, CallToolResponse, CallToolResult,
+        CancelledNotificationParam, ClientRequest, ContentBlock, Implementation, ListToolsRequest,
+        ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, ServerResult,
+        Tool, ToolAnnotations,
     },
     service::{PeerRequestOptions, RequestContext, RunningService, ServiceError},
 };
@@ -194,17 +195,7 @@ impl Adapter {
     async fn connection(&self) -> Result<Arc<BrokerClient>> {
         let mut current = self.broker.lock().await;
         if let Some(client) = current.as_ref() {
-            let healthy = !client.is_closed()
-                && !client.is_transport_closed()
-                && matches!(
-                    timeout(
-                        super::WORKER_HEALTH_TIMEOUT,
-                        client.send_request(ClientRequest::PingRequest(PingRequest::default()))
-                    )
-                    .await,
-                    Ok(Ok(ServerResult::EmptyResult(_)))
-                );
-            if healthy {
+            if !client.is_closed() && !client.is_transport_closed() {
                 return Ok(client.clone());
             }
             warn!("browser broker connection lost; reconnecting the adapter");
@@ -236,21 +227,24 @@ impl Adapter {
                 None,
             ));
         }
-        let mut handle = client
-            .send_cancellable_request(request, PeerRequestOptions::no_options())
+        let request_timeout = Duration::from_secs(self.config.operation_seconds)
+            + BROKER_START_TIMEOUT
+            + super::WORKER_START_TIMEOUT;
+        let handle = client
+            .send_cancellable_request(request, PeerRequestOptions::with_timeout(request_timeout))
             .await
             .map_err(adapter_request_error)?;
+        let request_id = handle.id.clone();
         // A dispatched operation may already have taken effect. Never replay it
         // after a disconnect; the next request reconnects and reconciles ownership.
         let result = tokio::select! {
-            result = &mut handle.rx => result.unwrap_or(Err(ServiceError::TransportClosed)),
+            result = handle.await_response() => result,
             _ = context.ct.cancelled() => {
-                let _ = handle.cancel(Some("upstream request cancelled".into())).await;
+                let _ = client.notify_cancelled(CancelledNotificationParam::new(
+                    Some(request_id),
+                    Some("upstream request cancelled".into()),
+                )).await;
                 Err(ServiceError::Cancelled { reason: Some("upstream request cancelled".into()) })
-            }
-            _ = sleep(Duration::from_secs(self.config.operation_seconds) + BROKER_START_TIMEOUT + super::WORKER_START_TIMEOUT) => {
-                let _ = handle.cancel(Some("adapter request timed out".into())).await;
-                Err(ServiceError::Timeout { timeout: Duration::from_secs(self.config.operation_seconds) })
             }
         };
         result.map_err(adapter_request_error)
@@ -1435,6 +1429,68 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+
+    #[tokio::test]
+    async fn adapter_cancellation_reaches_the_broker_request() {
+        struct PendingBroker(tokio::sync::mpsc::UnboundedSender<RequestContext<rmcp::RoleServer>>);
+        impl ServerHandler for PendingBroker {
+            fn get_info(&self) -> ServerInfo {
+                browser_server_info()
+            }
+
+            async fn call_tool(
+                &self,
+                _request: CallToolRequestParams,
+                context: RequestContext<rmcp::RoleServer>,
+            ) -> Result<CallToolResponse, rmcp::ErrorData> {
+                let cancellation = context.ct.clone();
+                self.0.send(context).unwrap();
+                cancellation.cancelled().await;
+                Ok(CallToolResult::error(vec![ContentBlock::text("cancelled")]).into())
+            }
+        }
+
+        let (started, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let (server_io, client_io) = tokio::io::duplex(4096);
+        let (broker, client) =
+            tokio::join!(PendingBroker(started).serve(server_io), ().serve(client_io));
+        let broker = broker.unwrap();
+        let adapter = Adapter {
+            paths: RuntimePaths {
+                socket: PathBuf::new(),
+                lock: PathBuf::new(),
+            },
+            direct_tools: false,
+            config: Cli::try_parse_from(["opencode-browser-mcp", "--headless=true"])
+                .unwrap()
+                .config,
+            broker: Mutex::new(Some(Arc::new(client.unwrap()))),
+        };
+        let (server_io, client_io) = tokio::io::duplex(4096);
+        let (adapter, client) = tokio::join!(adapter.serve(server_io), ().serve(client_io));
+        let adapter = adapter.unwrap();
+        let client = client.unwrap();
+        let request = client
+            .send_cancellable_request(
+                ClientRequest::CallToolRequest(CallToolRequest::new(CallToolRequestParams::new(
+                    "pending",
+                ))),
+                PeerRequestOptions::no_options(),
+            )
+            .await
+            .unwrap();
+        let dispatched = timeout(Duration::from_secs(1), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        request.cancel(Some("caller stopped".into())).await.unwrap();
+        timeout(Duration::from_secs(1), dispatched.ct.cancelled())
+            .await
+            .expect("broker did not receive cancellation");
+        client.cancel().await.unwrap();
+        adapter.cancel().await.unwrap();
+        broker.cancel().await.unwrap();
+    }
 
     #[test]
     fn opencode_connections_require_and_remove_the_session_id() {

@@ -619,6 +619,17 @@ struct Session {
     downstream: Option<Downstream>,
 }
 
+impl Session {
+    async fn stop_worker(&mut self, id: &str) {
+        self.pages.local_to_tab.clear();
+        if let Some(worker) = self.downstream.take()
+            && let Err(error) = stop_worker(worker).await
+        {
+            warn!(%error, session_id = %id, "failed to stop Chrome DevTools MCP worker");
+        }
+    }
+}
+
 #[derive(Default)]
 struct PageState {
     local_to_tab: HashMap<u64, TargetId>,
@@ -825,17 +836,7 @@ impl CatalogLoader {
                 })
                 .clone()
         };
-        let result = future.clone().await;
-        if result.is_err() {
-            let mut current = self.future.lock().await;
-            if current
-                .as_ref()
-                .is_some_and(|current| current.ptr_eq(&future))
-            {
-                *current = None;
-            }
-        }
-        result.map_err(|error| anyhow!(error.to_string()))
+        future.await.map_err(|error| anyhow!(error.to_string()))
     }
 
     fn cancel(&self) {
@@ -872,44 +873,46 @@ async fn discover_catalog(
         _ = cancelled(&mut cancel) => bail!("Chrome DevTools tool catalog initialization stopped"),
         result = spawn_downstream(config, &workspace) => result?,
     };
-    let listed = tokio::select! {
-        biased;
-        _ = cancelled(&mut cancel) => {
-            stop_worker(worker).await?;
-            bail!("Chrome DevTools tool catalog initialization stopped");
-        },
-        result = timeout(WORKER_START_TIMEOUT, worker.list_all_tools()) => result
-            .map_err(|_| anyhow!("timed out retrieving Chrome DevTools tools"))
-            .and_then(|result| result.context("failed to retrieve Chrome DevTools tools")),
-    };
-    let listed = match listed {
-        Ok(listed) => listed,
+    let catalog = async {
+        let listed = tokio::select! {
+            biased;
+            _ = cancelled(&mut cancel) => bail!("Chrome DevTools tool catalog initialization stopped"),
+            result = timeout(WORKER_START_TIMEOUT, worker.list_all_tools()) => result
+                .context("timed out retrieving Chrome DevTools tools")?
+                .context("failed to retrieve Chrome DevTools tools")?,
+        };
+        let mut page_scoped = HashSet::new();
+        let mut has_get_tab_id = false;
+        let mut tools = Vec::with_capacity(listed.len());
+        for mut tool in listed {
+            if tool.name == "select_page" || tool.name == "get_tab_id" {
+                has_get_tab_id |= tool.name == "get_tab_id";
+                continue;
+            }
+            let mut schema = (*tool.input_schema).clone();
+            if remove_schema_property(&mut schema, "pageId") {
+                page_scoped.insert(tool.name.to_string());
+            }
+            tool.input_schema = Arc::new(schema);
+            tools.push(tool);
+        }
+        if !has_get_tab_id {
+            bail!("Chrome DevTools MCP does not provide required get_tab_id capability");
+        }
+        Ok(ToolCatalog { tools, page_scoped })
+    }.await;
+    match catalog {
+        Ok(catalog) => {
+            recycle_worker(worker_pool, workspace, worker).await;
+            Ok(catalog)
+        }
         Err(error) => {
-            stop_worker(worker).await?;
-            return Err(error);
+            if let Err(stop_error) = stop_worker(worker).await {
+                warn!(%stop_error, "failed to stop Chrome DevTools worker after catalog initialization failed");
+            }
+            Err(error)
         }
-    };
-    let mut page_scoped = HashSet::new();
-    let mut has_get_tab_id = false;
-    let mut tools = Vec::with_capacity(listed.len());
-    for mut tool in listed {
-        if tool.name == "select_page" || tool.name == "get_tab_id" {
-            has_get_tab_id |= tool.name == "get_tab_id";
-            continue;
-        }
-        let mut schema = (*tool.input_schema).clone();
-        if remove_schema_property(&mut schema, "pageId") {
-            page_scoped.insert(tool.name.to_string());
-        }
-        tool.input_schema = Arc::new(schema);
-        tools.push(tool);
     }
-    if !has_get_tab_id {
-        stop_worker(worker).await?;
-        bail!("Chrome DevTools MCP does not provide required get_tab_id capability");
-    }
-    recycle_worker(worker_pool, workspace, worker).await;
-    Ok(ToolCatalog { tools, page_scoped })
 }
 
 #[derive(Clone)]
@@ -1068,9 +1071,9 @@ impl BrowserProxy {
             .map(|(id, slot)| (id.clone(), slot.clone()))
             .collect::<Vec<_>>();
         for (id, slot) in slots {
-            if let Some(session) = slot.session.lock().await.take() {
+            if let Some(mut session) = slot.session.lock().await.take() {
                 // Targets belong to the previous endpoint, so never close them here.
-                self.stop_session(&id, session).await;
+                session.stop_worker(&id).await;
             }
         }
         self.stop_pooled_workers().await;
@@ -1142,78 +1145,56 @@ impl BrowserProxy {
         }
         if guard.is_none() {
             tracker.activate_session(id).await?;
-            let started = self.acquire_worker(workspace).await;
-            match started {
-                Ok(downstream) => {
-                    let mut session = Session {
-                        persisted: PersistedSession {
-                            workspace: workspace.to_path_buf(),
-                            current_tab: None,
-                            last_activity_unix_seconds: unix_time_seconds()?,
-                            cleanup_pending: false,
-                        },
-                        pages: PageState::default(),
-                        downstream: Some(downstream),
-                    };
-                    if slot.cleanup_requested() {
-                        session.persisted.cleanup_pending = true;
-                    }
-                    *guard = Some(session);
-                    if let Err(error) =
-                        self.persist_session(id, guard.as_ref().expect("session exists"))
-                    {
-                        let session = guard.take().expect("session exists");
-                        self.stop_session(id, session).await;
-                        drop(guard);
-                        self.prune_slot(id, &slot).await;
-                        return Err(error);
-                    }
-                }
+            let downstream = match self.acquire_worker(workspace).await {
+                Ok(downstream) => downstream,
                 Err(error) => {
                     drop(guard);
                     self.prune_slot(id, &slot).await;
                     return Err(error);
                 }
+            };
+            let mut session = Session {
+                persisted: PersistedSession {
+                    workspace: workspace.to_path_buf(),
+                    current_tab: None,
+                    last_activity_unix_seconds: unix_time_seconds()?,
+                    cleanup_pending: slot.cleanup_requested(),
+                },
+                pages: PageState::default(),
+                downstream: Some(downstream),
+            };
+            if let Err(error) = self.persist_session(id, &session) {
+                session.stop_worker(id).await;
+                drop(guard);
+                self.prune_slot(id, &slot).await;
+                return Err(error);
             }
-        }
-        if guard
-            .as_ref()
-            .is_some_and(|session| session.persisted.workspace != workspace)
-        {
-            error!(session_id = %id, existing_workspace = %guard.as_ref().expect("session checked").persisted.workspace.display(), requested_workspace = %workspace.display(), "browser session identifier was reused from a different workspace");
-            bail!("browser session identifier is already bound to a different workspace");
-        }
-        if guard
-            .as_ref()
-            .is_some_and(|session| session.persisted.cleanup_pending)
-        {
-            bail!("browser session is pending owned-tab cleanup");
+            *guard = Some(session);
         }
         let session = guard.as_mut().expect("session exists");
+        if session.persisted.workspace != workspace {
+            error!(session_id = %id, existing_workspace = %session.persisted.workspace.display(), requested_workspace = %workspace.display(), "browser session identifier was reused from a different workspace");
+            bail!("browser session identifier is already bound to a different workspace");
+        }
+        if session.persisted.cleanup_pending {
+            bail!("browser session is pending owned-tab cleanup");
+        }
         if let Some(worker) = session.downstream.as_ref()
-            && !worker_is_healthy(worker).await
+            && (worker.is_closed() || worker.is_transport_closed())
         {
             warn!(session_id = %id, "restarting unhealthy Chrome DevTools worker; retaining owned tabs");
-            self.reset_worker(id, session).await;
+            session.stop_worker(id).await;
         }
         if session.downstream.is_none() {
             session.downstream = Some(self.acquire_worker(workspace).await?);
         }
         let closes_page = request.name == "close_page";
         let mut result = self
-            .call_session(
-                catalog,
-                tracker,
-                id,
-                guard.as_mut().expect("session was just started"),
-                request,
-            )
+            .call_session(catalog, tracker, id, session, request)
             .await;
-        if let Some(session) = guard.as_mut() {
-            session.persisted.last_activity_unix_seconds = unix_time_seconds()?;
-            if let Err(error) = self.persist_session(id, session) {
-                result = Err(error);
-            }
+        session.persisted.last_activity_unix_seconds = unix_time_seconds()?;
+        if let Err(error) = self.persist_session(id, session) {
+            result = Err(error);
         }
         if closes_page
             && result
@@ -1249,7 +1230,7 @@ impl BrowserProxy {
             && let Some(session) = guard.as_mut()
         {
             warn!(session_id = %id, "browser call failed; resetting worker without replaying the call or closing owned tabs");
-            self.reset_worker(id, session).await;
+            session.stop_worker(id).await;
         }
         drop(guard);
         self.prune_slot(id, &slot).await;
@@ -1326,39 +1307,22 @@ impl BrowserProxy {
             .as_mut()
             .ok_or_else(|| anyhow!("browser session disappeared during retirement"))?;
         self.mark_cleanup_pending(id, session)?;
-        session.pages = PageState::default();
+        session.pages.local_to_tab.clear();
         let closed = self.close_owned_pages(id, tracker).await;
-        if let Some(worker) = session.downstream.take() {
-            if reuse_worker {
+        if reuse_worker {
+            if let Some(worker) = session.downstream.take() {
                 recycle_worker(
                     &self.worker_pool,
                     session.persisted.workspace.clone(),
                     worker,
                 )
                 .await;
-            } else if let Err(error) = stop_worker(worker).await {
-                warn!(%error, session_id = %id, "failed to stop retiring Chrome DevTools MCP worker");
             }
+        } else {
+            session.stop_worker(id).await;
         }
         closed?;
         self.finalize_session(id, tracker, slot, false).await
-    }
-
-    async fn stop_session(&self, id: &str, session: Session) {
-        if let Some(worker) = session.downstream
-            && let Err(error) = stop_worker(worker).await
-        {
-            warn!(%error, session_id = %id, "failed to stop retired Chrome DevTools MCP worker");
-        }
-    }
-
-    async fn reset_worker(&self, id: &str, session: &mut Session) {
-        session.pages = PageState::default();
-        if let Some(worker) = session.downstream.take()
-            && let Err(error) = stop_worker(worker).await
-        {
-            warn!(%error, session_id = %id, "failed to stop failed Chrome DevTools MCP worker");
-        }
     }
 
     async fn finalize_session(
@@ -1370,7 +1334,7 @@ impl BrowserProxy {
     ) -> Result<()> {
         tracker.finalize_session(id).await?;
         let persisted = self.persistence.remove_session_if_unowned(id);
-        let session = slot
+        let mut session = slot
             .take()
             .ok_or_else(|| anyhow!("browser session disappeared during finalization"))?;
         if reuse_worker {
@@ -1378,7 +1342,7 @@ impl BrowserProxy {
                 recycle_worker(&self.worker_pool, session.persisted.workspace, worker).await;
             }
         } else {
-            self.stop_session(id, session).await;
+            session.stop_worker(id).await;
         }
         persisted.context("failed to remove persisted browser session")
     }
@@ -1495,8 +1459,25 @@ impl BrowserProxy {
         id: &str,
         session: &mut Session,
     ) -> Result<()> {
-        self.reconcile_with_current(tracker, id, session, None)
+        match self
+            .reconcile_with_current(tracker, id, session, None)
             .await
+        {
+            Err(error)
+                if session
+                    .downstream
+                    .as_ref()
+                    .is_some_and(|worker| worker.is_closed() || worker.is_transport_closed()) =>
+            {
+                // Only repeat read-only reconciliation, never the caller's action.
+                warn!(%error, session_id = %id, "worker exited during page reconciliation; replacing it and retaining owned tabs");
+                session.stop_worker(id).await;
+                session.downstream = Some(self.acquire_worker(&session.persisted.workspace).await?);
+                self.reconcile_with_current(tracker, id, session, None)
+                    .await
+            }
+            result => result,
+        }
     }
     /// Current-page policy is deterministic: an explicitly created target
     /// wins, then the prior live target, then the downstream selected owned
@@ -1517,7 +1498,8 @@ impl BrowserProxy {
             return Ok(());
         }
         let (pages, selected) = self.list_snapshot(session).await?;
-        let mut mappings = HashMap::new();
+        let mut mappings = std::mem::take(&mut session.pages.local_to_tab);
+        mappings.clear();
         for page in pages {
             let Some(tab) = self.tab_id(session, page).await? else {
                 continue;
@@ -1783,7 +1765,7 @@ impl BrowserProxy {
         futures_util::future::join_all(
             sessions
                 .into_iter()
-                .map(|(id, session)| async move { self.stop_session(&id, session).await }),
+                .map(|(id, mut session)| async move { session.stop_worker(&id).await }),
         )
         .await;
         self.stop_pooled_workers().await;

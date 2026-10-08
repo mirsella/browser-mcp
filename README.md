@@ -188,7 +188,7 @@ cargo fmt --check
 cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 bun test tests/plugin.test.ts
-cargo test --release --test e2e -- --ignored --nocapture
+cargo test --release --test e2e -- --ignored --nocapture --test-threads=1
 ```
 
 The headed E2E starts adapters against temporary profiles, sockets, and CDP

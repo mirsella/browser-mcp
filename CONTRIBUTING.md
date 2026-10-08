@@ -27,8 +27,11 @@ Run the real-browser test for changes to routing, ownership, browser startup,
 cleanup, persistence, profile locking, or process shutdown:
 
 ```sh
-cargo test --release --test e2e -- --ignored --nocapture
+cargo test --release --test e2e -- --ignored --nocapture --test-threads=1
 ```
+
+The real-browser cases share Bunx's installation cache and run serially. Adapter
+and tool-call concurrency is exercised within each case.
 
 The E2E test starts adapters with temporary profiles, private sockets, and CDP
 ports. It verifies automatic race-safe broker startup, shared cookies, tab
