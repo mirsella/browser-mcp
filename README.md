@@ -155,7 +155,14 @@ Optional environment variables inherited from OpenCode:
 | Routed session reaches the configured inactivity timeout | Fallback cleanup closes that session's owned tabs; defaults to 30 minutes and `0` disables it |
 | Another OpenCode instance connects | It shares the broker and profile with isolated tab ownership |
 | Final adapter disconnects | The broker waits briefly, closes Chromium, and exits |
-| Broker exits unexpectedly | A later adapter starts a replacement and recovery fails closed unless the exact browser generation matches |
+| Browser exits, segfaults, or is killed | The next browser action starts Chromium again; ownership from the old browser generation is discarded |
+| DevTools worker exits or loses its transport | The next call replaces the worker and restores routing to surviving owned tabs |
+| Broker exits unexpectedly | Connected adapters stay available and start one replacement on the next call; surviving tabs are restored only when the exact browser generation matches |
+| MCP adapter exits unexpectedly | The OpenCode plugin reconnects it automatically, with retries up to 30 seconds apart |
+
+Calls interrupted after dispatch can have taken effect. They return an error and
+are never replayed automatically. Inspect the browser state before retrying an
+action. Explicitly disabled or disconnected MCP entries stay disabled.
 
 ## Troubleshooting
 

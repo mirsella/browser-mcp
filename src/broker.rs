@@ -18,20 +18,20 @@ use super::{
 };
 use anyhow::{Context, Result, anyhow, bail};
 use rmcp::{
-    ServerHandler, ServiceExt,
+    RoleClient, ServerHandler, ServiceExt,
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-        ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
-        ToolAnnotations,
+        CallToolRequest, CallToolRequestParams, CallToolResponse, CallToolResult, ClientRequest,
+        ContentBlock, Implementation, ListToolsRequest, ListToolsResult, PaginatedRequestParams,
+        PingRequest, ServerCapabilities, ServerInfo, ServerResult, Tool, ToolAnnotations,
     },
-    service::RequestContext,
+    service::{PeerRequestOptions, RequestContext, RunningService, ServiceError},
 };
 use semver::Version;
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, copy},
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
-    sync::{Notify, watch},
+    sync::{Mutex, Notify, watch},
     task::JoinSet,
     time::{Instant, interval, sleep, timeout},
 };
@@ -163,34 +163,187 @@ fn validate_private_directory(directory: &Path) -> Result<()> {
 }
 
 async fn bridge(paths: RuntimePaths, direct_tools: bool, config: Config) -> Result<()> {
+    let adapter = Adapter {
+        paths,
+        direct_tools,
+        config,
+        broker: Mutex::new(None),
+    };
+    // Validate configuration before publishing the stdio MCP server, as before.
+    adapter.connection().await?;
+    adapter
+        .serve(rmcp::transport::stdio())
+        .await
+        .context("failed to initialize browser MCP adapter")?
+        .waiting()
+        .await
+        .context("browser MCP adapter failed")?;
+    Ok(())
+}
+
+type BrokerClient = RunningService<RoleClient, ()>;
+
+struct Adapter {
+    paths: RuntimePaths,
+    direct_tools: bool,
+    config: Config,
+    broker: Mutex<Option<Arc<BrokerClient>>>,
+}
+
+impl Adapter {
+    async fn connection(&self) -> Result<Arc<BrokerClient>> {
+        let mut current = self.broker.lock().await;
+        if let Some(client) = current.as_ref() {
+            let healthy = !client.is_closed()
+                && !client.is_transport_closed()
+                && matches!(
+                    timeout(
+                        super::WORKER_HEALTH_TIMEOUT,
+                        client.send_request(ClientRequest::PingRequest(PingRequest::default()))
+                    )
+                    .await,
+                    Ok(Ok(ServerResult::EmptyResult(_)))
+                );
+            if healthy {
+                return Ok(client.clone());
+            }
+            warn!("browser broker connection lost; reconnecting the adapter");
+            client.cancellation_token().cancel();
+            *current = None;
+        }
+        let stream = connect_current_broker(&self.paths, self.direct_tools, &self.config).await?;
+        let client = Arc::new(
+            timeout(HANDSHAKE_TIMEOUT, ().serve(stream))
+                .await
+                .context("timed out initializing broker MCP connection")?
+                .context("failed to initialize broker MCP connection")?,
+        );
+        *current = Some(client.clone());
+        Ok(client)
+    }
+
+    async fn forward(
+        &self,
+        request: ClientRequest,
+        context: RequestContext<rmcp::RoleServer>,
+    ) -> Result<ServerResult, rmcp::ErrorData> {
+        let client = self.connection().await.map_err(|error| {
+            rmcp::ErrorData::internal_error(format!("browser broker unavailable: {error}"), None)
+        })?;
+        if context.ct.is_cancelled() {
+            return Err(rmcp::ErrorData::internal_error(
+                "browser request cancelled before dispatch",
+                None,
+            ));
+        }
+        let mut handle = client
+            .send_cancellable_request(request, PeerRequestOptions::no_options())
+            .await
+            .map_err(adapter_request_error)?;
+        // A dispatched operation may already have taken effect. Never replay it
+        // after a disconnect; the next request reconnects and reconciles ownership.
+        let result = tokio::select! {
+            result = &mut handle.rx => result.unwrap_or(Err(ServiceError::TransportClosed)),
+            _ = context.ct.cancelled() => {
+                let _ = handle.cancel(Some("upstream request cancelled".into())).await;
+                Err(ServiceError::Cancelled { reason: Some("upstream request cancelled".into()) })
+            }
+            _ = sleep(Duration::from_secs(self.config.operation_seconds) + BROKER_START_TIMEOUT + super::WORKER_START_TIMEOUT) => {
+                let _ = handle.cancel(Some("adapter request timed out".into())).await;
+                Err(ServiceError::Timeout { timeout: Duration::from_secs(self.config.operation_seconds) })
+            }
+        };
+        result.map_err(adapter_request_error)
+    }
+}
+
+fn adapter_request_error(error: ServiceError) -> rmcp::ErrorData {
+    match error {
+        ServiceError::McpError(error) => error,
+        error => {
+            warn!(%error, "browser broker request interrupted; request was not replayed");
+            rmcp::ErrorData::internal_error(
+                format!(
+                    "Browser broker request interrupted: {error}. The action may have taken effect; inspect browser state before retrying. Subsequent calls reconnect automatically."
+                ),
+                None,
+            )
+        }
+    }
+}
+
+impl ServerHandler for Adapter {
+    fn get_info(&self) -> ServerInfo {
+        browser_server_info()
+    }
+
+    async fn list_tools(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        context: RequestContext<rmcp::RoleServer>,
+    ) -> Result<ListToolsResult, rmcp::ErrorData> {
+        match self
+            .forward(
+                ClientRequest::ListToolsRequest(ListToolsRequest {
+                    method: Default::default(),
+                    params: request,
+                    extensions: Default::default(),
+                }),
+                context,
+            )
+            .await?
+        {
+            ServerResult::ListToolsResult(result) => Ok(result),
+            _ => Err(rmcp::ErrorData::internal_error(
+                "unexpected broker tool list",
+                None,
+            )),
+        }
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResponse, rmcp::ErrorData> {
+        match self
+            .forward(
+                ClientRequest::CallToolRequest(CallToolRequest::new(request)),
+                context,
+            )
+            .await
+        {
+            Ok(ServerResult::CallToolResult(result)) => Ok(result.into()),
+            Ok(_) => Err(rmcp::ErrorData::internal_error(
+                "unexpected broker tool response",
+                None,
+            )),
+            Err(error) => Ok(CallToolResult::error(vec![ContentBlock::text(error.message)]).into()),
+        }
+    }
+}
+
+async fn connect_current_broker(
+    paths: &RuntimePaths,
+    direct_tools: bool,
+    config: &Config,
+) -> Result<UnixStream> {
     let deadline = Instant::now() + BROKER_START_TIMEOUT;
     loop {
         if Instant::now() >= deadline {
             bail!("managed browser broker did not become current within {BROKER_START_TIMEOUT:?}");
         }
-        let mut stream = connect_or_start(&paths, &config, deadline).await?;
+        let mut stream = connect_or_start(paths, config, deadline).await?;
         validate_broker_peer(&stream)?;
         let peer = broker_peer(&stream);
-        match client_handshake(&mut stream, direct_tools, &config, Some(&PACKAGE_VERSION)).await? {
-            ConnectResponse::Accepted => {
-                let mut stdin = tokio::io::stdin();
-                let mut stdout = tokio::io::stdout();
-                let (mut socket_read, mut socket_write) = stream.into_split();
-                let input = tokio::spawn(async move { copy(&mut stdin, &mut socket_write).await });
-                copy(&mut socket_read, &mut stdout)
-                    .await
-                    .context("stdio bridge failed")?;
-                stdout.flush().await.context("failed to flush stdio")?;
-                // Once the broker closes its half, retaining stdin would keep the adapter alive forever.
-                input.abort();
-                return Ok(());
-            }
+        match client_handshake(&mut stream, direct_tools, config, Some(&PACKAGE_VERSION)).await? {
+            ConnectResponse::Accepted => return Ok(stream),
             ConnectResponse::Restarting => {
                 info!(adapter_version = %*PACKAGE_VERSION, "browser broker restarting for upgrade");
             }
             ConnectResponse::Legacy => {
                 let observed = peer?;
-                if replace_compatible_legacy(&paths, &config, &observed).await? {
+                if replace_compatible_legacy(paths, config, &observed).await? {
                     info!(pid = observed.pid, adapter_version = %*PACKAGE_VERSION, "replacing legacy browser broker");
                 }
             }
@@ -846,12 +999,7 @@ fn compact_help(request: CallToolRequestParams, tools: &[Tool]) -> Result<CallTo
 
 impl ServerHandler for Connection {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::from_build_env())
-            .with_instructions(
-                "Controls a shared Chromium-family browser with connection-isolated pages."
-                    .to_owned(),
-            )
+        browser_server_info()
     }
     async fn list_tools(
         &self,
@@ -915,6 +1063,14 @@ impl ServerHandler for Connection {
             }
         }
     }
+}
+
+fn browser_server_info() -> ServerInfo {
+    ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        .with_server_info(Implementation::from_build_env())
+        .with_instructions(
+            "Controls a shared Chromium-family browser with connection-isolated pages.".to_owned(),
+        )
 }
 
 async fn serve_connection(

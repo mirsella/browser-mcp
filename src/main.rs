@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
-        Arc, OnceLock,
+        Arc,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -325,11 +325,11 @@ struct SupervisorState {
 impl SupervisorState {
     fn reap_exited_process(&mut self) -> Result<()> {
         if let Some(child) = self.process.as_mut()
-            && child
+            && let Some(status) = child
                 .try_wait()
                 .context("failed to inspect browser process")?
-                .is_some()
         {
+            warn!(%status, "browser process exited; the next browser action will restart it");
             self.process = None;
         }
         Ok(())
@@ -748,6 +748,19 @@ async fn stop_worker(worker: Downstream) -> Result<()> {
     Ok(())
 }
 
+async fn worker_is_healthy(worker: &Downstream) -> bool {
+    !worker.is_closed()
+        && !worker.is_transport_closed()
+        && matches!(
+            timeout(
+                WORKER_HEALTH_TIMEOUT,
+                worker.send_request(ClientRequest::PingRequest(PingRequest::default()))
+            )
+            .await,
+            Ok(Ok(ServerResult::EmptyResult(_)))
+        )
+}
+
 async fn recycle_worker(pool: &WorkerPool, workspace: PathBuf, worker: Downstream) {
     if worker.is_closed() {
         return;
@@ -773,36 +786,56 @@ type CatalogFuture = Shared<BoxFuture<'static, CatalogResult>>;
 struct CatalogLoader {
     config: Arc<Config>,
     worker_pool: WorkerPool,
-    future: OnceLock<CatalogFuture>,
+    future: Mutex<Option<CatalogFuture>>,
     cancel: watch::Sender<bool>,
 }
 
 impl CatalogLoader {
     async fn get(&self, workspace: &Path) -> Result<Arc<ToolCatalog>> {
-        let future = self
-            .future
-            .get_or_init(|| {
-                let config = self.config.clone();
-                let worker_pool = self.worker_pool.clone();
-                let cancel = self.cancel.subscribe();
-                let workspace = workspace.to_path_buf();
-                let future = async move {
-                    let result = discover_catalog(&config, &worker_pool, workspace, cancel).await;
-                    if let Err(error) = &result {
-                        warn!(%error, "Chrome DevTools tool catalog initialization failed");
+        let future = {
+            let mut current = self.future.lock().await;
+            if current
+                .as_ref()
+                .and_then(CatalogFuture::peek)
+                .is_some_and(|result| result.is_err())
+            {
+                *current = None;
+            }
+            current
+                .get_or_insert_with(|| {
+                    let config = self.config.clone();
+                    let worker_pool = self.worker_pool.clone();
+                    let cancel = self.cancel.subscribe();
+                    let workspace = workspace.to_path_buf();
+                    let future = async move {
+                        let result =
+                            discover_catalog(&config, &worker_pool, workspace, cancel).await;
+                        if let Err(error) = &result {
+                            warn!(%error, "Chrome DevTools tool catalog initialization failed");
+                        }
+                        result
+                            .map(Arc::new)
+                            .map_err(|error| Arc::from(error.to_string()))
                     }
-                    result
-                        .map(Arc::new)
-                        .map_err(|error| Arc::from(error.to_string()))
-                }
-                .boxed()
-                .shared();
-                let background = future.clone();
-                tokio::spawn(async move { drop(background.await) });
-                future
-            })
-            .clone();
-        future.await.map_err(|error| anyhow!(error.to_string()))
+                    .boxed()
+                    .shared();
+                    let background = future.clone();
+                    tokio::spawn(async move { drop(background.await) });
+                    future
+                })
+                .clone()
+        };
+        let result = future.clone().await;
+        if result.is_err() {
+            let mut current = self.future.lock().await;
+            if current
+                .as_ref()
+                .is_some_and(|current| current.ptr_eq(&future))
+            {
+                *current = None;
+            }
+        }
+        result.map_err(|error| anyhow!(error.to_string()))
     }
 
     fn cancel(&self) {
@@ -811,8 +844,9 @@ impl CatalogLoader {
 
     async fn shutdown(&self) {
         self.cancel();
-        if let Some(future) = self.future.get() {
-            drop(future.clone().await);
+        let future = self.future.lock().await.clone();
+        if let Some(future) = future {
+            drop(future.await);
         }
     }
 }
@@ -905,7 +939,7 @@ impl BrowserProxy {
             catalog: Arc::new(CatalogLoader {
                 config: config.clone(),
                 worker_pool: worker_pool.clone(),
-                future: OnceLock::new(),
+                future: Mutex::new(None),
                 cancel: catalog_cancel,
             }),
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -936,17 +970,7 @@ impl BrowserProxy {
             let Some(worker) = worker else {
                 return spawn_downstream(&self.config, workspace).await;
             };
-            let healthy = !worker.is_closed()
-                && !worker.is_transport_closed()
-                && matches!(
-                    timeout(
-                        WORKER_HEALTH_TIMEOUT,
-                        worker.send_request(ClientRequest::PingRequest(PingRequest::default()))
-                    )
-                    .await,
-                    Ok(Ok(ServerResult::EmptyResult(_)))
-                );
-            if healthy {
+            if worker_is_healthy(&worker).await {
                 return Ok(worker);
             }
             if let Err(error) = stop_worker(worker).await {
@@ -1165,11 +1189,14 @@ impl BrowserProxy {
         {
             bail!("browser session is pending owned-tab cleanup");
         }
-        if guard
-            .as_ref()
-            .is_some_and(|session| session.downstream.is_none())
+        let session = guard.as_mut().expect("session exists");
+        if let Some(worker) = session.downstream.as_ref()
+            && !worker_is_healthy(worker).await
         {
-            let session = guard.as_mut().expect("session exists");
+            warn!(session_id = %id, "restarting unhealthy Chrome DevTools worker; retaining owned tabs");
+            self.reset_worker(id, session).await;
+        }
+        if session.downstream.is_none() {
             session.downstream = Some(self.acquire_worker(workspace).await?);
         }
         let closes_page = request.name == "close_page";
@@ -1216,13 +1243,13 @@ impl BrowserProxy {
                     result = Err(error.context("failed to release browser session"));
                 }
             }
-        } else if let Err(error) = &result
-            && guard.is_some()
+        } else if result
+            .as_ref()
+            .map_or(true, |result| result.is_error.unwrap_or(false))
+            && let Some(session) = guard.as_mut()
         {
-            error!(%error, session_id = %id, "retiring failed Chrome DevTools worker");
-            if let Err(cleanup_error) = self.retire_session(id, tracker, &mut guard, false).await {
-                warn!(%cleanup_error, session_id = %id, "browser session retirement failed");
-            }
+            warn!(session_id = %id, "browser call failed; resetting worker without replaying the call or closing owned tabs");
+            self.reset_worker(id, session).await;
         }
         drop(guard);
         self.prune_slot(id, &slot).await;
@@ -1325,6 +1352,15 @@ impl BrowserProxy {
         }
     }
 
+    async fn reset_worker(&self, id: &str, session: &mut Session) {
+        session.pages = PageState::default();
+        if let Some(worker) = session.downstream.take()
+            && let Err(error) = stop_worker(worker).await
+        {
+            warn!(%error, session_id = %id, "failed to stop failed Chrome DevTools MCP worker");
+        }
+    }
+
     async fn finalize_session(
         &self,
         id: &str,
@@ -1423,7 +1459,7 @@ impl BrowserProxy {
             .context("failed to send Chrome DevTools tool call")?
             .await_response()
             .await
-            .context("Chrome DevTools tool call failed")?;
+            .map_err(|error| anyhow!("Chrome DevTools tool call interrupted: {error}. The action may have taken effect; inspect browser state before retrying. Subsequent calls replace failed workers automatically."))?;
         match response {
             ServerResult::CallToolResult(result) => Ok(result),
             _ => bail!("Chrome DevTools returned an unexpected tool response"),

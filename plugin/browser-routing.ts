@@ -50,10 +50,50 @@ function requiresDirectTools(config: ConfigWithPolicies): boolean {
 	);
 }
 
-const server: Plugin = async ({ $ }, options) => {
+const server: Plugin = async ({ $, client, directory }, options) => {
 	const { enabled = false, compactTools = true } = (options ?? {}) as BrowserRoutingOptions;
 	if (typeof enabled !== "boolean") throw new Error("enabled must be a boolean");
 	if (typeof compactTools !== "boolean") throw new Error("compactTools must be a boolean");
+	let configured = false;
+	let disposed = false;
+	let failures = 0;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	let recovering: Promise<void> | undefined;
+	const scheduleRecovery = (delay: number) => {
+		if (timer) clearTimeout(timer);
+		if (disposed || !configured) return;
+		timer = setTimeout(() => void recover(), delay);
+		timer.unref();
+	};
+	const recover = (): Promise<void> => {
+		if (disposed || !configured) return Promise.resolve();
+		if (recovering) return recovering;
+		recovering = (async () => {
+			try {
+				const status = await client.mcp.status({ query: { directory }, throwOnError: true });
+				if (disposed) return;
+				if (!status.data?.browser) throw new Error("Browser MCP status is missing");
+				// Respect explicit runtime disconnects in the OpenCode UI.
+				if (status.data?.browser?.status === "failed") {
+					console.warn("Browser MCP adapter failed; reconnecting");
+					await client.mcp.connect({ path: { name: "browser" }, query: { directory }, throwOnError: true });
+					const restored = await client.mcp.status({ query: { directory }, throwOnError: true });
+					if (restored.data?.browser?.status !== "connected") {
+						throw new Error(`Browser MCP adapter recovery failed: ${JSON.stringify(restored.data?.browser)}`);
+					}
+					console.warn("Browser MCP adapter reconnected");
+				}
+				failures = 0;
+			} catch (error) {
+				failures++;
+				console.error("Failed to recover browser MCP adapter; will retry", error);
+			} finally {
+				recovering = undefined;
+				scheduleRecovery(failures ? Math.min(30_000, 1_000 * 2 ** Math.min(failures - 1, 5)) : 5_000);
+			}
+		})();
+		return recovering;
+	};
 
 	return {
 		config: async (config) => {
@@ -78,6 +118,8 @@ const server: Plugin = async ({ $ }, options) => {
 				enabled: requestedEnabled,
 				timeout: 600_000,
 			};
+			configured = true;
+			scheduleRecovery(1_000);
 			if (!requestedEnabled) return;
 			if (compactTools && !compact) {
 				console.warn(
@@ -96,8 +138,23 @@ const server: Plugin = async ({ $ }, options) => {
 				throw new Error("browser tool call has invalid arguments");
 			}
 			(output.args as Record<string, unknown>)[SESSION_KEY] = input.sessionID;
+			await recover();
+		},
+		"chat.message": async () => {
+			await recover();
 		},
 		event: async ({ event }) => {
+			if (event.type === "server.instance.disposed") {
+				disposed = true;
+				if (timer) clearTimeout(timer);
+				return;
+			}
+			const change = event as { type: string; properties: { server?: string } };
+			if (change.type === "mcp.tools.changed" && change.properties.server === "browser") {
+				// Do not await a callback that can be published by the connect request itself.
+				void recover();
+				return;
+			}
 			if (event.type !== "session.deleted") return;
 			const sessionID = event.properties.info.id;
 			try {

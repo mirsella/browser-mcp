@@ -1,7 +1,12 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import BrowserPlugin from "@mirsella/opencode-browser-mcp/server";
 
-async function hooks(options?: { enabled?: boolean; compactTools?: boolean }) {
+const disposals: Array<() => Promise<void>> = [];
+afterEach(async () => {
+	await Promise.all(disposals.splice(0).map((dispose) => dispose()));
+});
+
+async function hooks(options?: { enabled?: boolean; compactTools?: boolean }, mcp?: unknown) {
 	const calls: unknown[][] = [];
 	const shell = ((strings: TemplateStringsArray, ...values: unknown[]) => {
 		calls.push([strings, ...values]);
@@ -12,9 +17,21 @@ async function hooks(options?: { enabled?: boolean; compactTools?: boolean }) {
 		return command;
 	}) as never;
 	const plugin = await BrowserPlugin.server(
-		{ $: shell, directory: "/workspace", worktree: "/workspace" } as never,
+		{
+			$: shell,
+			directory: "/workspace",
+			worktree: "/workspace",
+			client: {
+				mcp: mcp ?? {
+					status: async () => ({ data: { browser: { status: "connected" } } }),
+				},
+			},
+		} as never,
 		options,
 	);
+	disposals.push(async () => {
+		await plugin.event?.({ event: { type: "server.instance.disposed", properties: {} } } as never);
+	});
 	return { plugin, calls };
 }
 
@@ -32,6 +49,70 @@ function browserEnabled(config: { mcp?: { browser?: { enabled?: unknown } } }): 
 }
 
 describe("BrowserRouting", () => {
+	test("reconnects a crashed adapter once across concurrent hooks", async () => {
+		let state = "failed";
+		const connections: unknown[] = [];
+		const { plugin } = await hooks({ enabled: true }, {
+			status: async () => ({ data: { browser: { status: state } } }),
+			connect: async (options: unknown) => {
+				connections.push(options);
+				await Bun.sleep(10);
+				state = "connected";
+				return { data: true };
+			},
+		});
+		await plugin.config?.({} as never);
+		await Promise.all(Array.from({ length: 4 }, () => plugin["chat.message"]?.({} as never, {} as never)));
+		expect(connections).toEqual([
+			{ path: { name: "browser" }, query: { directory: "/workspace" }, throwOnError: true },
+		]);
+		state = "disabled";
+		await plugin["chat.message"]?.({} as never, {} as never);
+		expect(connections).toHaveLength(1);
+	});
+
+	test("retries unsuccessful reconnects and stops on disposal", async () => {
+		let state = "failed";
+		let connections = 0;
+		const { plugin } = await hooks({ enabled: true }, {
+			status: async () => ({ data: { browser: { status: state } } }),
+			connect: async () => {
+				connections++;
+				if (connections > 1) state = "connected";
+				return { data: true };
+			},
+		});
+		await plugin.config?.({} as never);
+		await plugin["chat.message"]?.({} as never, {} as never);
+		expect(connections).toBe(1);
+		await Bun.sleep(1_100);
+		expect(connections).toBe(2);
+		await plugin.event?.({ event: { type: "server.instance.disposed", properties: {} } } as never);
+		state = "failed";
+		await plugin["chat.message"]?.({} as never, {} as never);
+		expect(connections).toBe(2);
+	});
+
+	test("recovers an adapter enabled at runtime when its tools disappear", async () => {
+		let state = "disabled";
+		let connections = 0;
+		const { plugin } = await hooks({}, {
+			status: async () => ({ data: { browser: { status: state } } }),
+			connect: async () => {
+				connections++;
+				state = "connected";
+				return { data: true };
+			},
+		});
+		await plugin.config?.({} as never);
+		await plugin["chat.message"]?.({} as never, {} as never);
+		expect(connections).toBe(0);
+		state = "failed";
+		await plugin.event?.({ event: { type: "mcp.tools.changed", properties: { server: "browser" } } } as never);
+		await plugin["chat.message"]?.({} as never, {} as never);
+		expect(connections).toBe(1);
+	});
+
 	test("exports the module, registers compact routing, and injects the session ID", async () => {
 		expect(BrowserPlugin.id).toBe("@mirsella/opencode-browser-mcp");
 		const { plugin } = await hooks({ enabled: true });

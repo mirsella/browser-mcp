@@ -73,6 +73,18 @@ fn runtime_command(runtime: &Path, profile: &Path, port: u16, layout: &str) -> C
         .env("WAYLAND_DISPLAY", "")
         .env("XDG_SESSION_TYPE", "x11")
         .stderr(Stdio::inherit());
+    unsafe {
+        command.pre_exec(|| {
+            let limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::setrlimit(libc::RLIMIT_CORE, &limit) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
         command.env("OPENCODE_BROWSER_HEADLESS", "true");
     }
@@ -131,6 +143,148 @@ async fn wait_for_broker_exit(socket: &Path, profile: &Path) {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+async fn broker_pid(socket: &Path) -> i32 {
+    tokio::net::UnixStream::connect(socket)
+        .await
+        .expect("connect to broker for its PID")
+        .peer_cred()
+        .expect("broker credentials")
+        .pid()
+        .expect("broker PID")
+}
+
+fn kill_process(pid: i32, signal: i32) {
+    assert_eq!(
+        unsafe { libc::kill(pid, signal) },
+        0,
+        "failed to signal process {pid}"
+    );
+}
+
+async fn wait_for_profile_lease(profile: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let file = OpenOptions::new()
+            .read(true)
+            .open(profile.join("opencode-browser-mcp.lock"))
+            .unwrap();
+        if file.try_lock().is_ok() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "crashed broker retained its profile lease"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test]
+async fn connected_adapters_recover_from_killed_and_segfaulted_brokers() {
+    let root =
+        std::env::temp_dir().join(format!("opencode-browser-mcp-crash-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let profile = root.join("profile");
+    let socket = broker_socket(&profile);
+    let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let (a, b) = tokio::join!(
+        client(&root, false, &profile, port, "shared-window"),
+        client(&root, false, &profile, port, "shared-window"),
+    );
+    for signal in [libc::SIGKILL, libc::SIGSEGV] {
+        let old_pid = broker_pid(&socket).await;
+        kill_process(old_pid, signal);
+        if signal == libc::SIGSEGV {
+            // Rust's stack-overflow handler first restores the default handler
+            // for a synthetic SIGSEGV; unlike a real fault it does not recur.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let result = unsafe { libc::kill(old_pid, signal) };
+            assert!(
+                result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            );
+        }
+        wait_for_profile_lease(&profile).await;
+        let (tools_a, tools_b) = tokio::join!(
+            a.send_request(rmcp::model::ClientRequest::ListToolsRequest(
+                Default::default()
+            )),
+            b.send_request(rmcp::model::ClientRequest::ListToolsRequest(
+                Default::default()
+            )),
+        );
+        for result in [tools_a, tools_b] {
+            let rmcp::model::ServerResult::ListToolsResult(result) =
+                result.expect("adapter recovered")
+            else {
+                panic!("unexpected broker response");
+            };
+            assert_eq!(result.tools.len(), 2);
+        }
+        assert_ne!(broker_pid(&socket).await, old_pid);
+    }
+    a.cancel().await.unwrap();
+    b.cancel().await.unwrap();
+    wait_for_broker_exit(&socket, &profile).await;
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn failed_catalog_discovery_can_be_retried() {
+    let root = std::env::temp_dir().join(format!(
+        "opencode-browser-mcp-catalog-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let profile = root.join("profile");
+    let socket = broker_socket(&profile);
+    let downstream = root.join("downstream");
+    std::fs::write(&downstream, r##"#!/usr/bin/env bun
+import { existsSync, writeFileSync } from 'node:fs';
+import { createInterface } from 'node:readline';
+if (!existsSync('failed-once')) { writeFileSync('failed-once', ''); process.exit(1); }
+for await (const line of createInterface({ input: process.stdin })) {
+  const request = JSON.parse(line);
+  if (request.id === undefined) continue;
+  let result = {};
+  if (request.method === 'initialize') result = { protocolVersion: request.params.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: 'test-worker', version: '1' } };
+  if (request.method === 'tools/list') result = { tools: ['get_tab_id', 'list_pages'].map(name => ({ name, inputSchema: { type: 'object', properties: {} } })) };
+  console.log(JSON.stringify({ jsonrpc: '2.0', id: request.id, result }));
+}
+"##).unwrap();
+    std::fs::set_permissions(&downstream, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut command = adapter_command(&root, false, &profile, port, "shared-window");
+    command
+        .current_dir(&root)
+        .env("OPENCODE_BROWSER_DOWNSTREAM_COMMAND", downstream);
+    let client = ().serve(TokioChildProcess::new(command).unwrap()).await.unwrap();
+    let failed = client
+        .call_tool(request("help", "catalog", json!({})))
+        .await
+        .unwrap();
+    assert!(failed.is_error.unwrap_or(false));
+    let recovered = call_ok(&client, "help", "catalog", json!({})).await;
+    assert!(text(&recovered).contains("list_pages"));
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_err()
+    );
+    client.cancel().await.unwrap();
+    wait_for_broker_exit(&socket, &profile).await;
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 async fn release_session(
@@ -217,6 +371,319 @@ async fn browser_tabs(port: u16) -> Vec<Value> {
         .as_array()
         .expect("browser target list")
         .clone()
+}
+
+async fn cdp_request(url: &str, method: &str, params: Value) -> Value {
+    let (mut socket, _) = connect_async(url).await.unwrap();
+    socket
+        .send(Message::Text(
+            json!({"id": 1, "method": method, "params": params})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(message) = socket.next().await {
+            let Message::Text(text) = message.unwrap() else {
+                continue;
+            };
+            let response: Value = serde_json::from_str(&text).unwrap();
+            if response["id"] == 1 {
+                assert!(response.get("error").is_none(), "CDP failed: {response}");
+                return response["result"].clone();
+            }
+        }
+        panic!("CDP socket closed before responding to {method}");
+    })
+    .await
+    .unwrap()
+}
+
+async fn browser_process_id(port: u16) -> i32 {
+    let version = browser_json(port, "version").await;
+    let processes = cdp_request(
+        version["webSocketDebuggerUrl"].as_str().unwrap(),
+        "SystemInfo.getProcessInfo",
+        json!({}),
+    )
+    .await;
+    processes["processInfo"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|process| process["type"] == "browser")
+        .unwrap()["id"]
+        .as_i64()
+        .unwrap()
+        .try_into()
+        .unwrap()
+}
+
+fn kill_process_tree(pid: i32) {
+    if let Ok(children) = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")) {
+        for child in children.split_whitespace() {
+            kill_process_tree(child.parse().unwrap());
+        }
+    }
+    let result = unsafe { libc::kill(pid, libc::SIGKILL) };
+    assert!(result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH));
+}
+
+fn kill_recorded_workers(path: &Path) {
+    let pids = std::fs::read_to_string(path).unwrap();
+    std::fs::write(path, "").unwrap();
+    for pid in pids.lines() {
+        kill_process_tree(pid.parse().unwrap());
+    }
+}
+
+async fn wait_for_page_counter(page: &Value, counter: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let value = cdp_request(
+            page["webSocketDebuggerUrl"].as_str().unwrap(),
+            "Runtime.evaluate",
+            json!({"expression": format!("window.{counter}")}),
+        )
+        .await;
+        if value["result"]["value"] == 1 {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "interrupted call never reached the browser"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium and the real Chrome DevTools MCP worker"]
+async fn recovers_from_browser_worker_and_broker_process_deaths() {
+    let root = std::env::temp_dir().join(format!(
+        "opencode-browser-mcp-runtime-crash-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let profile = root.join("profile");
+    let socket = broker_socket(&profile);
+    let worker_pids = root.join("workers");
+    let launcher = root.join("downstream");
+    std::fs::write(
+        &launcher,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\nexec bunx \"$@\"\n",
+            worker_pids.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let make_client = || async {
+        let mut command = adapter_command(&root, true, &profile, port, "shared-window");
+        command.env("OPENCODE_BROWSER_DOWNSTREAM_COMMAND", &launcher);
+        ().serve(TokioChildProcess::new(command).unwrap())
+            .await
+            .unwrap()
+    };
+    let a = make_client().await;
+    let b = make_client().await;
+    let (url, site) = start_test_site().await;
+    call_ok(
+        &a,
+        "navigate_page",
+        "crash-a",
+        json!({"url": format!("{url}/#owned-a")}),
+    )
+    .await;
+    call_ok(
+        &b,
+        "navigate_page",
+        "crash-b",
+        json!({"url": format!("{url}/#owned-b")}),
+    )
+    .await;
+    create_unowned_tab(port).await;
+    let original = browser_tabs(port).await;
+    let page_a = original
+        .iter()
+        .find(|tab| {
+            tab["url"]
+                .as_str()
+                .is_some_and(|url| url.ends_with("#owned-a"))
+        })
+        .unwrap();
+    let generation = browser_json(port, "version").await;
+
+    // A renderer crash keeps its target but invalidates the page's execution state.
+    let (mut renderer, _) = connect_async(page_a["webSocketDebuggerUrl"].as_str().unwrap())
+        .await
+        .unwrap();
+    renderer
+        .send(Message::Text(
+            json!({"id": 1, "method": "Page.crash"}).to_string().into(),
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(message) = renderer.next().await {
+            let Message::Text(text) = message.unwrap() else {
+                continue;
+            };
+            let event: Value = serde_json::from_str(&text).unwrap();
+            if event["method"] == "Inspector.targetCrashed" {
+                return;
+            }
+        }
+        panic!("renderer closed without reporting a crash");
+    })
+    .await
+    .expect("renderer crash event");
+    drop(renderer);
+    call_ok(
+        &a,
+        "navigate_page",
+        "crash-a",
+        json!({"url": format!("{url}/#owned-a")}),
+    )
+    .await;
+    call_ok(
+        &b,
+        "navigate_page",
+        "crash-b",
+        json!({"url": format!("{url}/#owned-b")}),
+    )
+    .await;
+    assert_eq!(browser_json(port, "version").await, generation);
+
+    // Dead workers are replaced before dispatch, preserving stable tab ownership.
+    kill_recorded_workers(&worker_pids);
+    let view_a = call_ok(&a, "list_pages", "crash-a", json!({})).await;
+    let view_b = call_ok(&b, "list_pages", "crash-b", json!({})).await;
+    isolated_view(&view_a, "#owned-a", "#owned-b");
+    isolated_view(&view_b, "#owned-b", "#owned-a");
+
+    // An interrupted call reports failure and is not replayed on a new worker.
+    let interrupted = a.call_tool(request("evaluate_script", "crash-a", json!({"function": "async () => { window.workerCrashCount = (window.workerCrashCount || 0) + 1; await new Promise(resolve => setTimeout(resolve, 30000)); return window.workerCrashCount; }"})));
+    let kill = async {
+        wait_for_page_counter(page_a, "workerCrashCount").await;
+        kill_recorded_workers(&worker_pids);
+    };
+    let (result, ()) = tokio::join!(interrupted, kill);
+    assert!(result.unwrap().is_error.unwrap_or(false));
+    let counter = call_ok(
+        &a,
+        "evaluate_script",
+        "crash-a",
+        json!({"function": "() => window.workerCrashCount"}),
+    )
+    .await;
+    assert!(
+        text(&counter).contains("\n1\n"),
+        "interrupted worker action was replayed: {}",
+        text(&counter)
+    );
+
+    // Broker death leaves the upstream stdio connection and surviving browser intact.
+    let old_pid = broker_pid(&socket).await;
+    let interrupted = a.call_tool(request("evaluate_script", "crash-a", json!({"function": "async () => { window.brokerCrashCount = (window.brokerCrashCount || 0) + 1; await new Promise(resolve => setTimeout(resolve, 30000)); return window.brokerCrashCount; }"})));
+    let kill = async {
+        wait_for_page_counter(page_a, "brokerCrashCount").await;
+        kill_process(old_pid, libc::SIGKILL);
+        wait_for_profile_lease(&profile).await;
+    };
+    let (result, ()) = tokio::join!(interrupted, kill);
+    let result = result.unwrap();
+    assert!(result.is_error.unwrap_or(false));
+    assert!(text(&result).contains("may have taken effect"));
+    let counter = call_ok(
+        &a,
+        "evaluate_script",
+        "crash-a",
+        json!({"function": "() => window.brokerCrashCount"}),
+    )
+    .await;
+    assert!(
+        text(&counter).contains("\n1\n"),
+        "interrupted broker action was replayed: {}",
+        text(&counter)
+    );
+    isolated_view(
+        &call_ok(&b, "list_pages", "crash-b", json!({})).await,
+        "#owned-b",
+        "#owned-a",
+    );
+    assert_eq!(browser_json(port, "version").await, generation);
+    let surviving = browser_tabs(port).await;
+    for tab in &original {
+        assert!(
+            surviving.iter().any(|survivor| survivor["id"] == tab["id"]),
+            "recovery closed a surviving tab: {tab}"
+        );
+    }
+
+    // Browser death starts a new generation and discards old target mappings.
+    kill_process(browser_process_id(port).await, libc::SIGKILL);
+    wait_for_browser_exit(port).await;
+    let empty = call_ok(&a, "list_pages", "crash-a", json!({})).await;
+    assert_eq!(empty.structured_content.unwrap()["pages"], json!([]));
+    assert_ne!(
+        browser_json(port, "version").await["webSocketDebuggerUrl"],
+        generation["webSocketDebuggerUrl"]
+    );
+    call_ok(
+        &a,
+        "navigate_page",
+        "crash-a",
+        json!({"url": format!("{url}/#new-a")}),
+    )
+    .await;
+    call_ok(
+        &b,
+        "navigate_page",
+        "crash-b",
+        json!({"url": format!("{url}/#new-b")}),
+    )
+    .await;
+    isolated_view(
+        &call_ok(&a, "list_pages", "crash-a", json!({})).await,
+        "#new-a",
+        "#new-b",
+    );
+    isolated_view(
+        &call_ok(&b, "list_pages", "crash-b", json!({})).await,
+        "#new-b",
+        "#new-a",
+    );
+
+    // An OOM kill can take out the browser and broker together.
+    let browser_pid = browser_process_id(port).await;
+    kill_process(broker_pid(&socket).await, libc::SIGKILL);
+    kill_process(browser_pid, libc::SIGKILL);
+    wait_for_profile_lease(&profile).await;
+    wait_for_browser_exit(port).await;
+    let empty = call_ok(&b, "list_pages", "crash-b", json!({})).await;
+    assert_eq!(empty.structured_content.unwrap()["pages"], json!([]));
+    call_ok(
+        &a,
+        "navigate_page",
+        "crash-a",
+        json!({"url": format!("{url}/#after-group-kill")}),
+    )
+    .await;
+
+    a.cancel().await.unwrap();
+    b.cancel().await.unwrap();
+    wait_for_broker_exit(&socket, &profile).await;
+    wait_for_browser_exit(port).await;
+    site.abort();
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 fn tabs_contain_url(tabs: &[Value], fragment: &str) -> bool {
