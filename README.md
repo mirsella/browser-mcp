@@ -20,14 +20,13 @@ logins, local storage, cache, and extensions.
 
 ## OpenCode setup
 
-Add the plugin to `opencode.json`. The browser server is disabled by default,
-so the entry shows up in `opencode mcp list` as disabled and the skill is
-skipped. Opt in with plugin options:
+Add the plugin to `opencode.json`. It enables the browser server and makes
+the browser automation skill available by default:
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": [["@mirsella/opencode-browser-mcp", { "enabled": true }]]
+  "plugin": ["@mirsella/opencode-browser-mcp"]
 }
 ```
 
@@ -38,6 +37,10 @@ The first adapter starts the packaged native broker automatically.
 Concurrent Codex and OpenCode instances converge on the same private socket and browser
 profile. The broker remains available while at least one adapter is connected,
 then closes the browser and exits shortly after the final adapter disconnects.
+
+OpenCode loads the JavaScript `./server` package export. Codex uses the
+plugin and MCP manifests plus the session hooks. Both integrations launch
+the same packaged Rust executable.
 
 ## Codex setup
 
@@ -84,7 +87,7 @@ dispatch has one approval rule for all actions.
 
 The plugin:
 
-- registers the packaged browser MCP adapter (disabled unless opted in);
+- registers and enables the packaged browser MCP adapter;
 - injects the active OpenCode session ID after model argument generation;
 - exposes compact browser tools unless existing permissions require direct tools;
 - releases owned tabs when an OpenCode session is deleted;
@@ -100,9 +103,8 @@ direct tools so those policies continue to work.
 
 Settings:
 
-- `enabled` (default `false`): start the server and load the skill. An
-  explicit `mcp.browser` entry with `"enabled": true` also opts in, without
-  plugin options.
+- `enabled` (default `true`): start the server and load the skill. Set it to
+  `false` to disable both. An explicit `mcp.browser` entry takes precedence.
 - `compactTools` (default `true`): keep `browser_dispatch` and `browser_help`
   instead of the direct tools. Set it to `false` to always use direct tools:
 
@@ -110,7 +112,7 @@ Settings:
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
-    ["@mirsella/opencode-browser-mcp", { "enabled": true, "compactTools": false }]
+    ["@mirsella/opencode-browser-mcp", { "compactTools": false }]
   ]
 }
 ```

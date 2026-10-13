@@ -113,9 +113,9 @@ describe("BrowserRouting", () => {
 		expect(connections).toBe(1);
 	});
 
-	test("exports the module, registers compact routing, and injects the session ID", async () => {
+	test("enables compact routing by default and injects the session ID", async () => {
 		expect(BrowserPlugin.id).toBe("@mirsella/opencode-browser-mcp");
-		const { plugin } = await hooks({ enabled: true });
+		const { plugin } = await hooks();
 		const config = { skills: { paths: ["/existing"] } } as never;
 		await plugin.config?.(config);
 		await plugin.config?.(config);
@@ -141,8 +141,8 @@ describe("BrowserRouting", () => {
 		).rejects.toThrow("invalid arguments");
 	});
 
-	test("is disabled by default and skips the skill", async () => {
-		const { plugin } = await hooks();
+	test("allows explicit disablement and skips the skill", async () => {
+		const { plugin } = await hooks({ enabled: false });
 		const config = { skills: { paths: ["/existing"] } } as never;
 		await plugin.config?.(config);
 		expect(browserEnabled(config)).toBeFalse();

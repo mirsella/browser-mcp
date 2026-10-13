@@ -51,7 +51,7 @@ function requiresDirectTools(config: ConfigWithPolicies): boolean {
 }
 
 const server: Plugin = async ({ $, client, directory }, options) => {
-	const { enabled = false, compactTools = true } = (options ?? {}) as BrowserRoutingOptions;
+	const { enabled = true, compactTools = true } = (options ?? {}) as BrowserRoutingOptions;
 	if (typeof enabled !== "boolean") throw new Error("enabled must be a boolean");
 	if (typeof compactTools !== "boolean") throw new Error("compactTools must be a boolean");
 	let configured = false;
