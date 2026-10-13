@@ -30,7 +30,13 @@ jobs:
             "https://storage.googleapis.com/chrome-for-testing-public/${chrome_version}/linux64/chrome-linux64.zip" \
             --output "$RUNNER_TEMP/chrome-linux64.zip"
           unzip -q "$RUNNER_TEMP/chrome-linux64.zip" -d "$RUNNER_TEMP"
+          # Ubuntu's policy blocks user namespaces for downloaded Chrome binaries.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           "$RUNNER_TEMP/chrome-linux64/chrome" --version
+          timeout 30s "$RUNNER_TEMP/chrome-linux64/chrome" --headless=new \
+            --no-first-run --no-default-browser-check \
+            --user-data-dir="$RUNNER_TEMP/chrome-preflight" --dump-dom about:blank \
+            > "$RUNNER_TEMP/chrome-preflight.html"
           echo "OPENCODE_BROWSER_EXECUTABLE=$RUNNER_TEMP/chrome-linux64/chrome" >> "$GITHUB_ENV"
           bunx chrome-devtools-mcp@1.6.0 --help >/dev/null
       - name: Test real browser routing
