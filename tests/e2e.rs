@@ -19,7 +19,7 @@ use tokio::{
     process::Command,
     task::JoinHandle,
 };
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 use xxhash_rust::xxh3::xxh3_64;
 
 const SESSION_KEY: &str = "__opencode_session_id";
@@ -469,11 +469,17 @@ async fn browser_tabs(port: u16) -> Vec<Value> {
         .clone()
 }
 
+type CdpSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
 async fn cdp_request(url: &str, method: &str, params: Value) -> Value {
     let (mut socket, _) = connect_async(url).await.unwrap();
+    cdp_call(&mut socket, 1, method, params).await
+}
+
+async fn cdp_call(socket: &mut CdpSocket, id: u64, method: &str, params: Value) -> Value {
     socket
         .send(Message::Text(
-            json!({"id": 1, "method": method, "params": params})
+            json!({"id": id, "method": method, "params": params})
                 .to_string()
                 .into(),
         ))
@@ -485,7 +491,7 @@ async fn cdp_request(url: &str, method: &str, params: Value) -> Value {
                 continue;
             };
             let response: Value = serde_json::from_str(&text).unwrap();
-            if response["id"] == 1 {
+            if response["id"] == id {
                 assert!(response.get("error").is_none(), "CDP failed: {response}");
                 return response["result"].clone();
             }
@@ -516,7 +522,72 @@ async fn browser_process_id(port: u16) -> i32 {
         .unwrap()
 }
 
+async fn renderer_process_id(browser: &mut CdpSocket, page: &Value) -> i32 {
+    let marker = format!("browser-mcp-renderer-{}", page["id"].as_str().unwrap());
+    cdp_call(
+        browser,
+        2,
+        "Tracing.start",
+        json!({"categories": "blink.user_timing", "transferMode": "ReportEvents"}),
+    )
+    .await;
+    // Emit a unique trace event through the exact page's CDP connection.
+    cdp_request(
+        page["webSocketDebuggerUrl"].as_str().unwrap(),
+        "Runtime.evaluate",
+        json!({"expression": format!("performance.mark({})", serde_json::to_string(&marker).unwrap())}),
+    )
+    .await;
+    browser
+        .send(Message::Text(
+            json!({"id": 3, "method": "Tracing.end"}).to_string().into(),
+        ))
+        .await
+        .unwrap();
+    let mut renderer = None;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(message) = browser.next().await {
+            let Message::Text(text) = message.unwrap() else {
+                continue;
+            };
+            let event: Value = serde_json::from_str(&text).unwrap();
+            assert!(event.get("error").is_none(), "Tracing failed: {event}");
+            if event["method"] == "Tracing.dataCollected" {
+                for entry in event["params"]["value"].as_array().unwrap() {
+                    if entry["name"] == marker {
+                        renderer = entry["pid"].as_i64();
+                    }
+                }
+            } else if event["method"] == "Tracing.tracingComplete" {
+                assert_ne!(event["params"]["dataLossOccurred"], true);
+                return;
+            }
+        }
+        panic!("browser closed before completing its trace");
+    })
+    .await
+    .expect("renderer identity trace");
+    let pid: i32 = renderer
+        .expect("Chrome trace omitted the exact page marker")
+        .try_into()
+        .unwrap();
+    assert!(pid > 1);
+    let processes = cdp_call(browser, 4, "SystemInfo.getProcessInfo", json!({})).await;
+    assert!(
+        processes["processInfo"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|process| {
+                process["type"] == "renderer" && process["id"].as_i64() == Some(pid.into())
+            }),
+        "traced process is not a live renderer"
+    );
+    pid
+}
+
 fn kill_process_tree(pid: i32) {
+    assert!(pid > 1);
     if let Ok(children) = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")) {
         for child in children.split_whitespace() {
             kill_process_tree(child.parse().unwrap());
@@ -622,69 +693,32 @@ async fn recovers_from_browser_worker_and_broker_process_deaths() {
         connect_async(generation["webSocketDebuggerUrl"].as_str().unwrap())
             .await
             .unwrap();
-    browser_events
-        .send(Message::Text(
-            json!({"id": 1, "method": "Target.setDiscoverTargets", "params": {"discover": true}})
-                .to_string()
-                .into(),
-        ))
-        .await
-        .unwrap();
+    cdp_call(
+        &mut browser_events,
+        1,
+        "Target.setDiscoverTargets",
+        json!({"discover": true}),
+    )
+    .await;
+    // Page.crash can stall in CI's crash handler. SIGKILL bypasses it while
+    // still requiring a real crash of the renderer for this exact page.
+    let renderer_pid = renderer_process_id(&mut browser_events, page_a).await;
+    kill_process_tree(renderer_pid);
     tokio::time::timeout(Duration::from_secs(5), async {
         while let Some(message) = browser_events.next().await {
             if let Message::Text(text) = message.unwrap() {
-                let response: Value = serde_json::from_str(&text).unwrap();
-                if response["id"] == 1 {
-                    assert!(response.get("error").is_none(), "CDP failed: {response}");
+                let event: Value = serde_json::from_str(&text).unwrap();
+                if event["method"] == "Target.targetCrashed"
+                    && event["params"]["targetId"] == page_a["id"]
+                {
                     return;
                 }
             }
         }
-        panic!("browser closed before subscribing to target events");
-    })
-    .await
-    .expect("target event subscription");
-    let (mut renderer, _) = connect_async(page_a["webSocketDebuggerUrl"].as_str().unwrap())
-        .await
-        .unwrap();
-    renderer
-        .send(Message::Text(
-            json!({"id": 1, "method": "Page.crash"}).to_string().into(),
-        ))
-        .await
-        .unwrap();
-    let mut renderer_open = true;
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            tokio::select! {
-                message = browser_events.next() => {
-                    let message = message.expect("browser closed before crash event").unwrap();
-                    if let Message::Text(text) = message {
-                        let event: Value = serde_json::from_str(&text).unwrap();
-                        if event["method"] == "Target.targetCrashed"
-                            && event["params"]["targetId"] == page_a["id"] {
-                            return;
-                        }
-                    }
-                }
-                message = renderer.next(), if renderer_open => {
-                    match message {
-                        Some(Ok(Message::Text(text))) => {
-                            let response: Value = serde_json::from_str(&text).unwrap();
-                            if response.get("error").is_some() {
-                                eprintln!("Page.crash response: {response}");
-                            }
-                        }
-                        Some(Ok(Message::Close(_))) | Some(Err(_)) | None => renderer_open = false,
-                        _ => {},
-                    }
-                }
-            }
-        }
+        panic!("browser closed before reporting the renderer crash");
     })
     .await
     .expect("renderer crash event");
-    drop(renderer);
     drop(browser_events);
     call_ok(
         &a,
