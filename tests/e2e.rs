@@ -617,16 +617,34 @@ async fn recovers_from_browser_worker_and_broker_process_deaths() {
         .unwrap();
     let generation = browser_json(port, "version").await;
 
-    // A renderer crash keeps its target but invalidates the page's execution state.
-    let (mut renderer, _) = connect_async(page_a["webSocketDebuggerUrl"].as_str().unwrap())
-        .await
-        .unwrap();
-    renderer
+    // Observe the crash at browser scope: a renderer socket may disappear first.
+    let (mut browser_events, _) =
+        connect_async(generation["webSocketDebuggerUrl"].as_str().unwrap())
+            .await
+            .unwrap();
+    browser_events
         .send(Message::Text(
-            json!({"id": 0, "method": "Inspector.enable"})
+            json!({"id": 1, "method": "Target.setDiscoverTargets", "params": {"discover": true}})
                 .to_string()
                 .into(),
         ))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(message) = browser_events.next().await {
+            if let Message::Text(text) = message.unwrap() {
+                let response: Value = serde_json::from_str(&text).unwrap();
+                if response["id"] == 1 {
+                    assert!(response.get("error").is_none(), "CDP failed: {response}");
+                    return;
+                }
+            }
+        }
+        panic!("browser closed before subscribing to target events");
+    })
+    .await
+    .expect("target event subscription");
+    let (mut renderer, _) = connect_async(page_a["webSocketDebuggerUrl"].as_str().unwrap())
         .await
         .unwrap();
     renderer
@@ -635,21 +653,39 @@ async fn recovers_from_browser_worker_and_broker_process_deaths() {
         ))
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while let Some(message) = renderer.next().await {
-            let Message::Text(text) = message.unwrap() else {
-                continue;
-            };
-            let event: Value = serde_json::from_str(&text).unwrap();
-            if event["method"] == "Inspector.targetCrashed" {
-                return;
+    let mut renderer_open = true;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            tokio::select! {
+                message = browser_events.next() => {
+                    let message = message.expect("browser closed before crash event").unwrap();
+                    if let Message::Text(text) = message {
+                        let event: Value = serde_json::from_str(&text).unwrap();
+                        if event["method"] == "Target.targetCrashed"
+                            && event["params"]["targetId"] == page_a["id"] {
+                            return;
+                        }
+                    }
+                }
+                message = renderer.next(), if renderer_open => {
+                    match message {
+                        Some(Ok(Message::Text(text))) => {
+                            let response: Value = serde_json::from_str(&text).unwrap();
+                            if response.get("error").is_some() {
+                                eprintln!("Page.crash response: {response}");
+                            }
+                        }
+                        Some(Ok(Message::Close(_))) | Some(Err(_)) | None => renderer_open = false,
+                        _ => {},
+                    }
+                }
             }
         }
-        panic!("renderer closed without reporting a crash");
     })
     .await
     .expect("renderer crash event");
     drop(renderer);
+    drop(browser_events);
     call_ok(
         &a,
         "navigate_page",
