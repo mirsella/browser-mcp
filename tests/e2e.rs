@@ -61,8 +61,104 @@ async fn call_ok(
     result
 }
 
+async fn codex_request(action: &str, id: &str, arguments: Value) -> CallToolRequestParams {
+    let input = json!({
+        "hook_event_name": "PreToolUse", "session_id": id,
+        "tool_name": "mcp__plugin_browser_browser__dispatch",
+        "tool_input": {"action": action, "arguments": arguments},
+    });
+    let mut process = Command::new(env!("CARGO_BIN_EXE_browser-mcp"))
+        .arg("codex-hook")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    process
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&serde_json::to_vec(&input).unwrap())
+        .await
+        .unwrap();
+    let output = process.wait_with_output().await.unwrap();
+    assert!(output.status.success(), "Codex routing hook failed");
+    let output: Value = serde_json::from_slice(&output.stdout).unwrap();
+    CallToolRequestParams::new("dispatch").with_arguments(
+        output["hookSpecificOutput"]["updatedInput"]
+            .as_object()
+            .unwrap()
+            .clone(),
+    )
+}
+
+async fn codex_call(client: &Client, action: &str, id: &str, arguments: Value) -> CallToolResult {
+    let result = client
+        .call_tool(codex_request(action, id, arguments).await)
+        .await
+        .unwrap();
+    assert!(
+        !result.is_error.unwrap_or(false),
+        "{action}: {}",
+        text(&result)
+    );
+    result
+}
+
+async fn codex_end(runtime: &Path, profile: &Path, port: u16, id: &str) {
+    let root = profile.parent().unwrap();
+    let plugin_root = root.join("codex-plugin");
+    let vendor = plugin_root.join("vendor/browser-mcp");
+    std::fs::create_dir_all(vendor.parent().unwrap()).unwrap();
+    if !vendor.exists() {
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_browser-mcp"), &vendor).unwrap();
+    }
+    let hooks: Value = serde_json::from_str(include_str!("../hooks/hooks.json")).unwrap();
+    let config = runtime_command(runtime, profile, port, "shared-window");
+    let mut command = Command::new("sh");
+    for (key, value) in config.as_std().get_envs() {
+        if let Some(value) = value {
+            command.env(key, value);
+        }
+    }
+    // Codex starts hooks in the conversation cwd; the MCP adapter uses the plugin cwd.
+    let mut process = command
+        .args([
+            "-c",
+            hooks["hooks"]["SessionEnd"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap(),
+        ])
+        .current_dir(root)
+        .env("PLUGIN_ROOT", &plugin_root)
+        .env(
+            "OPENCODE_BROWSER_PROFILE",
+            Path::new("..").join(profile.file_name().unwrap()),
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    process
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            &serde_json::to_vec(&json!({"hook_event_name": "SessionEnd", "session_id": id}))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(3), process.wait_with_output())
+        .await
+        .expect("Codex SessionEnd exceeded its hook deadline")
+        .unwrap();
+    assert!(output.status.success(), "Codex session cleanup failed");
+}
+
 fn runtime_command(runtime: &Path, profile: &Path, port: u16, layout: &str) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_opencode-browser-mcp"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_browser-mcp"));
     command
         .env("XDG_RUNTIME_DIR", runtime)
         .env("OPENCODE_BROWSER_PROFILE", profile)
@@ -1292,4 +1388,111 @@ async fn exercise_window_per_session_layout() {
 async fn isolates_sessions_in_both_window_layouts() {
     exercise_shared_broker().await;
     exercise_window_per_session_layout().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Chromium and the real Chrome DevTools MCP worker"]
+async fn codex_hooks_share_profile_isolate_sessions_and_queue_cleanup() {
+    let root =
+        std::env::temp_dir().join(format!("opencode-browser-mcp-codex-{}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let profile = root.join("profile");
+    let socket = broker_socket(&profile);
+    let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    codex_end(&root, &profile, port, "unused").await;
+    assert!(!socket.exists(), "cleanup started an unused broker");
+    let open_code = client(&root, true, &profile, port, "shared-window").await;
+    let codex = client(&root, false, &profile, port, "shared-window").await;
+    let (site, site_task) = start_test_site().await;
+    call_ok(
+        &open_code,
+        "navigate_page",
+        "same",
+        json!({"url": format!("{site}/opencode")}),
+    )
+    .await;
+    codex_call(
+        &codex,
+        "navigate_page",
+        "same",
+        json!({"url": format!("{site}/codex-a")}),
+    )
+    .await;
+    codex_call(
+        &codex,
+        "navigate_page",
+        "other",
+        json!({"url": format!("{site}/codex-b")}),
+    )
+    .await;
+    create_unowned_tab(port).await;
+    let pages = codex_call(&codex, "list_pages", "same", json!({})).await;
+    let view = isolated_view(&pages, "/codex-a", "/codex-b");
+    assert!(!view.contains("/opencode") && !view.contains("user-tab"));
+    let pages = call_ok(&open_code, "list_pages", "same", json!({})).await;
+    isolated_view(&pages, "/opencode", "/codex-a");
+    codex_call(&codex, "evaluate_script", "same", json!({
+        "function": "() => { document.cookie = 'codexShared=yes;path=/'; return document.cookie; }"
+    })).await;
+    let shared = call_ok(
+        &open_code,
+        "evaluate_script",
+        "same",
+        json!({"function": "() => document.cookie"}),
+    )
+    .await;
+    assert!(
+        text(&shared).contains("codexShared=yes"),
+        "clients did not share the browser profile"
+    );
+    let tabs = browser_tabs(port).await;
+    let page = tabs
+        .iter()
+        .find(|tab| {
+            tab["url"]
+                .as_str()
+                .is_some_and(|url| url.contains("/codex-a"))
+        })
+        .unwrap();
+    let active = codex.send_cancellable_request(
+        rmcp::model::ClientRequest::CallToolRequest(rmcp::model::CallToolRequest::new(
+            codex_request("evaluate_script", "same", json!({
+                "function": "async () => { window.codexBusy = 1; await new Promise(resolve => setTimeout(resolve, 5500)); return 'finished'; }"
+            })).await)), rmcp::service::PeerRequestOptions::no_options()).await.unwrap();
+    wait_for_page_counter(page, "codexBusy").await;
+    codex_end(&root, &profile, port, "same").await;
+    active
+        .await_response()
+        .await
+        .expect("cleanup interrupted the active call");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let tabs = browser_tabs(port).await;
+        if !tabs_contain_url(&tabs, "/codex-a") {
+            for url in ["/opencode", "/codex-b", "user-tab"] {
+                assert!(
+                    tabs_contain_url(&tabs, url),
+                    "cleanup closed another owner's tab: {url}"
+                );
+            }
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "queued Codex cleanup did not finish"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    codex_end(&root, &profile, port, "other").await;
+    open_code.cancel().await.unwrap();
+    codex.cancel().await.unwrap();
+    wait_for_broker_exit(&socket, &profile).await;
+    site_task.abort();
+    let _ = site_task.await;
+    std::fs::remove_dir_all(root).unwrap();
 }

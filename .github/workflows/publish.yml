@@ -1,9 +1,12 @@
 name: publish
 
 on:
-  release:
-    types: [published]
   workflow_dispatch:
+    inputs:
+      publish_npm:
+        description: Publish the existing npm package after configuring its trusted publisher
+        default: false
+        type: boolean
 
 jobs:
   publish:
@@ -38,11 +41,6 @@ jobs:
           echo "name=$name" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - if: github.event_name == 'release' && github.event.release.tag_name != format('v{0}', steps.package.outputs.version)
-        run: |
-          echo "::error::Release tag ${{ github.event.release.tag_name }} does not match package version v${{ steps.package.outputs.version }}"
-          exit 1
-
       - id: published
         run: |
           package="${{ steps.package.outputs.name }}@${{ steps.package.outputs.version }}"
@@ -53,8 +51,8 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - if: github.event_name == 'workflow_dispatch'
+      - if: '!inputs.publish_npm'
         run: npm pack --dry-run
 
-      - if: github.event_name == 'release' && steps.published.outputs.exists != 'true'
+      - if: inputs.publish_npm && steps.published.outputs.exists != 'true'
         run: npm publish --access public

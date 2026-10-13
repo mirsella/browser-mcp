@@ -8,7 +8,9 @@ description: Use browser automation to inspect or interact with websites, test r
 Use the browser tools when the task requires rendered state, authentication,
 client-side behavior, layout, accessibility, console output, or network traffic.
 
-OpenCode normally exposes two compact tools:
+OpenCode and Codex expose two compact tools: `help` and `dispatch`. OpenCode
+names them `browser_help` and `browser_dispatch`; Codex namespaces them under
+this plugin's browser MCP server.
 
 - `browser_help` lists action names or loads the current schema for one action.
 - `browser_dispatch` executes an action with `{ action, arguments }`.
@@ -23,6 +25,10 @@ its exact arguments are not already clear. Do not guess argument shapes.
 
 Direct `browser_*` action tools may appear when compact tools are disabled. Use
 them directly with the same workflow.
+
+The host injects conversation identity automatically. Never add hidden routing
+fields. Browser tabs belong to the conversation; Codex subagents share their
+parent conversation's tabs, so coordinate concurrent work using separate pages.
 
 ## Workflow
 

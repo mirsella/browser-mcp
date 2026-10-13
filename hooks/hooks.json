@@ -1,0 +1,19 @@
+{
+  "hooks": {
+    "PreToolUse": [{
+      "matcher": "^mcp__(browser|plugin_browser_browser)__.*$",
+      "hooks": [{
+        "type": "command",
+        "command": "cd \"$PLUGIN_ROOT\" && \"$PLUGIN_ROOT/vendor/browser-mcp\" codex-hook",
+        "timeout": 5
+      }]
+    }],
+    "SessionEnd": [{
+      "hooks": [{
+        "type": "command",
+        "command": "cd \"$PLUGIN_ROOT\" && \"$PLUGIN_ROOT/vendor/browser-mcp\" codex-hook",
+        "timeout": 3
+      }]
+    }]
+  }
+}

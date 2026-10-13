@@ -13,7 +13,7 @@ use std::{
 };
 
 use super::{
-    BrowserProxy, Cli, Config, MAX_SESSION_ID_BYTES, ProcessMode, SESSION_KEY, browser_tool,
+    BrowserProxy, Cli, Config, MAX_SESSION_ID_BYTES, ProcessMode, browser_tool,
     persistence::OwnershipPersistence, validate_config,
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -49,17 +49,46 @@ const HANDSHAKE_MAGIC: &[u8] = b"opencode-browser-mcp\0v5\n";
 const MANAGED_CONFIG_ENV: &str = "OPENCODE_BROWSER_INTERNAL_CONFIG";
 const CONNECT_HANDSHAKE: u8 = 0;
 const RELEASE_HANDSHAKE: u8 = 1;
+const CODEX_RELEASE_HANDSHAKE: u8 = 5;
 const VERSIONED_CONNECT_HANDSHAKE: u8 = 4;
 const ACCEPTED_RESPONSE: u8 = 1;
 const CONFIG_MISMATCH_RESPONSE: u8 = 2;
 const RESTARTING_RESPONSE: u8 = 3;
 const MAX_VERSION_BYTES: usize = 256;
 const MAX_CONFIG_BYTES: usize = 16 * 1024;
-const OPENCODE_PREFIX: &str = "opencode:";
-const MAX_OPENCODE_SESSION_ID_BYTES: usize = MAX_SESSION_ID_BYTES - OPENCODE_PREFIX.len();
 static PACKAGE_VERSION: LazyLock<Version> = LazyLock::new(|| {
     Version::parse(env!("CARGO_PKG_VERSION")).expect("package version must be valid SemVer")
 });
+
+pub(super) const SESSION_KEY: &str = "__opencode_session_id";
+pub(super) const CODEX_SESSION_KEY: &str = "__codex_session_id";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SessionClient {
+    OpenCode,
+    Codex,
+}
+
+impl SessionClient {
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::OpenCode => "opencode:",
+            Self::Codex => "codex:",
+        }
+    }
+
+    pub(super) fn validate_id(self, id: &str) -> Result<()> {
+        if id.is_empty() || id.len() > MAX_SESSION_ID_BYTES - self.prefix().len() {
+            bail!("invalid browser session identifier");
+        }
+        Ok(())
+    }
+
+    fn owner_id(self, id: &str) -> Result<String> {
+        self.validate_id(id)?;
+        Ok(format!("{}{id}", self.prefix()))
+    }
+}
 
 pub(super) async fn run(cli: Cli) -> Result<()> {
     let Cli {
@@ -84,6 +113,7 @@ pub(super) async fn run(cli: Cli) -> Result<()> {
             let paths = RuntimePaths::new(&config)?;
             release_session(&paths, &config, &session_id).await
         }
+        Some(ProcessMode::CodexHook) => super::codex::run(config, profile_override).await,
         None => {
             config.resolve(profile_override).await?;
             validate_config(&config)?;
@@ -853,14 +883,20 @@ impl Drop for ConnectionLease {
 }
 
 fn route_request(mut request: CallToolRequestParams) -> Result<(String, CallToolRequestParams)> {
-    let id = request
-        .arguments
-        .get_or_insert_default()
-        .remove(SESSION_KEY)
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .filter(|id| !id.is_empty() && id.len() <= MAX_OPENCODE_SESSION_ID_BYTES)
-        .ok_or_else(|| anyhow!("browser call is missing the OpenCode session identifier"))?;
-    Ok((format!("{OPENCODE_PREFIX}{id}"), request))
+    let arguments = request.arguments.get_or_insert_default();
+    let (client, id) = match (
+        arguments.remove(SESSION_KEY),
+        arguments.remove(CODEX_SESSION_KEY),
+    ) {
+        (Some(id), None) => (SessionClient::OpenCode, id),
+        (None, Some(id)) => (SessionClient::Codex, id),
+        (Some(_), Some(_)) => bail!("browser call contains conflicting agent session identifiers"),
+        (None, None) => bail!("browser call is missing the OpenCode or Codex session identifier"),
+    };
+    let id = id
+        .as_str()
+        .context("browser session identifier must be a string")?;
+    Ok((client.owner_id(id)?, request))
 }
 
 fn compact_tools() -> Vec<Tool> {
@@ -956,7 +992,7 @@ fn expand_dispatch(
         Some(_) => bail!("browser_dispatch arguments must be an object"),
         None => Default::default(),
     };
-    if arguments.contains_key(SESSION_KEY) {
+    if arguments.contains_key(SESSION_KEY) || arguments.contains_key(CODEX_SESSION_KEY) {
         bail!("browser action arguments contain a reserved routing field");
     }
     request.name = action.into();
@@ -1080,12 +1116,21 @@ async fn serve_connection(
     };
     let compact = match request {
         HandshakeRequest::Connect { direct_tools, .. } => !direct_tools,
-        HandshakeRequest::Release { session_id, .. } => {
-            let result = proxy
-                .release_session(&format!("{OPENCODE_PREFIX}{session_id}"))
-                .await;
-            stream.write_u8(u8::from(result.is_ok())).await?;
-            stream.flush().await?;
+        HandshakeRequest::Release {
+            session_id, client, ..
+        } => {
+            let owner = client.owner_id(&session_id)?;
+            let queued = client == SessionClient::Codex;
+            if queued {
+                // This connection task keeps the broker alive until cleanup completes.
+                stream.write_u8(ACCEPTED_RESPONSE).await?;
+                stream.flush().await?;
+            }
+            let result = proxy.release_session(&owner).await;
+            if !queued {
+                stream.write_u8(u8::from(result.is_ok())).await?;
+                stream.flush().await?;
+            }
             result?;
             return Ok(false);
         }
@@ -1219,6 +1264,7 @@ enum HandshakeRequest {
     },
     Release {
         session_id: String,
+        client: SessionClient,
         config: Config,
     },
 }
@@ -1244,12 +1290,22 @@ async fn write_handshake(stream: &mut UnixStream, request: &HandshakeRequest) ->
             stream.write_u8(u8::from(*direct_tools)).await?;
             write_config(stream, config).await?;
         }
-        HandshakeRequest::Release { session_id, config } => {
+        HandshakeRequest::Release {
+            session_id,
+            client,
+            config,
+        } => {
+            client.validate_id(session_id)?;
             let bytes = session_id.as_bytes();
-            if bytes.is_empty() || bytes.len() > MAX_OPENCODE_SESSION_ID_BYTES {
-                bail!("invalid browser session identifier");
+            stream
+                .write_u8(match client {
+                    SessionClient::OpenCode => RELEASE_HANDSHAKE,
+                    SessionClient::Codex => CODEX_RELEASE_HANDSHAKE,
+                })
+                .await?;
+            if *client == SessionClient::Codex {
+                stream.write_all(&[1, 1]).await?;
             }
-            stream.write_u8(RELEASE_HANDSHAKE).await?;
             stream.write_u32(bytes.len() as u32).await?;
             stream.write_all(bytes).await?;
             write_config(stream, config).await?;
@@ -1285,16 +1341,27 @@ async fn read_handshake(stream: &mut UnixStream) -> Result<HandshakeRequest> {
                 config: read_config(stream).await?,
             })
         }
-        RELEASE_HANDSHAKE => {
+        kind @ (RELEASE_HANDSHAKE | CODEX_RELEASE_HANDSHAKE) => {
+            let client = if kind == RELEASE_HANDSHAKE {
+                SessionClient::OpenCode
+            } else {
+                if stream.read_u8().await? != 1 || stream.read_u8().await? != 1 {
+                    bail!("invalid queued Codex session release");
+                }
+                SessionClient::Codex
+            };
             let length = stream.read_u32().await? as usize;
-            if length == 0 || length > MAX_OPENCODE_SESSION_ID_BYTES {
+            if length == 0 || length > MAX_SESSION_ID_BYTES {
                 bail!("invalid browser session identifier length");
             }
             let mut session_id = vec![0; length];
             stream.read_exact(&mut session_id).await?;
+            let session_id =
+                String::from_utf8(session_id).context("browser session identifier is not UTF-8")?;
+            client.validate_id(&session_id)?;
             Ok(HandshakeRequest::Release {
-                session_id: String::from_utf8(session_id)
-                    .context("browser session identifier is not UTF-8")?,
+                session_id,
+                client,
                 config: read_config(stream).await?,
             })
         }
@@ -1375,9 +1442,7 @@ async fn shutdown_signal() {
 }
 
 async fn release_session(paths: &RuntimePaths, config: &Config, session_id: &str) -> Result<()> {
-    if session_id.is_empty() || session_id.len() > MAX_OPENCODE_SESSION_ID_BYTES {
-        bail!("invalid browser session identifier");
-    }
+    SessionClient::OpenCode.validate_id(session_id)?;
     timeout(RELEASE_CONTROL_TIMEOUT, async {
         loop {
             let result = async {
@@ -1388,6 +1453,7 @@ async fn release_session(paths: &RuntimePaths, config: &Config, session_id: &str
                     &mut stream,
                     &HandshakeRequest::Release {
                         session_id: session_id.to_owned(),
+                        client: SessionClient::OpenCode,
                         config: config.clone(),
                     },
                 )
@@ -1406,6 +1472,35 @@ async fn release_session(paths: &RuntimePaths, config: &Config, session_id: &str
     })
     .await
     .context("timed out waiting for browser session release")?
+}
+
+pub(super) async fn queue_codex_release(
+    mut config: Config,
+    profile: Option<PathBuf>,
+    session_id: String,
+) -> Result<()> {
+    timeout(Duration::from_secs(2), async {
+        // Codex's three-second hook deadline includes configuration and IPC.
+        config.resolve(profile).await?;
+        let paths = RuntimePaths::new(&config)?;
+        // A stopped broker has no live owned tabs. Cleanup must not start a browser.
+        let Some(mut stream) = connect_or_absent(&paths.socket).await? else {
+            return Ok(());
+        };
+        validate_broker_peer(&stream)?;
+        write_handshake(
+            &mut stream,
+            &HandshakeRequest::Release {
+                session_id,
+                client: SessionClient::Codex,
+                config,
+            },
+        )
+        .await?;
+        expect_acceptance(&mut stream, "Codex session release").await
+    })
+    .await
+    .context("timed out queueing Codex browser session release")?
 }
 
 fn is_transient_disconnect(error: &anyhow::Error) -> bool {
@@ -1461,7 +1556,7 @@ mod tests {
                 lock: PathBuf::new(),
             },
             direct_tools: false,
-            config: Cli::try_parse_from(["opencode-browser-mcp", "--headless=true"])
+            config: Cli::try_parse_from(["browser-mcp", "--headless=true"])
                 .unwrap()
                 .config,
             broker: Mutex::new(Some(Arc::new(client.unwrap()))),
@@ -1511,6 +1606,87 @@ mod tests {
     }
 
     #[test]
+    fn agent_session_namespaces_do_not_collide_or_allow_ambiguous_routing() {
+        let request = CallToolRequestParams::new("help").with_arguments(
+            json!({(CODEX_SESSION_KEY): "session-a"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        let (id, request) = route_request(request).unwrap();
+        assert_eq!(id, "codex:session-a");
+        assert!(request.arguments.unwrap().is_empty());
+        for arguments in [
+            json!({(CODEX_SESSION_KEY): "session-a", (SESSION_KEY): "session-a"}),
+            json!({(CODEX_SESSION_KEY): null}),
+            json!({(CODEX_SESSION_KEY): ""}),
+        ] {
+            assert!(
+                route_request(
+                    CallToolRequestParams::new("help")
+                        .with_arguments(arguments.as_object().unwrap().clone())
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn release_handshakes_preserve_existing_wire_formats() {
+        let config = Cli::try_parse_from(["browser-mcp", "--headless=true"])
+            .unwrap()
+            .config;
+        let config_bytes = serde_json::to_vec(&config).unwrap();
+        for (client, header) in [
+            (SessionClient::OpenCode, &[1][..]),
+            (SessionClient::Codex, &[5, 1, 1][..]),
+        ] {
+            let mut fixture = b"opencode-browser-mcp\0v5\n".to_vec();
+            fixture.extend_from_slice(header);
+            fixture.extend_from_slice(&[0, 0, 0, 4]);
+            fixture.extend_from_slice(b"same");
+            fixture.extend_from_slice(&(config_bytes.len() as u32).to_be_bytes());
+            fixture.extend_from_slice(&config_bytes);
+
+            let (mut writer, mut reader) = UnixStream::pair().unwrap();
+            write_handshake(
+                &mut writer,
+                &HandshakeRequest::Release {
+                    session_id: "same".to_owned(),
+                    client,
+                    config: config.clone(),
+                },
+            )
+            .await
+            .unwrap();
+            let mut actual = vec![0; fixture.len()];
+            reader.read_exact(&mut actual).await.unwrap();
+            assert_eq!(actual, fixture);
+
+            let (mut writer, mut reader) = UnixStream::pair().unwrap();
+            writer.write_all(&fixture).await.unwrap();
+            let HandshakeRequest::Release {
+                session_id,
+                client: actual_client,
+                config: actual_config,
+            } = read_handshake(&mut reader).await.unwrap()
+            else {
+                panic!("expected release")
+            };
+            assert_eq!(session_id, "same");
+            assert_eq!(actual_client, client);
+            assert_eq!(actual_config, config);
+        }
+        for flags in [[0, 0], [0, 1], [1, 0], [2, 1]] {
+            let (mut writer, mut reader) = UnixStream::pair().unwrap();
+            writer.write_all(HANDSHAKE_MAGIC).await.unwrap();
+            writer.write_u8(CODEX_RELEASE_HANDSHAKE).await.unwrap();
+            writer.write_all(&flags).await.unwrap();
+            assert!(read_handshake(&mut reader).await.is_err());
+        }
+    }
+
+    #[test]
     fn compact_interface_validates_and_expands_dispatch() {
         let tools = [Tool::new(
             "navigate_page",
@@ -1544,6 +1720,7 @@ mod tests {
             json!({"action": "missing"}),
             json!({"action": "navigate_page", "arguments": []}),
             json!({"action": "navigate_page", "arguments": {(SESSION_KEY): "forged"}}),
+            json!({"action": "navigate_page", "arguments": {(CODEX_SESSION_KEY): "forged"}}),
         ] {
             let request = CallToolRequestParams::new("dispatch")
                 .with_arguments(arguments.as_object().unwrap().clone());
@@ -1620,7 +1797,7 @@ mod tests {
 
     #[tokio::test]
     async fn versioned_connect_accepts_compatible_adapters_and_restarts_for_newer_ones() {
-        let config = Cli::try_parse_from(["opencode-browser-mcp", "--headless=true"])
+        let config = Cli::try_parse_from(["browser-mcp", "--headless=true"])
             .expect("parse test configuration")
             .config;
         let broker_version = Version::parse("2.0.0").unwrap();
@@ -1661,7 +1838,7 @@ mod tests {
 
     #[tokio::test]
     async fn versioned_connect_distinguishes_legacy_disconnects() {
-        let config = Cli::try_parse_from(["opencode-browser-mcp", "--headless=true"])
+        let config = Cli::try_parse_from(["browser-mcp", "--headless=true"])
             .expect("parse test configuration")
             .config;
         let (mut client, mut server) = UnixStream::pair().expect("create broker socket pair");

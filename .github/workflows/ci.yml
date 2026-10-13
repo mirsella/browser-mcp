@@ -39,9 +39,18 @@ jobs:
       - name: Test packed OpenCode plugin export
         run: |
           tarball=$(npm pack --json --ignore-scripts | node -e 'let data=""; process.stdin.on("data", chunk => data += chunk); process.stdin.on("end", () => { const parsed = JSON.parse(data); const item = Array.isArray(parsed) ? parsed[0] : Object.values(parsed)[0]; console.log(item.filename) })')
-          mkdir /tmp/opencode-browser-mcp-package-test
-          cd /tmp/opencode-browser-mcp-package-test
+          mkdir /tmp/browser-mcp-package-test
+          cd /tmp/browser-mcp-package-test
           bun init -y
           bun add "$GITHUB_WORKSPACE/$tarball"
           bun -e 'import plugin from "@mirsella/opencode-browser-mcp/server"; if (plugin.id !== "@mirsella/opencode-browser-mcp" || typeof plugin.server !== "function") process.exit(1)'
-          ./node_modules/@mirsella/opencode-browser-mcp/vendor/opencode-browser-mcp --version
+          ./node_modules/@mirsella/opencode-browser-mcp/vendor/browser-mcp --version
+      - name: Checksum release package
+        run: sha256sum mirsella-opencode-browser-mcp-*.tgz > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-package
+          path: |
+            mirsella-opencode-browser-mcp-*.tgz
+            SHA256SUMS
+          if-no-files-found: error

@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 
 const SESSION_KEY = "__opencode_session_id";
 const SKILLS_PATH = fileURLToPath(new URL("../skills", import.meta.url));
-const MCP_CLI = fileURLToPath(new URL("../vendor/opencode-browser-mcp", import.meta.url));
+const MCP_CLI = fileURLToPath(new URL("../vendor/browser-mcp", import.meta.url));
 const DISPATCH_TOOL = "browser_dispatch";
 const DIRECT_TOOLS = `
 	browser_click browser_close_page browser_drag browser_emulate browser_evaluate_script browser_fill browser_fill_form

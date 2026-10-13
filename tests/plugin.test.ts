@@ -40,7 +40,7 @@ function expectRouting(
 	directTools: boolean,
 ) {
 	const [executable, ...arguments_] = config.mcp.browser.command;
-	expect(String(executable).endsWith("/vendor/opencode-browser-mcp")).toBeTrue();
+	expect(String(executable).endsWith("/vendor/browser-mcp")).toBeTrue();
 	expect(arguments_).toEqual(directTools ? ["--direct-tools"] : []);
 }
 

@@ -2,7 +2,7 @@
 
 ## Reporting a vulnerability
 
-Please use [GitHub private vulnerability reporting](https://github.com/mirsella/opencode-browser-mcp/security/advisories/new).
+Please use [GitHub private vulnerability reporting](https://github.com/mirsella/browser-mcp/security/advisories/new).
 Do not open a public issue for a vulnerability that exposes browser data,
 credentials, local files, or cross-session tabs.
 

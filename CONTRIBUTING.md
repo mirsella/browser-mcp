@@ -79,14 +79,12 @@ npm pack --dry-run
 
 ## Releases
 
-Releases are published from GitHub Actions through npm trusted publishing. Do
-not add an npm token to the repository or workflow.
+GitHub releases reuse the package tested by CI. Push a versioned commit to
+`main`, wait for CI, then dispatch `release.yml` with its full `commit` SHA.
+The workflow verifies that commit is still main and attaches the tested
+package and `SHA256SUMS`.
 
-1. Update npm package `@mirsella/opencode-browser-mcp` and Cargo package
-   `opencode-browser-mcp` to the same version in `package.json`, `Cargo.toml`,
-   and `Cargo.lock`.
-2. Run the Rust checks, `bun test tests/plugin.test.ts`, headed E2E test, and
-   `npm pack --dry-run`.
-3. Push the release commit.
-4. Create a GitHub release tagged `v<version>`.
-5. The `publish` workflow builds the static binary and publishes with OIDC.
+Keep npm, Cargo, and Codex plugin versions synchronized. npm names remain
+unchanged for now. npm publication is a separate, explicit `publish.yml`
+dispatch with `publish_npm=true`; Browser MCP's trusted publisher must first
+be updated for the renamed repository. Do not add an npm token.

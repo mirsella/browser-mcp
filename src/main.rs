@@ -35,7 +35,6 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 
-const SESSION_KEY: &str = "__opencode_session_id";
 const INTERNAL_URL: &str = "about:blank";
 const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const WORKER_START_TIMEOUT: Duration = Duration::from_secs(30);
@@ -140,6 +139,7 @@ fn browser_profile(config_home: &Path, executable: &Path) -> PathBuf {
 
 mod broker;
 mod cdp;
+mod codex;
 mod persistence;
 use cdp::{SessionLayout, TargetId, TargetTracker};
 use persistence::{OwnershipPersistence, PersistedSession, RestoredState};
@@ -161,9 +161,11 @@ struct Cli {
 enum ProcessMode {
     #[command(hide = true)]
     ManagedBroker,
-    /// Release the tabs owned by an OpenCode session.
+    /// Release the tabs owned by an agent session.
     #[command(hide = true)]
     ReleaseSession { session_id: String },
+    /// Handle a Codex browser lifecycle hook on stdin.
+    CodexHook,
 }
 
 #[derive(Clone, Debug, Args, Deserialize, Eq, PartialEq, Serialize)]
@@ -597,7 +599,7 @@ impl ClientHandler for DownstreamClient {
     fn get_info(&self) -> ClientInfo {
         ClientInfo::new(
             ClientCapabilities::builder().enable_roots().build(),
-            Implementation::new("opencode-browser-mcp", env!("CARGO_PKG_VERSION")),
+            Implementation::new("browser-mcp", env!("CARGO_PKG_VERSION")),
         )
     }
 
@@ -1953,7 +1955,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "opencode_browser_mcp=info".into()),
+                .unwrap_or_else(|_| "browser_mcp=info".into()),
         )
         .with_writer(std::io::stderr)
         .init();

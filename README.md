@@ -1,24 +1,24 @@
-# opencode-browser-mcp
+# Browser MCP
 
 [![npm](https://img.shields.io/npm/v/@mirsella/opencode-browser-mcp)](https://www.npmjs.com/package/@mirsella/opencode-browser-mcp)
-[![CI](https://github.com/mirsella/opencode-browser-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/mirsella/opencode-browser-mcp/actions/workflows/ci.yml)
+[![CI](https://github.com/mirsella/browser-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/mirsella/browser-mcp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-One shared browser profile with separate tab ownership for every OpenCode
-session. The plugin wraps
+One shared browser profile with separate tab ownership for OpenCode sessions
+and Codex conversations. The plugin wraps
 [`chrome-devtools-mcp`](https://github.com/ChromeDevTools/chrome-devtools-mcp)
 and routes each conversation through its own browser tabs while sharing cookies,
 logins, local storage, cache, and extensions.
 
 ## Requirements
 
-- OpenCode 1.18 or newer
+- OpenCode 1.18 or newer, or Codex with plugin and hook support
 - Linux x64
 - Bun
 - A local Chromium-family browser
 - A graphical session, unless `OPENCODE_BROWSER_HEADLESS=true`
 
-## Setup
+## OpenCode setup
 
 Add the plugin to `opencode.json`. The browser server is disabled by default,
 so the entry shows up in `opencode mcp list` as disabled and the skill is
@@ -34,10 +34,51 @@ skipped. Opt in with plugin options:
 Restart OpenCode after changing its configuration. That is the complete setup.
 You do not need a separate installation, broker command, or background service.
 
-The first OpenCode adapter starts the packaged native broker automatically.
-Concurrent OpenCode instances converge on the same private socket and browser
+The first adapter starts the packaged native broker automatically.
+Concurrent Codex and OpenCode instances converge on the same private socket and browser
 profile. The broker remains available while at least one adapter is connected,
 then closes the browser and exits shortly after the final adapter disconnects.
+
+## Codex setup
+
+The release tarball contains the executable, both integrations, and a local
+Codex marketplace. Download it from [GitHub Releases](https://github.com/mirsella/browser-mcp/releases),
+extract it to a permanent directory, then register that directory:
+
+```sh
+codex plugin marketplace add /path/to/browser-mcp
+codex plugin add browser@browser-mcp
+```
+
+The npm package keeps its current name, `@mirsella/opencode-browser-mcp`.
+To use a GitHub release in OpenCode, set the plugin entry to the `file:///absolute/path`
+of its unpacked directory instead of the npm name.
+
+For a source checkout, build and stage the binary first (`bun run build:native`
+and `bun run stage:native`). Use a packaged directory for installation so
+compiler outputs are not copied into Codex's plugin cache.
+
+The installed plugin is enabled by default. Open `/hooks` in Codex to review
+and trust its two hooks, then restart Codex. They inject the conversation ID
+before browser calls and release owned tabs at `SessionEnd`. Browser calls
+without an injected identity fail closed. The plugin exposes compact `help`
+and `dispatch` tools and loads the same browser automation skill as OpenCode.
+
+Codex and OpenCode use separate ownership namespaces while sharing the existing
+broker, profile, cookies and logins. Codex's hook API identifies subagents with
+their parent conversation ID, so subagents share that conversation's tabs.
+Use separate pages when they work concurrently.
+
+Codex runs `SessionEnd` on normal shutdown, on archive/delete of an open
+conversation, or after 30 minutes idle with no client connected. Its hook has
+a three-second deadline: the broker acknowledges cleanup promptly, then waits
+for active calls before closing only that conversation's owned tabs. Cleanup
+does not start a broker when none is running. Crashes still use normal broker
+shutdown and idle cleanup.
+
+The Codex MCP entry uses a 540-second tool timeout. Add `--direct-tools` to its
+arguments when configuring per-action Codex tool approval rules; compact
+dispatch has one approval rule for all actions.
 
 ## Plugin behavior
 
@@ -127,7 +168,8 @@ browser it passes only a fixed allowlist of display and desktop variables. The
 current process environment stays authoritative; missing values are recovered
 from the current user session when available.
 
-Optional environment variables inherited from OpenCode:
+Configuration variables inherited from either host (the existing names are
+shared by both integrations):
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -137,7 +179,7 @@ Optional environment variables inherited from OpenCode:
 | `OPENCODE_BROWSER_SESSION_LAYOUT` | `shared-window` | `shared-window` or `window-per-session` |
 | `OPENCODE_BROWSER_CDP_PORT` | `9222` | Loopback CDP port |
 | `OPENCODE_BROWSER_IDLE_MINUTES` | `30` | Fallback cleanup for routed sessions |
-| `OPENCODE_BROWSER_MAX_PAGES` | `5` | Max owned tabs per OpenCode session |
+| `OPENCODE_BROWSER_MAX_PAGES` | `5` | Max owned tabs per agent session |
 | `OPENCODE_BROWSER_STARTUP_SECONDS` | `20` | Browser startup deadline |
 | `OPENCODE_BROWSER_OPERATION_SECONDS` | `540` | Browser operation deadline |
 | `OPENCODE_BROWSER_DOWNSTREAM_COMMAND` | `bunx` | DevTools MCP launcher |

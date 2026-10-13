@@ -5,9 +5,9 @@ import { fileURLToPath } from "node:url";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const source = resolve(
 	root,
-	"target/x86_64-unknown-linux-musl/release/opencode-browser-mcp",
+	"target/x86_64-unknown-linux-musl/release/browser-mcp",
 );
-const destination = resolve(root, "vendor/opencode-browser-mcp");
+const destination = resolve(root, "vendor/browser-mcp");
 
 await mkdir(dirname(destination), { recursive: true });
 await copyFile(source, destination);

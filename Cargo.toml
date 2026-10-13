@@ -1,11 +1,11 @@
 [package]
-name = "opencode-browser-mcp"
-version = "0.8.0"
+name = "browser-mcp"
+version = "0.9.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Session-isolated browser automation over MCP and Chrome DevTools Protocol"
 license = "MIT"
-repository = "https://github.com/mirsella/opencode-browser-mcp"
+repository = "https://github.com/mirsella/browser-mcp"
 
 [dependencies]
 anyhow = "1.0"
