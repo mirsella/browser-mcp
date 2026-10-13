@@ -88,3 +88,6 @@ Keep npm, Cargo, and Codex plugin versions synchronized. npm names remain
 unchanged for now. npm publication is a separate, explicit `publish.yml`
 dispatch with `publish_npm=true`; Browser MCP's trusted publisher must first
 be updated for the renamed repository. Do not add an npm token.
+
+CI pins Chrome for Testing 155.0.8059.39 for headed browser tests. Its renderer
+crash events are verified locally; the runner image currently ships Chrome 154.
