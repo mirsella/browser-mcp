@@ -1532,7 +1532,7 @@ async fn exports_allow_workspace_and_scratch_but_reject_outside_paths() {
             .contains("compact export marker")
     );
 
-    let outside = PathBuf::from(std::env::var_os("HOME").expect("test requires HOME"))
+    let outside = std::path::PathBuf::from(std::env::var_os("HOME").expect("test requires HOME"))
         .join(format!("browser-mcp-forbidden-{}.txt", std::process::id()));
     std::os::unix::fs::symlink(outside.parent().unwrap(), scratch.join("outside")).unwrap();
     for path in [
