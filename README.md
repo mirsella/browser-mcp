@@ -223,8 +223,9 @@ permissions, history, and downloads. Browser content remains untrusted and may
 contain prompt injection. The private same-UID socket prevents access by other
 local users, but it does not isolate processes already running as your Unix user.
 
-File exports are limited to the conversation's workspace and `/tmp/opencode`.
-The latter is a shared scratch directory for small, temporary snapshots,
+File exports can use the conversation's workspace and `/tmp/opencode`.
+Chrome DevTools also permits its OS temporary directory. `/tmp/opencode`
+is a shared scratch directory for small, temporary snapshots,
 screenshots, and network responses. Clean up exported files when finished;
 store larger or lasting artifacts in the workspace.
 
