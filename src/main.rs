@@ -591,7 +591,7 @@ async fn terminate_child(child: &mut Child) {
 
 #[derive(Clone)]
 struct DownstreamClient {
-    root_uri: String,
+    root_uris: Vec<String>,
 }
 
 #[allow(deprecated)]
@@ -607,7 +607,9 @@ impl ClientHandler for DownstreamClient {
         &self,
         _: RequestContext<RoleClient>,
     ) -> Result<ListRootsResult, rmcp::ErrorData> {
-        Ok(ListRootsResult::new(vec![Root::new(&self.root_uri)]))
+        Ok(ListRootsResult::new(
+            self.root_uris.iter().map(Root::new).collect(),
+        ))
     }
 }
 
@@ -725,6 +727,17 @@ async fn connect_tracker(
 }
 
 async fn spawn_downstream(config: &Config, workspace: &std::path::Path) -> Result<Downstream> {
+    let scratch = Path::new("/tmp/opencode");
+    std::fs::create_dir_all(scratch)
+        .context("failed to create browser export scratch directory")?;
+    let root_uris = [workspace, scratch]
+        .into_iter()
+        .map(|path| {
+            Url::from_directory_path(path)
+                .map(|uri| uri.to_string())
+                .map_err(|_| anyhow!("failed to convert {} to a file URL", path.display()))
+        })
+        .collect::<Result<Vec<_>>>()?;
     let mut command = Command::new(&config.downstream_command);
     command
         .arg("chrome-devtools-mcp@1.6.0")
@@ -741,12 +754,9 @@ async fn spawn_downstream(config: &Config, workspace: &std::path::Path) -> Resul
         .stderr(Stdio::inherit());
     let transport =
         TokioChildProcess::new(command).context("failed to start Chrome DevTools MCP")?;
-    let root_uri = Url::from_directory_path(workspace)
-        .map_err(|_| anyhow!("failed to convert {} to a file URL", workspace.display()))?
-        .to_string();
     timeout(
         WORKER_START_TIMEOUT,
-        DownstreamClient { root_uri }.serve(transport),
+        DownstreamClient { root_uris }.serve(transport),
     )
     .await
     .context("timed out initializing Chrome DevTools MCP")?

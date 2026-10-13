@@ -1470,6 +1470,101 @@ async fn isolates_sessions_in_both_window_layouts() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Chromium and the real Chrome DevTools MCP worker"]
+async fn exports_allow_workspace_and_scratch_but_reject_outside_paths() {
+    let root = std::env::temp_dir().join(format!("browser-mcp-exports-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let profile = root.join("profile");
+    let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let direct = client(&root, true, &profile, port, "shared-window").await;
+    let compact = client(&root, false, &profile, port, "shared-window").await;
+    let scratch =
+        Path::new("/tmp/opencode").join(format!("browser-mcp-exports-{}", std::process::id()));
+    std::fs::create_dir(&scratch).unwrap();
+    let workspace_file = std::env::current_dir()
+        .unwrap()
+        .join(format!(".browser-mcp-export-{}.txt", std::process::id()));
+    call_ok(
+        &direct,
+        "navigate_page",
+        "exports",
+        json!({
+            "url": "data:text/html,<title>Export%20boundary</title><p>scratch export marker</p>"
+        }),
+    )
+    .await;
+    call_ok(
+        &direct,
+        "take_snapshot",
+        "exports",
+        json!({"filePath": workspace_file}),
+    )
+    .await;
+    assert!(
+        std::fs::read_to_string(&workspace_file)
+            .unwrap()
+            .contains("scratch export marker")
+    );
+    codex_call(
+        &compact,
+        "navigate_page",
+        "exports",
+        json!({
+            "url": "data:text/html,<title>Compact%20export</title><p>compact export marker</p>"
+        }),
+    )
+    .await;
+    let scratch_file = scratch.join("compact.txt");
+    codex_call(
+        &compact,
+        "take_snapshot",
+        "exports",
+        json!({"filePath": scratch_file}),
+    )
+    .await;
+    assert!(
+        std::fs::read_to_string(&scratch_file)
+            .unwrap()
+            .contains("compact export marker")
+    );
+
+    let outside =
+        Path::new("/tmp").join(format!("browser-mcp-forbidden-{}.txt", std::process::id()));
+    std::os::unix::fs::symlink("/tmp", scratch.join("outside")).unwrap();
+    for path in [
+        &outside,
+        &scratch.join("outside").join(outside.file_name().unwrap()),
+    ] {
+        let result = direct
+            .call_tool(request(
+                "take_snapshot",
+                "exports",
+                json!({"filePath": path}),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            result.is_error.unwrap_or(false),
+            "export escaped roots: {}",
+            text(&result)
+        );
+        assert!(!outside.exists(), "outside export was written");
+    }
+    codex_end(&root, &profile, port, "exports").await;
+    direct.cancel().await.unwrap();
+    compact.cancel().await.unwrap();
+    wait_for_broker_exit(&broker_socket(&profile), &profile).await;
+    std::fs::remove_file(workspace_file).unwrap();
+    std::fs::remove_dir_all(scratch).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Chromium and the real Chrome DevTools MCP worker"]
 async fn codex_hooks_share_profile_isolate_sessions_and_queue_cleanup() {
     let root =
         std::env::temp_dir().join(format!("opencode-browser-mcp-codex-{}", std::process::id()));
