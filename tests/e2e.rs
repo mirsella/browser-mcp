@@ -1532,13 +1532,11 @@ async fn exports_allow_workspace_and_scratch_but_reject_outside_paths() {
             .contains("compact export marker")
     );
 
-    let outside = std::path::PathBuf::from(std::env::var_os("HOME").expect("test requires HOME"))
-        .join(format!("browser-mcp-forbidden-{}.txt", std::process::id()));
-    std::os::unix::fs::symlink(outside.parent().unwrap(), scratch.join("outside")).unwrap();
-    for path in [
-        &outside,
-        &scratch.join("outside").join(outside.file_name().unwrap()),
-    ] {
+    let home = std::env::var_os("HOME").expect("test requires HOME");
+    let filename = format!("browser-mcp-forbidden-{}.txt", std::process::id());
+    let outside = Path::new(&home).join(&filename);
+    std::os::unix::fs::symlink(&home, scratch.join("outside")).unwrap();
+    for path in [&outside, &scratch.join("outside").join(filename)] {
         let result = direct
             .call_tool(request(
                 "take_snapshot",
