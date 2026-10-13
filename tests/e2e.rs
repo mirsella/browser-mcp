@@ -623,6 +623,14 @@ async fn recovers_from_browser_worker_and_broker_process_deaths() {
         .unwrap();
     renderer
         .send(Message::Text(
+            json!({"id": 0, "method": "Inspector.enable"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    renderer
+        .send(Message::Text(
             json!({"id": 1, "method": "Page.crash"}).to_string().into(),
         ))
         .await

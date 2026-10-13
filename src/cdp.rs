@@ -828,7 +828,7 @@ async fn handle_message(
                 return;
             }
             let mut answer = if let Some(error) = message.get("error") {
-                Err(anyhow!("CDP command failed: {error}"))
+                Err(anyhow!("CDP {} command failed: {error}", pending.method))
             } else {
                 let result = message.get("result").cloned().unwrap_or(Value::Null);
                 if pending.method == "Target.getTargets" {
