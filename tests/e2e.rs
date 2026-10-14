@@ -688,6 +688,60 @@ async fn recovers_from_browser_worker_and_broker_process_deaths() {
         .unwrap();
     let generation = browser_json(port, "version").await;
 
+    // Cancelling a call queued behind an active action must prevent its effects.
+    let active = a
+        .send_cancellable_request(
+            rmcp::model::ClientRequest::CallToolRequest(rmcp::model::CallToolRequest::new(request(
+                "evaluate_script",
+                "crash-a",
+                json!({"function": "async () => { window.queueActive = 1; await new Promise(resolve => { window.releaseQueue = resolve; }); return 'released'; }"}),
+            ))),
+            rmcp::service::PeerRequestOptions::no_options(),
+        )
+        .await
+        .unwrap();
+    wait_for_page_counter(page_a, "queueActive").await;
+    let cancelled = a
+        .send_cancellable_request(
+            rmcp::model::ClientRequest::CallToolRequest(rmcp::model::CallToolRequest::new(
+                request(
+                    "evaluate_script",
+                    "crash-a",
+                    json!({"function": "() => { window.cancelledQueuedAction = 1; }"}),
+                ),
+            )),
+            rmcp::service::PeerRequestOptions::no_options(),
+        )
+        .await
+        .unwrap();
+    // Let the request reach the broker's session queue before cancelling it.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    cancelled
+        .cancel(Some("caller stopped".into()))
+        .await
+        .unwrap();
+    // Let cancellation reach the session queue before releasing the blocking call.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    cdp_request(
+        page_a["webSocketDebuggerUrl"].as_str().unwrap(),
+        "Runtime.evaluate",
+        json!({"expression": "window.releaseQueue()"}),
+    )
+    .await;
+    active.await_response().await.unwrap();
+    let cancelled_effect = call_ok(
+        &a,
+        "evaluate_script",
+        "crash-a",
+        json!({"function": "() => window.cancelledQueuedAction === undefined"}),
+    )
+    .await;
+    assert!(
+        text(&cancelled_effect).contains("\ntrue\n"),
+        "cancelled queued action executed: {}",
+        text(&cancelled_effect)
+    );
+
     // Observe the crash at browser scope: a renderer socket may disappear first.
     let (mut browser_events, _) =
         connect_async(generation["webSocketDebuggerUrl"].as_str().unwrap())
