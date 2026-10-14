@@ -3,20 +3,21 @@ import plugin from "../plugin/browser-routing";
 async function setup(options = {}, permissions: object[] = [], existing?: any, catalog?: Promise<any>, mcpList?: () => Promise<any>) {
   const hooks: Record<string, Function> = {};
   let registration = existing;
+  let reloads = 0;
   const skills: any[] = [];
   let transform: Function;
   const connected = async () => ({data:[{name:"browser",status:{status:"connected"}}]});
   const editor = { get: () => existing, set: (_name: string, value: unknown) => { registration = value; } };
   const cleanup = await plugin.setup({ options,
     agent: { list: async () => catalog ? await catalog : ({data:[{permissions}]}) },
-    mcp: { transform: async (fn: Function) => { transform = fn; fn(editor); }, reload: async () => transform(editor), list: mcpList ?? connected },
+    mcp: { transform: async (fn: Function) => { transform = fn; fn(editor); }, reload: async () => { reloads++; transform(editor); }, list: mcpList ?? connected },
     skill: { transform: async (fn: Function) => fn({add: (skill: unknown) => skills.push(skill)}) },
     tool: { hook: async (name: string, fn: Function) => { hooks[name] = fn; } },
     session: { hook: async (name: string, fn: Function) => { hooks[name] = fn; } },
     event: { subscribe: async function* () {} },
   } as any);
   if (!catalog) await hooks.prompt?.();
-  return { hooks, registration, skills, cleanup };
+  return { hooks, registration, skills, cleanup, get reloads() { return reloads; } };
 }
 test("registers native MCP, skill and session routing", async () => {
   const h = await setup();
@@ -71,38 +72,24 @@ test("recovery stays quiet until the browser server has been seen", async () => 
   } finally { errors.mockRestore(); await h.cleanup?.(); }
 });
 
-test("prompt continues while adapter recovery is stalled", async () => {
-  let reloads = 0;
-  const stalled = new Promise<any>(() => {});
-  const hooks: Record<string, Function> = {};
-  let registration: any;
-  const editor = { get: () => undefined, set: (_name: string, value: unknown) => { registration = value; } };
+test("prompts and disposal finish while adapter recovery is stalled", async () => {
+  const { promise, resolve } = Promise.withResolvers<any>();
   const originalTimeout = globalThis.setTimeout;
   const deadlines = spyOn(globalThis, "setTimeout").mockImplementation(
     ((handler: any, delay: any, ...args: any[]) =>
       originalTimeout(handler, delay === 5_000 ? 0 : delay, ...args)) as typeof setTimeout,
   );
+  let h: Awaited<ReturnType<typeof setup>> | undefined;
   try {
-    await plugin.setup({ options: {},
-      agent: { list: async () => ({data:[{permissions:[]}]}) },
-      mcp: {
-        transform: async (fn: Function) => fn(editor),
-        reload: async () => { reloads++; },
-        list: async () => stalled,
-      },
-      skill: { transform: async (fn: Function) => fn({add: () => {}}) },
-      tool: { hook: async (name: string, fn: Function) => { hooks[name] = fn; } },
-      session: { hook: async (name: string, fn: Function) => { hooks[name] = fn; } },
-      event: { subscribe: async function* () {} },
-    } as any);
-    // The background schedule() recovery also stalls; only the prompt path matters here.
-    // No cleanup: it awaits the stalled recovery and would hang the suite.
+    h = await setup({}, [], undefined, undefined, () => promise);
     const started = Date.now();
-    await hooks.prompt();
-    expect(reloads).toBe(0);
-    // A wrong deadline (e.g. 60s) would still pass functionally; pin the bound.
+    await h.hooks.prompt();
     expect(Date.now() - started).toBeLessThan(5_000);
+    expect(h.reloads).toBe(0);
+    await h.cleanup?.();
   } finally {
+    resolve({ data: [] });
+    await h?.cleanup?.();
     deadlines.mockRestore();
   }
 });

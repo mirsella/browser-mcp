@@ -33,7 +33,7 @@ export default Plugin.define({
     let active = enabled;
     await ctx.mcp.transform(editor => {
       const existing = editor.get("browser");
-      if (existing && (existing.type !== "local" || existing.command[0] !== binary)) {
+      if (existing?.type === "remote" || (existing && existing.command[0] !== binary)) {
         throw new Error("Browser MCP cannot replace an incompatible mcp.servers.browser configuration");
       }
       active = !(existing?.disabled ?? !enabled);
@@ -53,9 +53,9 @@ export default Plugin.define({
         const frontmatter = text.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
         if (!frontmatter) throw new Error(`Missing skill frontmatter: ${path}`);
         const meta = parse(frontmatter[1]);
-        if (typeof meta.name !== "string" || typeof meta.description !== "string") throw new Error(`Invalid skill metadata: ${path}`);
+        if (!meta || typeof meta.name !== "string" || typeof meta.description !== "string") throw new Error(`Invalid skill metadata: ${path}`);
         return Skill.Info.make({ id: Skill.ID.make(meta.name), name: Skill.Name.make(meta.name),
-          description: meta.description, path: path as never, content: text.slice(frontmatter[0].length) });
+          description: meta.description, path: Skill.Info.fields.path.make(path), content: text.slice(frontmatter[0].length) });
       }));
       await ctx.skill.transform(editor => { for (const skill of registered) editor.add(skill); });
     }
@@ -103,13 +103,21 @@ export default Plugin.define({
     };
     // Recovery must never stall a prompt: a wedged adapter keeps retrying in
     // the background while chat continues within a short deadline.
-    const recoverSoon = () => Promise.race([
-      recover(),
-      new Promise<void>(resolve => { const deadline = setTimeout(resolve, 5_000); deadline.unref(); }),
-    ]);
+    const recoverSoon = async () => {
+      let deadline: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          recover(),
+          new Promise<void>(resolve => { deadline = setTimeout(resolve, 5_000); deadline.unref(); }),
+        ]);
+      } finally {
+        if (deadline) clearTimeout(deadline);
+      }
+    };
     // Catalog reads wait for plugin bootstrap. Do not await them inside setup.
     const checkPolicy = async () => {
-      const next = compactTools && !partialPolicy((await ctx.agent.list()).data);
+      if (!compactTools || controller.signal.aborted) return;
+      const next = !partialPolicy((await ctx.agent.list()).data);
       if (controller.signal.aborted || next === compact) return;
       compact = next;
       if (!compact) console.warn("Browser MCP uses direct tools to preserve per-action permissions");
@@ -130,6 +138,6 @@ export default Plugin.define({
     };
     void events().catch(error => { if (!controller.signal.aborted) console.error("Browser MCP event subscription failed", error); });
     schedule();
-    return async () => { controller.abort(); if (timer) clearTimeout(timer); await recovering; };
+    return () => { controller.abort(); if (timer) clearTimeout(timer); };
   },
 });
