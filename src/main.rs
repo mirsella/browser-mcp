@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
+    future::Future,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Stdio,
@@ -30,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{
     process::{Child, Command},
-    sync::{Mutex, RwLock, watch},
+    sync::{Mutex, MutexGuard, RwLock, watch},
     time::{sleep, timeout},
 };
 use tracing::{error, info, warn};
@@ -1116,13 +1117,37 @@ impl BrowserProxy {
         }
     }
 
+    /// Acquires a session's action lock, giving up after `budget` or when the
+    /// client cancels. A busy session fails its waiters instead of holding
+    /// cancelled callers until they time out. Callers still bail out before
+    /// this point when cancellation is already known, so dead clients never
+    /// reach session state.
+    async fn acquire_session_lock<'a>(
+        session: &'a Mutex<Option<Session>>,
+        budget: Duration,
+        cancelled: impl Future<Output = ()>,
+    ) -> Result<MutexGuard<'a, Option<Session>>> {
+        tokio::select! {
+            biased;
+            _ = cancelled => bail!("browser request cancelled before dispatch"),
+            locked = timeout(budget, session.lock()) => {
+                locked.map_err(|_| anyhow!("browser session is busy with another action"))
+            }
+        }
+    }
+
     async fn route_call(
         &self,
         catalog: &ToolCatalog,
         workspace: &std::path::Path,
         id: &str,
         request: CallToolRequestParams,
+        context: &RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResult> {
+        // A dead client must not create session state below.
+        if context.ct.is_cancelled() {
+            bail!("browser request cancelled before dispatch");
+        }
         if browser_tool(&catalog.tools, request.name.as_ref()).is_none() {
             bail!("browser tool is not exposed: {}", request.name);
         }
@@ -1139,7 +1164,19 @@ impl BrowserProxy {
             }
         }; // Must outlive every browser operation below.
         let tracker = &*tracker_lease;
-        let mut guard = slot.session.lock().await;
+        let mut guard = match Self::acquire_session_lock(
+            &slot.session,
+            self.operation_timeout,
+            context.ct.cancelled(),
+        )
+        .await
+        {
+            Ok(guard) => guard,
+            Err(error) => {
+                self.prune_slot(id, &slot).await;
+                return Err(error);
+            }
+        };
         if slot.available_revision() != Some(revision) {
             drop(guard);
             self.prune_slot(id, &slot).await;
@@ -1199,6 +1236,9 @@ impl BrowserProxy {
         }
         if session.downstream.is_none() {
             session.downstream = Some(self.acquire_worker(workspace).await?);
+        }
+        if context.ct.is_cancelled() {
+            bail!("browser request cancelled before dispatch");
         }
         let closes_page = request.name == "close_page";
         let mut result = self
@@ -2206,5 +2246,51 @@ mod tests {
             Some("tab-a")
         );
         assert!(!state.local_to_tab.contains_key(&4));
+    }
+    #[tokio::test]
+    async fn session_lock_wait_times_out_while_held() {
+        let session: Mutex<Option<Session>> = Mutex::new(None);
+        let _held = session.lock().await;
+        let started = Instant::now();
+        let error = BrowserProxy::acquire_session_lock(
+            &session,
+            Duration::from_millis(50),
+            futures_util::future::pending(),
+        )
+        .await
+        .map(drop)
+        .expect_err("held session lock must time out");
+        assert!(
+            error.to_string().contains("busy with another action"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "session lock wait was not bounded"
+        );
+    }
+    #[tokio::test]
+    async fn session_lock_acquire_yields_to_cancellation() {
+        let session: Mutex<Option<Session>> = Mutex::new(None);
+        let error = BrowserProxy::acquire_session_lock(&session, Duration::from_secs(30), async {})
+            .await
+            .map(drop)
+            .expect_err("cancelled lock wait must not acquire");
+        assert!(
+            error.to_string().contains("cancelled before dispatch"),
+            "unexpected error: {error:#}"
+        );
+    }
+    #[tokio::test]
+    async fn session_lock_acquire_succeeds_when_free() {
+        let session: Mutex<Option<Session>> = Mutex::new(None);
+        let guard = BrowserProxy::acquire_session_lock(
+            &session,
+            Duration::from_secs(5),
+            futures_util::future::pending(),
+        )
+        .await
+        .expect("free session lock must acquire");
+        assert!(guard.is_none());
     }
 }

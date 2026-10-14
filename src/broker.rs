@@ -1053,7 +1053,7 @@ impl ServerHandler for Connection {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _: RequestContext<rmcp::RoleServer>,
+        context: RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResponse, rmcp::ErrorData> {
         if self.compact && request.name != "dispatch" && request.name != "help" {
             return Err(rmcp::ErrorData::invalid_params(
@@ -1081,7 +1081,7 @@ impl ServerHandler for Connection {
                 }
             }
             self.proxy
-                .route_call(&catalog, &self.workspace, &id, request)
+                .route_call(&catalog, &self.workspace, &id, request, &context)
                 .await
         }
         .await;
