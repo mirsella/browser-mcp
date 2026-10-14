@@ -63,6 +63,11 @@ static PACKAGE_VERSION: LazyLock<Version> = LazyLock::new(|| {
 pub(super) const SESSION_KEY: &str = "__opencode_session_id";
 pub(super) const CODEX_SESSION_KEY: &str = "__codex_session_id";
 
+/// Assumed session when the caller supplies no identifier (direct harness
+/// use without the plugin's injection). All keyless callers share one
+/// browser session per profile; keyed callers keep full isolation.
+const DIRECT_SESSION_ID: &str = "direct";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SessionClient {
     OpenCode,
@@ -891,7 +896,12 @@ fn route_request(mut request: CallToolRequestParams) -> Result<(String, CallTool
         (Some(id), None) => (SessionClient::OpenCode, id),
         (None, Some(id)) => (SessionClient::Codex, id),
         (Some(_), Some(_)) => bail!("browser call contains conflicting agent session identifiers"),
-        (None, None) => bail!("browser call is missing the OpenCode or Codex session identifier"),
+        (None, None) => {
+            return Ok((
+                SessionClient::OpenCode.owner_id(DIRECT_SESSION_ID)?,
+                request,
+            ));
+        }
     };
     let id = id
         .as_str()
@@ -1588,7 +1598,7 @@ mod tests {
     }
 
     #[test]
-    fn opencode_connections_require_and_remove_the_session_id() {
+    fn session_id_is_removed_and_defaults_when_missing() {
         let request = CallToolRequestParams::new("list_pages").with_arguments(
             json!({(SESSION_KEY): "session-a"})
                 .as_object()
@@ -1602,7 +1612,10 @@ mod tests {
                 .arguments
                 .is_some_and(|arguments| !arguments.contains_key(SESSION_KEY))
         );
-        assert!(route_request(CallToolRequestParams::new("list_pages")).is_err());
+        assert!(
+            route_request(CallToolRequestParams::new("list_pages"))
+                .is_ok_and(|(id, _)| id == "opencode:direct")
+        );
     }
 
     #[test]
