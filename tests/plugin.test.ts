@@ -1,14 +1,15 @@
 import { expect, spyOn, test } from "bun:test";
 import plugin from "../plugin/browser-routing";
-async function setup(options = {}, permissions: object[] = [], existing?: any, catalog?: Promise<any>) {
+async function setup(options = {}, permissions: object[] = [], existing?: any, catalog?: Promise<any>, mcpList?: () => Promise<any>) {
   const hooks: Record<string, Function> = {};
   let registration = existing;
   const skills: any[] = [];
   let transform: Function;
+  const connected = async () => ({data:[{name:"browser",status:{status:"connected"}}]});
   const editor = { get: () => existing, set: (_name: string, value: unknown) => { registration = value; } };
   const cleanup = await plugin.setup({ options,
     agent: { list: async () => catalog ? await catalog : ({data:[{permissions}]}) },
-    mcp: { transform: async (fn: Function) => { transform = fn; fn(editor); }, reload: async () => transform(editor), list: async () => ({data:[{name:"browser",status:{status:"connected"}}]}) },
+    mcp: { transform: async (fn: Function) => { transform = fn; fn(editor); }, reload: async () => transform(editor), list: mcpList ?? connected },
     skill: { transform: async (fn: Function) => fn({add: (skill: unknown) => skills.push(skill)}) },
     tool: { hook: async (name: string, fn: Function) => { hooks[name] = fn; } },
     session: { hook: async (name: string, fn: Function) => { hooks[name] = fn; } },
@@ -53,37 +54,21 @@ test("setup does not block on the agent catalog it helps initialize", async () =
 
 test("recovery stays quiet until the browser server has been seen", async () => {
   let listing: any[] = [];
-  const hooks: Record<string, Function> = {};
   const errors = spyOn(console, "error").mockImplementation(() => {});
+  const h = await setup({}, [], undefined, undefined, async () => ({data: listing}));
   try {
-    const base = {
-      options: {},
-      agent: { list: async () => ({data:[{permissions:[]} ]}) },
-      mcp: {
-        transform: async (fn: Function) => fn({get: () => undefined, set: () => {}}),
-        reload: async () => {},
-        list: async () => ({data: listing}),
-      },
-      skill: { transform: async (fn: Function) => fn({add: () => {}}) },
-      tool: { hook: async (name: string, fn: Function) => { hooks[name] = fn; } },
-      session: { hook: async (name: string, fn: Function) => { hooks[name] = fn; } },
-      event: { subscribe: async function* () {} },
-    } as any;
-    const { cleanup } = { cleanup: await plugin.setup(base) };
-    try {
-      // Never listed: recovery runs on every prompt but logs nothing.
-      await hooks.prompt();
-      await hooks.prompt();
-      expect(errors).toHaveBeenCalledTimes(0);
-      // Seen then gone: a genuine regression is still reported.
-      listing = [{name:"browser",status:{status:"connected"}}];
-      await hooks.prompt();
-      expect(errors).toHaveBeenCalledTimes(0);
-      listing = [];
-      await hooks.prompt();
-      expect(errors).toHaveBeenCalledTimes(1);
-    } finally { await cleanup?.(); }
-  } finally { errors.mockRestore(); }
+    // Never listed: recovery runs on every prompt but logs nothing.
+    await h.hooks.prompt();
+    await h.hooks.prompt();
+    expect(errors).toHaveBeenCalledTimes(0);
+    // Seen then gone: a genuine regression is still reported.
+    listing = [{name:"browser",status:{status:"connected"}}];
+    await h.hooks.prompt();
+    expect(errors).toHaveBeenCalledTimes(0);
+    listing = [];
+    await h.hooks.prompt();
+    expect(errors).toHaveBeenCalledTimes(1);
+  } finally { errors.mockRestore(); await h.cleanup?.(); }
 });
 
 test("prompt continues while adapter recovery is stalled", async () => {

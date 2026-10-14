@@ -69,9 +69,8 @@ export default Plugin.define({
     let timer: ReturnType<typeof setTimeout> | undefined;
     let recovering: Promise<void> | undefined;
     let failures = 0;
-    // Set once the browser entry shows up in listings. Runners whose topology
-    // never lists it cannot be fixed by reloading, so recovery stays quiet
-    // until the server has been seen at least once.
+    // Runners that never list the server cannot be fixed by reloading;
+    // stay quiet until it has been seen at least once.
     let seen = false;
     const schedule = () => {
       if (controller.signal.aborted) return;
