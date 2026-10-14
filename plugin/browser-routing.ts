@@ -69,6 +69,10 @@ export default Plugin.define({
     let timer: ReturnType<typeof setTimeout> | undefined;
     let recovering: Promise<void> | undefined;
     let failures = 0;
+    // Set once the browser entry shows up in listings. Runners whose topology
+    // never lists it cannot be fixed by reloading, so recovery stays quiet
+    // until the server has been seen at least once.
+    let seen = false;
     const schedule = () => {
       if (controller.signal.aborted) return;
       timer = setTimeout(() => void recover(), failures ? Math.min(30_000, 1_000 * 2 ** Math.min(failures - 1, 5)) : 5_000);
@@ -82,6 +86,7 @@ export default Plugin.define({
         try {
           const server = (await ctx.mcp.list()).data.find(server => server.name === "browser");
           if (!server) throw new Error("Browser MCP status is missing");
+          seen = true;
           // A disabled connection is an explicit user choice; only recover failures.
           if (server.status.status === "failed" && !controller.signal.aborted) {
             console.warn("Browser MCP adapter failed; reloading its registration");
@@ -92,7 +97,7 @@ export default Plugin.define({
           }
           failures = 0;
         } catch (error) {
-          if (!controller.signal.aborted) { failures++; console.error("Browser MCP recovery failed; will retry", error); }
+          if (!controller.signal.aborted) { failures++; if (seen) console.error("Browser MCP recovery failed; will retry", error); }
         } finally { recovering = undefined; schedule(); }
       })();
       return recovering;

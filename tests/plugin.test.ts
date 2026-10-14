@@ -51,6 +51,41 @@ test("setup does not block on the agent catalog it helps initialize", async () =
   finally { resolve({data:[]}); await h.cleanup?.(); }
 });
 
+test("recovery stays quiet until the browser server has been seen", async () => {
+  let listing: any[] = [];
+  const hooks: Record<string, Function> = {};
+  const errors = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    const base = {
+      options: {},
+      agent: { list: async () => ({data:[{permissions:[]} ]}) },
+      mcp: {
+        transform: async (fn: Function) => fn({get: () => undefined, set: () => {}}),
+        reload: async () => {},
+        list: async () => ({data: listing}),
+      },
+      skill: { transform: async (fn: Function) => fn({add: () => {}}) },
+      tool: { hook: async (name: string, fn: Function) => { hooks[name] = fn; } },
+      session: { hook: async (name: string, fn: Function) => { hooks[name] = fn; } },
+      event: { subscribe: async function* () {} },
+    } as any;
+    const { cleanup } = { cleanup: await plugin.setup(base) };
+    try {
+      // Never listed: recovery runs on every prompt but logs nothing.
+      await hooks.prompt();
+      await hooks.prompt();
+      expect(errors).toHaveBeenCalledTimes(0);
+      // Seen then gone: a genuine regression is still reported.
+      listing = [{name:"browser",status:{status:"connected"}}];
+      await hooks.prompt();
+      expect(errors).toHaveBeenCalledTimes(0);
+      listing = [];
+      await hooks.prompt();
+      expect(errors).toHaveBeenCalledTimes(1);
+    } finally { await cleanup?.(); }
+  } finally { errors.mockRestore(); }
+});
+
 test("prompt continues while adapter recovery is stalled", async () => {
   let reloads = 0;
   const stalled = new Promise<any>(() => {});
