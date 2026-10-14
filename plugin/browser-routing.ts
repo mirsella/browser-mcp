@@ -1,174 +1,131 @@
-import type { Plugin, PluginModule } from "@opencode-ai/plugin";
+import { Plugin, Skill } from "@opencode/plugin";
+import { execFile } from "node:child_process";
+import { readdir, readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+import { parse } from "yaml";
 
-const SESSION_KEY = "__opencode_session_id";
-const SKILLS_PATH = fileURLToPath(new URL("../skills", import.meta.url));
-const MCP_CLI = fileURLToPath(new URL("../vendor/browser-mcp", import.meta.url));
-const DISPATCH_TOOL = "browser_dispatch";
-const DIRECT_TOOLS = `
-	browser_click browser_close_page browser_drag browser_emulate browser_evaluate_script browser_fill browser_fill_form
-	browser_get_console_message browser_get_network_request browser_handle_dialog browser_hover browser_lighthouse_audit
-	browser_list_console_messages browser_list_network_requests browser_list_pages browser_navigate_page browser_new_page
-	browser_performance_analyze_insight browser_performance_start_trace browser_performance_stop_trace browser_press_key
-	browser_resize_page browser_take_heapsnapshot browser_take_screenshot browser_take_snapshot browser_type_text
-	browser_upload_file browser_wait_for
-`
-	.trim()
-	.split(/\s+/);
+const execute = promisify(execFile);
+const binary = fileURLToPath(new URL("../vendor/browser-mcp", import.meta.url));
+const skills = fileURLToPath(new URL("../skills/", import.meta.url));
+const directTools = `click close_page drag emulate evaluate_script fill fill_form get_console_message
+get_network_request handle_dialog hover lighthouse_audit list_console_messages list_network_requests
+list_pages navigate_page new_page performance_analyze_insight performance_start_trace performance_stop_trace
+press_key resize_page take_heapsnapshot take_screenshot take_snapshot type_text upload_file wait_for`
+  .split(/\s+/).map(name => `browser_${name}`);
 
-type ConfigWithPolicies = {
-	agent?: Record<string, { permission?: unknown; tools?: unknown }>;
-	permission?: unknown;
-	skills?: { paths?: string[] };
-	tools?: unknown;
-};
-
-type BrowserRoutingOptions = {
-	enabled?: boolean;
-	compactTools?: boolean;
-};
-
-function hasPartialBrowserPolicy(value: unknown): boolean {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-	return Object.keys(value).some((pattern) => {
-		const expression = pattern
-			.replace(/[.+^${}()|[\]\\]/g, "\\$&")
-			.replaceAll("*", ".*")
-			.replaceAll("?", ".");
-		const regex = new RegExp(`^${expression}$`);
-		const matches = (tool: string) => regex.test(tool);
-		return DIRECT_TOOLS.some(matches) && !(matches(DISPATCH_TOOL) && DIRECT_TOOLS.every(matches));
-	});
+function partialPolicy(agents: Array<{ permissions: readonly { action: string }[] }>) {
+  return agents.some(agent => agent.permissions.some(({ action }) => {
+    const regex = new RegExp(`^${action.replace(/[.+^${}()|[\]\\]/g, "\\$&").replaceAll("*", ".*").replaceAll("?", ".")}$`);
+    return directTools.some(tool => regex.test(tool))
+      && !(regex.test("browser_dispatch") && directTools.every(tool => regex.test(tool)));
+  }));
 }
 
-function requiresDirectTools(config: ConfigWithPolicies): boolean {
-	if (hasPartialBrowserPolicy(config.permission) || hasPartialBrowserPolicy(config.tools)) {
-		return true;
-	}
-	return Object.values(config.agent ?? {}).some(
-		(agent) => hasPartialBrowserPolicy(agent.permission) || hasPartialBrowserPolicy(agent.tools),
-	);
-}
-
-const server: Plugin = async ({ $, client, directory }, options) => {
-	const { enabled = true, compactTools = true } = (options ?? {}) as BrowserRoutingOptions;
-	if (typeof enabled !== "boolean") throw new Error("enabled must be a boolean");
-	if (typeof compactTools !== "boolean") throw new Error("compactTools must be a boolean");
-	let configured = false;
-	let disposed = false;
-	let failures = 0;
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	let recovering: Promise<void> | undefined;
-	const scheduleRecovery = (delay: number) => {
-		if (timer) clearTimeout(timer);
-		if (disposed || !configured) return;
-		timer = setTimeout(() => void recover(), delay);
-		timer.unref();
-	};
-	const recover = (): Promise<void> => {
-		if (disposed || !configured) return Promise.resolve();
-		if (recovering) return recovering;
-		recovering = (async () => {
-			try {
-				const status = await client.mcp.status({ query: { directory }, throwOnError: true });
-				if (disposed) return;
-				if (!status.data?.browser) throw new Error("Browser MCP status is missing");
-				// Respect explicit runtime disconnects in the OpenCode UI.
-				if (status.data?.browser?.status === "failed") {
-					console.warn("Browser MCP adapter failed; reconnecting");
-					await client.mcp.connect({ path: { name: "browser" }, query: { directory }, throwOnError: true });
-					const restored = await client.mcp.status({ query: { directory }, throwOnError: true });
-					if (restored.data?.browser?.status !== "connected") {
-						throw new Error(`Browser MCP adapter recovery failed: ${JSON.stringify(restored.data?.browser)}`);
-					}
-					console.warn("Browser MCP adapter reconnected");
-				}
-				failures = 0;
-			} catch (error) {
-				failures++;
-				console.error("Failed to recover browser MCP adapter; will retry", error);
-			} finally {
-				recovering = undefined;
-				scheduleRecovery(failures ? Math.min(30_000, 1_000 * 2 ** Math.min(failures - 1, 5)) : 5_000);
-			}
-		})();
-		return recovering;
-	};
-
-	return {
-		config: async (config) => {
-			const extended = config as typeof config & ConfigWithPolicies;
-			const compact = compactTools && !requiresDirectTools(extended);
-
-			config.mcp ??= {};
-			const existing = config.mcp.browser;
-			if (
-				existing &&
-				((existing.type !== undefined && existing.type !== "local") ||
-					(existing.command?.[0] !== undefined && existing.command[0] !== MCP_CLI))
-			) {
-				throw new Error(
-					"@mirsella/opencode-browser-mcp cannot replace the existing mcp.browser configuration",
-				);
-			}
-			const requestedEnabled = existing?.enabled ?? enabled;
-			config.mcp.browser = {
-				type: "local",
-				command: compact ? [MCP_CLI] : [MCP_CLI, "--direct-tools"],
-				enabled: requestedEnabled,
-				timeout: 600_000,
-			};
-			configured = true;
-			scheduleRecovery(1_000);
-			if (!requestedEnabled) return;
-			if (compactTools && !compact) {
-				console.warn(
-					"@mirsella/opencode-browser-mcp uses direct tools to preserve per-action browser permissions",
-				);
-			}
-
-			extended.skills ??= {};
-			extended.skills.paths ??= [];
-			if (!extended.skills.paths.includes(SKILLS_PATH)) extended.skills.paths.push(SKILLS_PATH);
-		},
-		"tool.execute.before": async (input, output) => {
-			if (!input.tool.startsWith("browser_")) return;
-			if (!input.sessionID) throw new Error("browser tool call has no OpenCode session ID");
-			if (!output.args || typeof output.args !== "object" || Array.isArray(output.args)) {
-				throw new Error("browser tool call has invalid arguments");
-			}
-			(output.args as Record<string, unknown>)[SESSION_KEY] = input.sessionID;
-		},
-		"chat.message": async () => {
-			await recover();
-		},
-		event: async ({ event }) => {
-			if (event.type === "server.instance.disposed") {
-				disposed = true;
-				if (timer) clearTimeout(timer);
-				return;
-			}
-			const change = event as { type: string; properties: { server?: string } };
-			if (change.type === "mcp.tools.changed" && change.properties.server === "browser") {
-				// Do not await a callback that can be published by the connect request itself.
-				void recover();
-				return;
-			}
-			if (event.type !== "session.deleted") return;
-			const sessionID = event.properties.info.id;
-			try {
-				const result = await $`${[MCP_CLI, "release-session", sessionID]}`.quiet().nothrow();
-				if (result.exitCode !== 0) {
-					const stderr = String(result.stderr).trim();
-					console.error(
-						`Failed to release browser session ${sessionID} with exit code ${result.exitCode}${stderr ? `: ${stderr}` : ""}`,
-					);
-				}
-			} catch (error) {
-				console.error(`Failed to release browser session ${sessionID}`, error);
-			}
-		},
-	};
-};
-
-export default { id: "@mirsella/opencode-browser-mcp", server } satisfies PluginModule;
+export default Plugin.define({
+  id: "@mirsella/opencode-browser-mcp",
+  async setup(ctx) {
+    const { enabled = true, compactTools = true } = ctx.options;
+    if (typeof enabled !== "boolean") throw new Error("enabled must be a boolean");
+    if (typeof compactTools !== "boolean") throw new Error("compactTools must be a boolean");
+    let compact = compactTools;
+    let reconnectGeneration = 0;
+    let active = enabled;
+    await ctx.mcp.transform(editor => {
+      const existing = editor.get("browser");
+      if (existing && (existing.type !== "local" || existing.command[0] !== binary)) {
+        throw new Error("Browser MCP cannot replace an incompatible mcp.servers.browser configuration");
+      }
+      active = !(existing?.disabled ?? !enabled);
+      editor.set("browser", {
+        ...existing,
+        type: "local", command: compact ? [binary] : [binary, "--direct-tools"],
+        disabled: !active, codemode: false,
+        environment: { ...existing?.environment, BROWSER_MCP_RECONNECT_GENERATION: String(reconnectGeneration) },
+        timeout: { startup: 30_000, catalog: 30_000, execution: 600_000, ...existing?.timeout },
+      });
+    });
+    if (active) {
+      const entries = await readdir(skills, { withFileTypes: true });
+      const registered = await Promise.all(entries.filter(entry => entry.isDirectory()).map(async entry => {
+        const path = `${skills}${entry.name}/SKILL.md`;
+        const text = await readFile(path, "utf8");
+        const frontmatter = text.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+        if (!frontmatter) throw new Error(`Missing skill frontmatter: ${path}`);
+        const meta = parse(frontmatter[1]);
+        if (typeof meta.name !== "string" || typeof meta.description !== "string") throw new Error(`Invalid skill metadata: ${path}`);
+        return Skill.Info.make({ id: Skill.ID.make(meta.name), name: Skill.Name.make(meta.name),
+          description: meta.description, path: path as never, content: text.slice(frontmatter[0].length) });
+      }));
+      await ctx.skill.transform(editor => { for (const skill of registered) editor.add(skill); });
+    }
+    await ctx.tool.hook("execute.before", input => {
+      if (!input.tool.startsWith("browser_")) return;
+      if (!input.sessionID) throw new Error("Browser tool call has no OpenCode session ID");
+      if (!input.input || typeof input.input !== "object" || Array.isArray(input.input)) throw new Error("Browser tool call has invalid arguments");
+      input.input = { ...input.input, __opencode_session_id: input.sessionID };
+    });
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let recovering: Promise<void> | undefined;
+    let failures = 0;
+    const schedule = () => {
+      if (controller.signal.aborted) return;
+      timer = setTimeout(() => void recover(), failures ? Math.min(30_000, 1_000 * 2 ** Math.min(failures - 1, 5)) : 5_000);
+      timer.unref();
+    };
+    const recover = (): Promise<void> => {
+      if (controller.signal.aborted) return Promise.resolve();
+      if (recovering) return recovering;
+      if (timer) clearTimeout(timer);
+      recovering = (async () => {
+        try {
+          const server = (await ctx.mcp.list()).data.find(server => server.name === "browser");
+          if (!server) throw new Error("Browser MCP status is missing");
+          // A disabled connection is an explicit user choice; only recover failures.
+          if (server.status.status === "failed" && !controller.signal.aborted) {
+            console.warn("Browser MCP adapter failed; reloading its registration");
+            reconnectGeneration++;
+            await ctx.mcp.reload();
+            const restored = (await ctx.mcp.list()).data.find(server => server.name === "browser");
+            if (restored?.status.status !== "connected") throw new Error(`Browser MCP recovery failed: ${JSON.stringify(restored?.status)}`);
+          }
+          failures = 0;
+        } catch (error) {
+          if (!controller.signal.aborted) { failures++; console.error("Browser MCP recovery failed; will retry", error); }
+        } finally { recovering = undefined; schedule(); }
+      })();
+      return recovering;
+    };
+    // Recovery must never stall a prompt: a wedged adapter keeps retrying in
+    // the background while chat continues within a short deadline.
+    const recoverSoon = () => Promise.race([
+      recover(),
+      new Promise<void>(resolve => { const deadline = setTimeout(resolve, 5_000); deadline.unref(); }),
+    ]);
+    // Catalog reads wait for plugin bootstrap. Do not await them inside setup.
+    const checkPolicy = async () => {
+      const next = compactTools && !partialPolicy((await ctx.agent.list()).data);
+      if (controller.signal.aborted || next === compact) return;
+      compact = next;
+      if (!compact) console.warn("Browser MCP uses direct tools to preserve per-action permissions");
+      await ctx.mcp.reload();
+    };
+    const policyReady = Promise.resolve().then(checkPolicy);
+    void policyReady.catch(error => console.error("Browser MCP permission initialization failed", error));
+    await ctx.session.hook("prompt", async () => { await policyReady; await checkPolicy(); await recoverSoon(); });
+    const events = async () => {
+      for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+        if (controller.signal.aborted) break;
+        if (event.type === "agent.updated") void checkPolicy().catch(error => console.error("Browser MCP permission update failed", error));
+        if ((event.type === "mcp.status.changed") && event.data.server === "browser") void recover();
+        if (event.type !== "session.deleted") continue;
+        try { await execute(binary, ["release-session", event.data.sessionID], { signal: controller.signal }); }
+        catch (error) { if (!controller.signal.aborted) console.error(`Failed to release browser session ${event.data.sessionID}`, error); }
+      }
+    };
+    void events().catch(error => { if (!controller.signal.aborted) console.error("Browser MCP event subscription failed", error); });
+    schedule();
+    return async () => { controller.abort(); if (timer) clearTimeout(timer); await recovering; };
+  },
+});

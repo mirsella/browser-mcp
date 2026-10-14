@@ -1,203 +1,88 @@
-import { afterEach, describe, expect, test } from "bun:test";
-import BrowserPlugin from "@mirsella/opencode-browser-mcp/server";
-
-const disposals: Array<() => Promise<void>> = [];
-afterEach(async () => {
-	await Promise.all(disposals.splice(0).map((dispose) => dispose()));
+import { expect, spyOn, test } from "bun:test";
+import plugin from "../plugin/browser-routing";
+async function setup(options = {}, permissions: object[] = [], existing?: any, catalog?: Promise<any>) {
+  const hooks: Record<string, Function> = {};
+  let registration = existing;
+  const skills: any[] = [];
+  let transform: Function;
+  const editor = { get: () => existing, set: (_name: string, value: unknown) => { registration = value; } };
+  const cleanup = await plugin.setup({ options,
+    agent: { list: async () => catalog ? await catalog : ({data:[{permissions}]}) },
+    mcp: { transform: async (fn: Function) => { transform = fn; fn(editor); }, reload: async () => transform(editor), list: async () => ({data:[{name:"browser",status:{status:"connected"}}]}) },
+    skill: { transform: async (fn: Function) => fn({add: (skill: unknown) => skills.push(skill)}) },
+    tool: { hook: async (name: string, fn: Function) => { hooks[name] = fn; } },
+    session: { hook: async (name: string, fn: Function) => { hooks[name] = fn; } },
+    event: { subscribe: async function* () {} },
+  } as any);
+  if (!catalog) await hooks.prompt?.();
+  return { hooks, registration, skills, cleanup };
+}
+test("registers native MCP, skill and session routing", async () => {
+  const h = await setup();
+  try {
+    expect(h.registration.type).toBe("local");
+    expect(h.registration.codemode).toBe(false);
+    expect(h.registration.timeout.execution).toBe(600000);
+    expect(h.skills.length).toBeGreaterThan(0);
+    const call = {tool:"browser_dispatch",sessionID:"ses_one",input:{name:"click",args:{uid:"1"}}};
+    await h.hooks["execute.before"](call);
+    expect(call.input).toEqual({name:"click",args:{uid:"1"},__opencode_session_id:"ses_one"});
+  } finally { await h.cleanup?.(); }
+});
+test("preserves individual tool permissions with direct tools", async () => {
+  const h = await setup({}, [{action:"browser_click",resource:"*",effect:"deny"}]);
+  try { expect(h.registration.command.at(-1)).toBe("--direct-tools"); }
+  finally { await h.cleanup?.(); }
+});
+test("disabled adapters do not register skills", async () => {
+  const h = await setup({enabled:false});
+  try { expect(h.registration.disabled).toBe(true); expect(h.skills).toEqual([]); }
+  finally { await h.cleanup?.(); }
+});
+test("invalid options and conflicting registration fail explicitly", async () => {
+  await expect(setup({compactTools:"yes"})).rejects.toThrow("boolean");
+  await expect(setup({}, [], {type:"remote",url:"https://example.test"})).rejects.toThrow("incompatible");
 });
 
-async function hooks(options?: { enabled?: boolean; compactTools?: boolean }, mcp?: unknown) {
-	const calls: unknown[][] = [];
-	const shell = ((strings: TemplateStringsArray, ...values: unknown[]) => {
-		calls.push([strings, ...values]);
-		const command = {
-			quiet: () => command,
-			nothrow: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
-		};
-		return command;
-	}) as never;
-	const plugin = await BrowserPlugin.server(
-		{
-			$: shell,
-			directory: "/workspace",
-			worktree: "/workspace",
-			client: {
-				mcp: mcp ?? {
-					status: async () => ({ data: { browser: { status: "connected" } } }),
-				},
-			},
-		} as never,
-		options,
-	);
-	disposals.push(async () => {
-		await plugin.event?.({ event: { type: "server.instance.disposed", properties: {} } } as never);
-	});
-	return { plugin, calls };
-}
+test("setup does not block on the agent catalog it helps initialize", async () => {
+  const {promise, resolve} = Promise.withResolvers<any>();
+  const h = await setup({}, [], undefined, promise);
+  try { resolve({data:[{permissions:[]}]}); await h.hooks.prompt(); expect(h.registration.disabled).toBe(false); }
+  finally { resolve({data:[]}); await h.cleanup?.(); }
+});
 
-function expectRouting(
-	config: { mcp: { browser: { command: unknown[] } } },
-	directTools: boolean,
-) {
-	const [executable, ...arguments_] = config.mcp.browser.command;
-	expect(String(executable).endsWith("/vendor/browser-mcp")).toBeTrue();
-	expect(arguments_).toEqual(directTools ? ["--direct-tools"] : []);
-}
-
-function browserEnabled(config: { mcp?: { browser?: { enabled?: unknown } } }): unknown {
-	return config.mcp?.browser?.enabled;
-}
-
-describe("BrowserRouting", () => {
-	test("reconnects a crashed adapter once across concurrent hooks", async () => {
-		let state = "failed";
-		const connections: unknown[] = [];
-		const { plugin } = await hooks({ enabled: true }, {
-			status: async () => ({ data: { browser: { status: state } } }),
-			connect: async (options: unknown) => {
-				connections.push(options);
-				await Bun.sleep(10);
-				state = "connected";
-				return { data: true };
-			},
-		});
-		await plugin.config?.({} as never);
-		await Promise.all(Array.from({ length: 4 }, () => plugin["chat.message"]?.({} as never, {} as never)));
-		expect(connections).toEqual([
-			{ path: { name: "browser" }, query: { directory: "/workspace" }, throwOnError: true },
-		]);
-		state = "disabled";
-		await plugin["chat.message"]?.({} as never, {} as never);
-		expect(connections).toHaveLength(1);
-	});
-
-	test("retries unsuccessful reconnects and stops on disposal", async () => {
-		let state = "failed";
-		let connections = 0;
-		const { plugin } = await hooks({ enabled: true }, {
-			status: async () => ({ data: { browser: { status: state } } }),
-			connect: async () => {
-				connections++;
-				if (connections > 1) state = "connected";
-				return { data: true };
-			},
-		});
-		await plugin.config?.({} as never);
-		await plugin["chat.message"]?.({} as never, {} as never);
-		expect(connections).toBe(1);
-		await Bun.sleep(1_100);
-		expect(connections).toBe(2);
-		await plugin.event?.({ event: { type: "server.instance.disposed", properties: {} } } as never);
-		state = "failed";
-		await plugin["chat.message"]?.({} as never, {} as never);
-		expect(connections).toBe(2);
-	});
-
-	test("recovers an adapter enabled at runtime when its tools disappear", async () => {
-		let state = "disabled";
-		let connections = 0;
-		const { plugin } = await hooks({}, {
-			status: async () => ({ data: { browser: { status: state } } }),
-			connect: async () => {
-				connections++;
-				state = "connected";
-				return { data: true };
-			},
-		});
-		await plugin.config?.({} as never);
-		await plugin["chat.message"]?.({} as never, {} as never);
-		expect(connections).toBe(0);
-		state = "failed";
-		await plugin.event?.({ event: { type: "mcp.tools.changed", properties: { server: "browser" } } } as never);
-		await plugin["chat.message"]?.({} as never, {} as never);
-		expect(connections).toBe(1);
-	});
-
-	test("enables compact routing by default and injects the session ID", async () => {
-		expect(BrowserPlugin.id).toBe("@mirsella/opencode-browser-mcp");
-		const { plugin } = await hooks();
-		const config = { skills: { paths: ["/existing"] } } as never;
-		await plugin.config?.(config);
-		await plugin.config?.(config);
-		expectRouting(config, false);
-		expect(browserEnabled(config)).toBeTrue();
-		expect(config.skills.paths).toHaveLength(2);
-
-		const output = { args: { action: "navigate_page", arguments: { url: "https://example.com" } } };
-		await plugin["tool.execute.before"]?.(
-			{ tool: "browser_dispatch", sessionID: "session-a", callID: "call-a" },
-			output,
-		);
-		expect(output.args).toEqual({
-			action: "navigate_page",
-			arguments: { url: "https://example.com" },
-			__opencode_session_id: "session-a",
-		});
-		expect(
-			plugin["tool.execute.before"]?.(
-				{ tool: "browser_dispatch", sessionID: "session-a", callID: "call-b" },
-				{ args: [] },
-			),
-		).rejects.toThrow("invalid arguments");
-	});
-
-	test("allows explicit disablement and skips the skill", async () => {
-		const { plugin } = await hooks({ enabled: false });
-		const config = { skills: { paths: ["/existing"] } } as never;
-		await plugin.config?.(config);
-		expect(browserEnabled(config)).toBeFalse();
-		expectRouting(config, false);
-		expect(config.skills.paths).toHaveLength(1);
-		await expect(
-			hooks({ enabled: "true" } as never),
-		).rejects.toThrow("enabled must be a boolean");
-	});
-
-	test("explicit mcp.browser settings take precedence", async () => {
-		const { plugin } = await hooks({ enabled: true });
-		const disabled = { mcp: { browser: { enabled: false } }, skills: { paths: [] as string[] } } as never;
-		await plugin.config?.(disabled);
-		expect(browserEnabled(disabled)).toBeFalse();
-		expect((disabled as { skills: { paths: string[] } }).skills.paths).toHaveLength(0);
-
-		const optedIn = { mcp: { browser: { enabled: true } } } as never;
-		await plugin.config?.(optedIn);
-		expectRouting(optedIn, false);
-		expect(browserEnabled(optedIn)).toBeTrue();
-	});
-
-	test("uses direct tools for partial browser policies", async () => {
-		for (const [pattern, directTools] of [
-			["*_evaluate_scrip?", true],
-			["browser_d*", true],
-			["browser_*", false],
-			["read_*", false],
-		]) {
-			const { plugin } = await hooks();
-			const config = { permission: { [pattern]: "deny" } } as never;
-			await plugin.config?.(config);
-			expectRouting(config, directTools);
-		}
-		const { plugin } = await hooks({ compactTools: false });
-		const config = {} as never;
-		await plugin.config?.(config);
-		expectRouting(config, true);
-	});
-
-	test("ignores idle and releases deleted sessions", async () => {
-		const { plugin, calls } = await hooks();
-		await plugin["tool.execute.before"]?.(
-			{ tool: "browser_dispatch", sessionID: "session-a", callID: "call-a" },
-			{ args: {} },
-		);
-		await plugin.event?.({
-			event: { type: "session.idle", properties: { sessionID: "session-a" } },
-		} as never);
-		expect(calls).toHaveLength(0);
-		await plugin.event?.({
-			event: { type: "session.deleted", properties: { info: { id: "restored-session" } } },
-		} as never);
-		expect(calls).toHaveLength(1);
-		expect(calls[0]?.[1]).toEqual([expect.any(String), "release-session", "restored-session"]);
-	});
+test("prompt continues while adapter recovery is stalled", async () => {
+  let reloads = 0;
+  const stalled = new Promise<any>(() => {});
+  const hooks: Record<string, Function> = {};
+  let registration: any;
+  const editor = { get: () => undefined, set: (_name: string, value: unknown) => { registration = value; } };
+  const originalTimeout = globalThis.setTimeout;
+  const deadlines = spyOn(globalThis, "setTimeout").mockImplementation(
+    ((handler: any, delay: any, ...args: any[]) =>
+      originalTimeout(handler, delay === 5_000 ? 0 : delay, ...args)) as typeof setTimeout,
+  );
+  try {
+    await plugin.setup({ options: {},
+      agent: { list: async () => ({data:[{permissions:[]}]}) },
+      mcp: {
+        transform: async (fn: Function) => fn(editor),
+        reload: async () => { reloads++; },
+        list: async () => stalled,
+      },
+      skill: { transform: async (fn: Function) => fn({add: () => {}}) },
+      tool: { hook: async (name: string, fn: Function) => { hooks[name] = fn; } },
+      session: { hook: async (name: string, fn: Function) => { hooks[name] = fn; } },
+      event: { subscribe: async function* () {} },
+    } as any);
+    // The background schedule() recovery also stalls; only the prompt path matters here.
+    // No cleanup: it awaits the stalled recovery and would hang the suite.
+    const started = Date.now();
+    await hooks.prompt();
+    expect(reloads).toBe(0);
+    // A wrong deadline (e.g. 60s) would still pass functionally; pin the bound.
+    expect(Date.now() - started).toBeLessThan(5_000);
+  } finally {
+    deadlines.mockRestore();
+  }
 });
