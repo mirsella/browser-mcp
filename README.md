@@ -10,9 +10,19 @@ and Codex conversations. The plugin wraps
 and routes each conversation through its own browser tabs while sharing cookies,
 logins, local storage, cache, and extensions.
 
+
+Package 2.x targets OpenCode v2 (2.0.27 or newer). Package 1.x retains the
+OpenCode v1 adapter (1.18 or newer, below 2). Codex uses the same Rust MCP
+server and manifests in both releases. The native v2 adapter uses
+`@opencode/plugin`; local directories also expose a physical `server` entrypoint.
+
+Until these releases are published, use the v2 worktree through a `file://`
+plugin reference and its packaged Codex marketplace. The v1 and v2 preparation
+worktrees are independent; neither requires changing an installed package.
+
 ## Requirements
 
-- OpenCode 1.18 or newer, or Codex with plugin and hook support
+- OpenCode 2.0.27 or newer, or Codex with plugin and hook support
 - Linux x64
 - Bun
 - A local Chromium-family browser
@@ -25,8 +35,8 @@ the browser automation skill available by default:
 
 ```json
 {
-  "$schema": "https://opencode.ai/config.json",
-  "plugin": ["@mirsella/opencode-browser-mcp"]
+  "$schema": "https://opencode.ai/v2/config.json",
+  "plugins": ["@mirsella/opencode-browser-mcp"]
 }
 ```
 
@@ -104,15 +114,15 @@ direct tools so those policies continue to work.
 Settings:
 
 - `enabled` (default `true`): start the server and load the skill. Set it to
-  `false` to disable both. An explicit `mcp.browser` entry takes precedence.
+  `false` to disable both. An explicit `mcp.servers.browser` entry takes precedence.
 - `compactTools` (default `true`): keep `browser_dispatch` and `browser_help`
   instead of the direct tools. Set it to `false` to always use direct tools:
 
 ```json
 {
-  "$schema": "https://opencode.ai/config.json",
-  "plugin": [
-    ["@mirsella/opencode-browser-mcp", { "compactTools": false }]
+  "$schema": "https://opencode.ai/v2/config.json",
+  "plugins": [
+    { "package": "@mirsella/opencode-browser-mcp", "options": { "compactTools": false } }
   ]
 }
 ```
@@ -214,7 +224,7 @@ action. Explicitly disabled or disconnected MCP entries stay disabled.
 - A profile or socket lease error means another live package process owns it or a stale process is still running. Do not bypass the locks.
 - A process on the configured CDP port must belong to the exact managed browser generation. Stop it or choose another port.
 - If downstream startup fails, verify that `bunx` is available to OpenCode.
-- The plugin refuses to replace an unrelated `mcp.browser` entry.
+- The plugin refuses to replace an unrelated `mcp.servers.browser` entry.
 
 ## Security
 
