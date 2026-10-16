@@ -1,6 +1,6 @@
 # Browser MCP
 
-[![npm](https://img.shields.io/npm/v/@mirsella/opencode-browser-mcp)](https://www.npmjs.com/package/@mirsella/opencode-browser-mcp)
+[![npm](https://img.shields.io/npm/v/@mirsella/browser-mcp)](https://www.npmjs.com/package/@mirsella/browser-mcp)
 [![CI](https://github.com/mirsella/browser-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/mirsella/browser-mcp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -9,6 +9,10 @@ and Codex conversations. The plugin wraps
 [`chrome-devtools-mcp`](https://github.com/ChromeDevTools/chrome-devtools-mcp)
 and routes each conversation through its own browser tabs while sharing cookies,
 logins, local storage, cache, and extensions.
+
+Package 1.x is the OpenCode v1 release line (1.18 or newer, below 2).
+Use package 2.x for the native OpenCode v2 adapter. Codex uses the same
+standalone Rust server in both release lines.
 
 ## Requirements
 
@@ -26,7 +30,7 @@ the browser automation skill available by default:
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["@mirsella/opencode-browser-mcp"]
+  "plugin": ["@mirsella/browser-mcp@opencode1"]
 }
 ```
 
@@ -53,7 +57,7 @@ codex plugin marketplace add /path/to/browser-mcp
 codex plugin add browser@browser-mcp
 ```
 
-The npm package keeps its current name, `@mirsella/opencode-browser-mcp`.
+The npm package is now `@mirsella/browser-mcp`; it replaces `@mirsella/opencode-browser-mcp`.
 To use a GitHub release in OpenCode, set the plugin entry to the `file:///absolute/path`
 of its unpacked directory instead of the npm name.
 
@@ -112,7 +116,7 @@ Settings:
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
-    ["@mirsella/opencode-browser-mcp", { "compactTools": false }]
+    ["@mirsella/browser-mcp@opencode1", { "compactTools": false }]
   ]
 }
 ```
@@ -257,6 +261,15 @@ dispatch, both window layouts, and automatic browser shutdown.
 | `tests/e2e.rs` | startup, shared-profile, isolation, routing, and shutdown coverage |
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the development and release workflow.
+
+## Releases
+
+CI builds and tests the distributable tarball on every push. Run the `release`
+workflow from `main` with the full tested source commit: `main` for 2.x, or
+`release/opencode-v1` for 1.x. The workflow verifies that commit and downloads
+its checksummed CI artifact instead of rebuilding it. Use `stage` for npm
+browser approval, or `publish` after configuring `release.yml` as an npm
+trusted publisher. The channels are `latest` for 2.x and `opencode1` for 1.x.
 
 ## License
 

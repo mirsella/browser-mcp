@@ -19,6 +19,10 @@ jobs:
         with:
           node-version: 24
       - uses: oven-sh/setup-bun@v2
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - run: pnpm install --frozen-lockfile
       - run: cargo fmt --check
       - run: cargo test --all-targets
       - run: bun test tests/plugin.test.ts
@@ -45,22 +49,21 @@ jobs:
         run: test "$(node -p 'require("./package.json").version')" = "$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
       - run: cargo build --release --target x86_64-unknown-linux-musl
       - run: node scripts/stage-native.mjs
-      - run: npm pack --dry-run --ignore-scripts
       - name: Test packed OpenCode plugin export
         run: |
-          tarball=$(npm pack --json --ignore-scripts | node -e 'let data=""; process.stdin.on("data", chunk => data += chunk); process.stdin.on("end", () => { const parsed = JSON.parse(data); const item = Array.isArray(parsed) ? parsed[0] : Object.values(parsed)[0]; console.log(item.filename) })')
-          mkdir /tmp/browser-mcp-package-test
-          cd /tmp/browser-mcp-package-test
-          bun init -y
-          bun add "$GITHUB_WORKSPACE/$tarball"
-          bun -e 'import plugin from "@mirsella/opencode-browser-mcp/server"; if (plugin.id !== "@mirsella/opencode-browser-mcp" || typeof plugin.server !== "function") process.exit(1)'
-          ./node_modules/@mirsella/opencode-browser-mcp/vendor/browser-mcp --version
+          pnpm --config.ignore-scripts=true pack
+          consumer=$(mktemp -d "$RUNNER_TEMP/browser-consumer.XXXXXX")
+          printf '{"name":"package-consumer","private":true}\n' > "$consumer/package.json"
+          cd "$consumer"
+          pnpm add "$GITHUB_WORKSPACE"/mirsella-browser-mcp-*.tgz @opencode-ai/plugin@1.18.11
+          bun -e 'import plugin from "@mirsella/browser-mcp/server"; if (plugin.id !== "@mirsella/browser-mcp" || typeof plugin.server !== "function") process.exit(1)'
+          ./node_modules/@mirsella/browser-mcp/vendor/browser-mcp --version
       - name: Checksum release package
-        run: sha256sum mirsella-opencode-browser-mcp-*.tgz > SHA256SUMS
+        run: sha256sum mirsella-browser-mcp-*.tgz > SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: npm-package
           path: |
-            mirsella-opencode-browser-mcp-*.tgz
+            mirsella-browser-mcp-*.tgz
             SHA256SUMS
           if-no-files-found: error

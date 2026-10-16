@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import BrowserPlugin from "@mirsella/opencode-browser-mcp/server";
+import BrowserPlugin from "@mirsella/browser-mcp/server";
 
 const disposals: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -114,7 +114,7 @@ describe("BrowserRouting", () => {
 	});
 
 	test("enables compact routing by default and injects the session ID", async () => {
-		expect(BrowserPlugin.id).toBe("@mirsella/opencode-browser-mcp");
+		expect(BrowserPlugin.id).toBe("@mirsella/browser-mcp");
 		const { plugin } = await hooks();
 		const config = { skills: { paths: ["/existing"] } } as never;
 		await plugin.config?.(config);

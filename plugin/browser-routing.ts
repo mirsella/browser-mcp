@@ -108,7 +108,7 @@ const server: Plugin = async ({ $, client, directory }, options) => {
 					(existing.command?.[0] !== undefined && existing.command[0] !== MCP_CLI))
 			) {
 				throw new Error(
-					"@mirsella/opencode-browser-mcp cannot replace the existing mcp.browser configuration",
+					"@mirsella/browser-mcp cannot replace the existing mcp.browser configuration",
 				);
 			}
 			const requestedEnabled = existing?.enabled ?? enabled;
@@ -123,7 +123,7 @@ const server: Plugin = async ({ $, client, directory }, options) => {
 			if (!requestedEnabled) return;
 			if (compactTools && !compact) {
 				console.warn(
-					"@mirsella/opencode-browser-mcp uses direct tools to preserve per-action browser permissions",
+					"@mirsella/browser-mcp uses direct tools to preserve per-action browser permissions",
 				);
 			}
 
@@ -171,4 +171,4 @@ const server: Plugin = async ({ $, client, directory }, options) => {
 	};
 };
 
-export default { id: "@mirsella/opencode-browser-mcp", server } satisfies PluginModule;
+export default { id: "@mirsella/browser-mcp", server } satisfies PluginModule;
