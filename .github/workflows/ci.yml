@@ -55,15 +55,15 @@ jobs:
           consumer=$(mktemp -d "$RUNNER_TEMP/browser-consumer.XXXXXX")
           printf '{"name":"package-consumer","private":true}\n' > "$consumer/package.json"
           cd "$consumer"
-          pnpm add "$GITHUB_WORKSPACE"/mirsella-opencode-browser-mcp-*.tgz @opencode/plugin@2.0.28
-          bun -e 'import plugin from "@mirsella/opencode-browser-mcp/server"; if (plugin.id !== "@mirsella/opencode-browser-mcp" || typeof plugin.setup !== "function") process.exit(1)'
-          ./node_modules/@mirsella/opencode-browser-mcp/vendor/browser-mcp --version
+          pnpm add "$GITHUB_WORKSPACE"/mirsella-browser-mcp-*.tgz @opencode/plugin@2.0.28
+          bun -e 'import plugin from "@mirsella/browser-mcp/server"; if (plugin.id !== "@mirsella/browser-mcp" || typeof plugin.setup !== "function") process.exit(1)'
+          ./node_modules/@mirsella/browser-mcp/vendor/browser-mcp --version
       - name: Checksum release package
-        run: sha256sum mirsella-opencode-browser-mcp-*.tgz > SHA256SUMS
+        run: sha256sum mirsella-browser-mcp-*.tgz > SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: npm-package
           path: |
-            mirsella-opencode-browser-mcp-*.tgz
+            mirsella-browser-mcp-*.tgz
             SHA256SUMS
           if-no-files-found: error

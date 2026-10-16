@@ -79,15 +79,18 @@ npm pack --dry-run
 
 ## Releases
 
-GitHub releases reuse the package tested by CI. Push a versioned commit to
-`main`, wait for CI, then dispatch `release.yml` with its full `commit` SHA.
-The workflow verifies that commit is still main and attaches the tested
-package and `SHA256SUMS`.
+Push the versioned source commit to `main` for 2.x, or to
+`release/opencode-v1` for 1.x, and wait for CI. Dispatch `release.yml` from
+`main` with the full source `commit` SHA. It verifies the pinned workflow and
+source branch, then reuses the checksummed `npm-package` artifact.
 
-Keep npm, Cargo, and Codex plugin versions synchronized. npm names remain
-unchanged for now. npm publication is a separate, explicit `publish.yml`
-dispatch with `publish_npm=true`; Browser MCP's trusted publisher must first
-be updated for the renamed repository. Do not add an npm token.
+Use `npm_mode=stage` to submit a release for approval on npm's Staged Packages
+page. For a new npm name, a temporary staging-only `NPM_STAGE_TOKEN` can
+bootstrap the first release; remove that secret and revoke the token after
+approval. Configure npm's trusted publisher as this repository's `release.yml`
+without an environment, then use `npm_mode=publish` for OIDC publication.
+Versions 1.x use `opencode1`; 2.x use `latest`. GitHub releases attach the same
+tested tarball and `SHA256SUMS`. Keep npm, Cargo and Codex versions synchronized.
 
 CI runs headed tests against Chrome for Testing 155.0.8059.39. Update the pin
 when validating a new browser version.

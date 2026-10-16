@@ -23,7 +23,7 @@ function partialPolicy(agents: Array<{ permissions: readonly { action: string }[
 }
 
 export default Plugin.define({
-  id: "@mirsella/opencode-browser-mcp",
+  id: "@mirsella/browser-mcp",
   async setup(ctx) {
     const { enabled = true, compactTools = true } = ctx.options;
     if (typeof enabled !== "boolean") throw new Error("enabled must be a boolean");
