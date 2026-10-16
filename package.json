@@ -1,0 +1,76 @@
+{
+  "name": "@mirsella/browser-mcp",
+  "version": "2.0.0",
+  "description": "Session-isolated browser automation over MCP and Chrome DevTools Protocol",
+  "type": "module",
+  "exports": {
+    ".": "./server.ts",
+    "./server": "./server.ts"
+  },
+  "bin": {
+    "browser-mcp": "vendor/browser-mcp"
+  },
+  "files": [
+    "plugin/",
+    "skills/",
+    "vendor/",
+    ".codex-plugin/plugin.json",
+    ".mcp.json",
+    "hooks/",
+    ".agents/plugins/marketplace.json",
+    "README.md",
+    "SECURITY.md",
+    "CONTRIBUTING.md",
+    "LICENSE",
+    "server.ts"
+  ],
+  "keywords": [
+    "opencode",
+    "mcp",
+    "browser",
+    "browser-automation",
+    "cdp",
+    "session-isolation",
+    "chrome-devtools",
+    "chromium",
+    "codex"
+  ],
+  "homepage": "https://github.com/mirsella/browser-mcp#readme",
+  "bugs": "https://github.com/mirsella/browser-mcp/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mirsella/browser-mcp.git"
+  },
+  "license": "MIT",
+  "author": "mirsella",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "engines": {
+    "opencode": ">=2.0.27 <3"
+  },
+  "devDependencies": {
+    "@opencode/plugin": "2.0.28",
+    "@types/node": "24.0.0",
+    "typescript": "5.9.3"
+  },
+  "publishConfig": {
+    "access": "public",
+    "tag": "latest"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": ">=2.0.27 <3"
+  },
+  "dependencies": {
+    "yaml": "2.8.1"
+  },
+  "main": "./server.ts",
+  "scripts": {
+    "build:native": "cargo build --release --target x86_64-unknown-linux-musl",
+    "stage:native": "node scripts/stage-native.mjs",
+    "test": "cargo test --all-targets && bun test tests/plugin.test.ts"
+  }
+}

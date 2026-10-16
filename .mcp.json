@@ -1,0 +1,36 @@
+{
+  "mcpServers": {
+    "browser": {
+      "command": "./vendor/browser-mcp",
+      "cwd": ".",
+      "env_vars": [
+        "DBUS_SESSION_BUS_ADDRESS",
+        "DESKTOP_SESSION",
+        "DISPLAY",
+        "GDK_BACKEND",
+        "OZONE_PLATFORM",
+        "WAYLAND_DISPLAY",
+        "XAUTHORITY",
+        "XDG_CURRENT_DESKTOP",
+        "XDG_RUNTIME_DIR",
+        "XDG_SESSION_TYPE",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "OPENCODE_BROWSER_PROFILE",
+        "OPENCODE_BROWSER_SESSION_LAYOUT",
+        "OPENCODE_BROWSER_EXECUTABLE",
+        "OPENCODE_BROWSER_HEADLESS",
+        "OPENCODE_BROWSER_DISABLE_CRASH_REPORTER",
+        "OPENCODE_BROWSER_CDP_HOST",
+        "OPENCODE_BROWSER_CDP_PORT",
+        "OPENCODE_BROWSER_IDLE_MINUTES",
+        "OPENCODE_BROWSER_MAX_PAGES",
+        "OPENCODE_BROWSER_STARTUP_SECONDS",
+        "OPENCODE_BROWSER_OPERATION_SECONDS",
+        "OPENCODE_BROWSER_DOWNSTREAM_COMMAND"
+      ],
+      "startup_timeout_sec": 40,
+      "tool_timeout_sec": 540
+    }
+  }
+}
