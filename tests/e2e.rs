@@ -1729,10 +1729,12 @@ async fn interrupted_worker_is_replaced_without_replaying_the_action() {
     );
     let log_path = std::fs::read_dir(root.join("state/browser-mcp"))
         .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            let name = path.file_name().unwrap().to_str().unwrap();
+            name.starts_with("broker-") && name.ends_with(".log")
+        })
+        .expect("broker diagnostics log");
     let diagnostics = std::fs::read_to_string(&log_path).unwrap();
     assert!(diagnostics.contains("Browser request exceeded"));
     assert!(diagnostics.contains("interrupted_action=true"));
