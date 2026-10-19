@@ -158,7 +158,23 @@ async fn codex_end(runtime: &Path, profile: &Path, port: u16, id: &str) {
 }
 
 fn runtime_command(runtime: &Path, profile: &Path, port: u16, layout: &str) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_browser-mcp"));
+    runtime_command_for(
+        Path::new(env!("CARGO_BIN_EXE_browser-mcp")),
+        runtime,
+        profile,
+        port,
+        layout,
+    )
+}
+
+fn runtime_command_for(
+    executable: &Path,
+    runtime: &Path,
+    profile: &Path,
+    port: u16,
+    layout: &str,
+) -> Command {
+    let mut command = Command::new(executable);
     command
         .env("XDG_RUNTIME_DIR", runtime)
         .env("OPENCODE_BROWSER_PROFILE", profile)
@@ -635,6 +651,8 @@ async fn recovers_from_browser_worker_and_broker_process_deaths() {
     std::fs::create_dir_all(&root).unwrap();
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
     let profile = root.join("profile");
+    let executable = root.join("installed-browser-mcp");
+    std::fs::copy(env!("CARGO_BIN_EXE_browser-mcp"), &executable).unwrap();
     let socket = broker_socket(&profile);
     let worker_pids = root.join("workers");
     let launcher = root.join("downstream");
@@ -653,8 +671,11 @@ async fn recovers_from_browser_worker_and_broker_process_deaths() {
         .unwrap()
         .port();
     let make_client = || async {
-        let mut command = adapter_command(&root, true, &profile, port, "shared-window");
-        command.env("OPENCODE_BROWSER_DOWNSTREAM_COMMAND", &launcher);
+        let mut command = runtime_command_for(&executable, &root, &profile, port, "shared-window");
+        command.arg("--direct-tools");
+        command
+            .env("OPENCODE_BROWSER_DOWNSTREAM_COMMAND", &launcher)
+            .env("XDG_STATE_HOME", root.join("state"));
         ().serve(TokioChildProcess::new(command).unwrap())
             .await
             .unwrap()
@@ -818,6 +839,30 @@ async fn recovers_from_browser_worker_and_broker_process_deaths() {
         text(&counter)
     );
 
+    let browser_pid = browser_process_id(port).await;
+    let log_id = xxhash_rust::xxh3::xxh3_64(profile.as_os_str().as_encoded_bytes());
+    let log_directory = root.join("state/browser-mcp");
+    let broker_log =
+        std::fs::read_to_string(log_directory.join(format!("broker-{log_id:016x}.log"))).unwrap();
+    let writer_pid: u32 = broker_log
+        .lines()
+        .find(|line| line.contains("browser stderr writer ready"))
+        .unwrap()
+        .split("pid=")
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let writer_pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, writer_pid, 0) as i32 };
+    assert!(writer_pidfd >= 0);
+    let writer_exit = tokio::io::unix::AsyncFd::new(unsafe {
+        <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(writer_pidfd)
+    })
+    .unwrap();
+
     // Broker death leaves the upstream stdio connection and surviving browser intact.
     let old_pid = broker_pid(&socket).await;
     let interrupted = a.call_tool(request("evaluate_script", "crash-a", json!({"function": "async () => { window.brokerCrashCount = (window.brokerCrashCount || 0) + 1; await new Promise(resolve => setTimeout(resolve, 30000)); return window.brokerCrashCount; }"})));
@@ -856,9 +901,34 @@ async fn recovers_from_browser_worker_and_broker_process_deaths() {
         );
     }
 
+    // Write through the surviving browser's real stderr FD after broker replacement.
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(format!("/proc/{browser_pid}/fd/2"))
+        .unwrap()
+        .write_all(b"stderr-after-broker-replacement\n")
+        .unwrap();
+
     // Browser death starts a new generation and discards old target mappings.
     kill_process(browser_process_id(port).await, libc::SIGKILL);
     wait_for_browser_exit(port).await;
+    drop(
+        tokio::time::timeout(Duration::from_secs(5), writer_exit.readable())
+            .await
+            .expect("stderr writer survived browser pipe EOF")
+            .unwrap(),
+    );
+    let browser_log = log_directory.join(format!("browser-{log_id:016x}.log"));
+    assert!(
+        std::fs::read_to_string(&browser_log)
+            .unwrap()
+            .contains("stderr-after-broker-replacement")
+    );
+    assert_eq!(
+        std::fs::metadata(browser_log).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
     let empty = call_ok(&a, "list_pages", "crash-a", json!({})).await;
     assert_eq!(empty.structured_content.unwrap()["pages"], json!([]));
     assert_ne!(
@@ -905,6 +975,14 @@ async fn recovers_from_browser_worker_and_broker_process_deaths() {
         json!({"url": format!("{url}/#after-group-kill")}),
     )
     .await;
+
+    // Unlink the running image only after broker restart checks; the surviving
+    // broker must still be able to launch a stderr helper for a new browser.
+    std::fs::remove_file(&executable).unwrap();
+    kill_process(browser_process_id(port).await, libc::SIGKILL);
+    wait_for_browser_exit(port).await;
+    let empty = call_ok(&a, "list_pages", "crash-a", json!({})).await;
+    assert_eq!(empty.structured_content.unwrap()["pages"], json!([]));
 
     a.cancel().await.unwrap();
     b.cancel().await.unwrap();
@@ -1520,6 +1598,156 @@ async fn exercise_window_per_session_layout() {
 async fn isolates_sessions_in_both_window_layouts() {
     exercise_shared_broker().await;
     exercise_window_per_session_layout().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Chromium and the real Chrome DevTools MCP worker"]
+async fn interrupted_worker_is_replaced_without_replaying_the_action() {
+    let root = std::env::temp_dir().join(format!("browser-mcp-interrupted-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let profile = root.join("profile");
+    let worker_pids = root.join("workers");
+    let launcher = root.join("downstream");
+    std::fs::write(
+        &launcher,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\nexec bunx \"$@\"\n",
+            worker_pids.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut command = adapter_command(&root, false, &profile, port, "shared-window");
+    command.env("OPENCODE_BROWSER_OPERATION_SECONDS", "5");
+    command.env("XDG_STATE_HOME", root.join("state"));
+    command.env("OPENCODE_BROWSER_DOWNSTREAM_COMMAND", &launcher);
+    let client = ().serve(TokioChildProcess::new(command).unwrap()).await.unwrap();
+    call_ok(&client, "help", "interrupted", json!({})).await;
+    codex_call(
+        &client,
+        "navigate_page",
+        "interrupted",
+        json!({
+            "url": "data:text/html,<title>Retained tab</title><h1>Recovery check</h1>"
+        }),
+    )
+    .await;
+    let before = browser_tabs(port).await;
+    let page = before
+        .iter()
+        .find(|tab| tab["title"] == "Retained tab")
+        .unwrap();
+    let result = client.call_tool(codex_request("evaluate_script", "interrupted", json!({
+        "function": "async () => { window.actionCount = (window.actionCount || 0) + 1; await new Promise(() => {}); }"
+    })).await).await.unwrap();
+    assert!(result.is_error.unwrap_or(false));
+    assert!(text(&result).contains("deadline"), "{}", text(&result));
+    let recovered = codex_call(
+        &client,
+        "evaluate_script",
+        "interrupted",
+        json!({
+            "function": "() => ({ count: window.actionCount, title: document.title })"
+        }),
+    )
+    .await;
+    let output = text(&recovered);
+    let returned = output
+        .split_once("```json\n")
+        .unwrap()
+        .1
+        .split_once("\n```")
+        .unwrap()
+        .0;
+    let returned: Value = serde_json::from_str(returned).unwrap();
+    assert_eq!(
+        returned["count"], 1,
+        "action replayed or tab lost: {output}"
+    );
+    assert_eq!(returned["title"], "Retained tab");
+    assert!(
+        browser_tabs(port)
+            .await
+            .iter()
+            .any(|tab| tab["id"] == page["id"]),
+        "recovery replaced the owned tab"
+    );
+    call_ok(&client, "dispatch", "opencode-recovery", json!({
+        "action": "navigate_page", "arguments": {"url": "data:text/html,<h1>OpenCode recovery</h1>"}
+    })).await;
+    let snapshot = call_ok(
+        &client,
+        "dispatch",
+        "opencode-recovery",
+        json!({
+            "action": "take_snapshot", "arguments": {}
+        }),
+    )
+    .await;
+    assert!(text(&snapshot).contains("OpenCode recovery"));
+    let worker_pid: libc::pid_t = std::fs::read_to_string(&worker_pids)
+        .unwrap()
+        .lines()
+        .last()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, worker_pid, 0) } as std::os::fd::RawFd;
+    assert!(
+        pidfd >= 0,
+        "failed to observe worker {worker_pid}: {}",
+        std::io::Error::last_os_error()
+    );
+    let pidfd: std::os::fd::OwnedFd = unsafe { std::os::fd::FromRawFd::from_raw_fd(pidfd) };
+    let exited = tokio::io::unix::AsyncFd::new(pidfd).unwrap();
+    let result = client.call_tool(request("dispatch", "opencode-recovery", json!({
+        "action": "evaluate_script", "arguments": {"function": "async () => { await new Promise(() => {}); }"}
+    }))).await.unwrap();
+    assert!(result.is_error.unwrap_or(false));
+    assert!(text(&result).contains("deadline"), "{}", text(&result));
+    let status = runtime_command(&root, &profile, port, "shared-window")
+        .env("OPENCODE_BROWSER_OPERATION_SECONDS", "5")
+        .env("XDG_STATE_HOME", root.join("state"))
+        .env("OPENCODE_BROWSER_DOWNSTREAM_COMMAND", &launcher)
+        .arg("release-session")
+        .arg("opencode-recovery")
+        .status()
+        .await
+        .unwrap();
+    assert!(status.success());
+    drop(
+        tokio::time::timeout(Duration::from_secs(10), exited.readable())
+            .await
+            .expect("retirement pooled the interrupted worker instead of stopping it")
+            .unwrap(),
+    );
+    let log_path = std::fs::read_dir(root.join("state/browser-mcp"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let diagnostics = std::fs::read_to_string(&log_path).unwrap();
+    assert!(diagnostics.contains("Browser request exceeded"));
+    assert!(diagnostics.contains("interrupted_action=true"));
+    assert!(
+        !diagnostics.contains("window.actionCount"),
+        "diagnostics logged tool arguments"
+    );
+    assert_eq!(
+        std::fs::metadata(log_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    client.cancel().await.unwrap();
+    wait_for_broker_exit(&broker_socket(&profile), &profile).await;
+    wait_for_browser_exit(port).await;
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]

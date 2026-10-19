@@ -17,6 +17,7 @@ use super::{
     persistence::OwnershipPersistence, validate_config,
 };
 use anyhow::{Context, Result, anyhow, bail};
+use futures_util::FutureExt;
 use rmcp::{
     RoleClient, ServerHandler, ServiceExt,
     model::{
@@ -36,7 +37,7 @@ use tokio::{
     task::JoinSet,
     time::{Instant, interval, sleep, timeout},
 };
-use tracing::{error, info, warn};
+use tracing::{Instrument, info, warn};
 use xxhash_rust::xxh3::xxh3_64;
 
 const STATE_FILE: &str = "opencode-browser-mcp.state.json";
@@ -103,6 +104,9 @@ pub(super) async fn run(cli: Cli) -> Result<()> {
         command,
     } = cli;
     match command {
+        Some(ProcessMode::BrowserStderr { .. }) => {
+            bail!("browser stderr writer must run outside the broker runtime")
+        }
         Some(ProcessMode::ManagedBroker) => {
             let encoded = std::env::var(MANAGED_CONFIG_ENV)
                 .context("managed browser broker configuration is missing")?;
@@ -262,9 +266,15 @@ impl Adapter {
                 None,
             ));
         }
-        let request_timeout = Duration::from_secs(self.config.operation_seconds)
-            + BROKER_START_TIMEOUT
-            + super::WORKER_START_TIMEOUT;
+        let operation_timeout = Duration::from_secs(self.config.operation_seconds);
+        let budget = match &request {
+            ClientRequest::ListToolsRequest(_) => super::CATALOG_TIMEOUT,
+            ClientRequest::CallToolRequest(call) => {
+                tool_budget(&call.params.name, operation_timeout)
+            }
+            _ => operation_timeout,
+        };
+        let request_timeout = budget + HANDSHAKE_TIMEOUT;
         let handle = client
             .send_cancellable_request(request, PeerRequestOptions::with_timeout(request_timeout))
             .await
@@ -547,6 +557,7 @@ async fn run_managed_broker(config: Arc<Config>, paths: RuntimePaths) -> Result<
 
 async fn run_broker(config: Arc<Config>, paths: RuntimePaths, _socket_lease: File) -> Result<()> {
     let _profile_lease = profile_lease(&config.profile)?;
+    super::logging::enable(&config.profile)?;
     let persistence = OwnershipPersistence::open(config.profile.join(STATE_FILE))?;
     let signal = shutdown_signal();
     tokio::pin!(signal);
@@ -1043,20 +1054,21 @@ impl ServerHandler for Connection {
     }
     async fn list_tools(
         &self,
-        request: Option<PaginatedRequestParams>,
+        _request: Option<PaginatedRequestParams>,
         context: RequestContext<rmcp::RoleServer>,
     ) -> Result<ListToolsResult, rmcp::ErrorData> {
-        let _ = (request, context);
         let tools = if self.compact {
             compact_tools()
         } else {
-            self.proxy
-                .catalog
-                .get(&self.workspace)
-                .await
-                .map_err(|error| rmcp::ErrorData::internal_error(error.to_string(), None))?
-                .tools
-                .clone()
+            bounded_request(
+                super::CATALOG_TIMEOUT,
+                &context,
+                self.proxy.catalog.get(&self.workspace),
+            )
+            .await
+            .map_err(|error| rmcp::ErrorData::internal_error(error.to_string(), None))?
+            .tools
+            .clone()
         };
         Ok(ListToolsResult::with_all_items(tools))
     }
@@ -1080,9 +1092,19 @@ impl ServerHandler for Connection {
                 .into());
             }
         };
-        let result: Result<_> = async {
+        let budget = tool_budget(&request.name, self.proxy.operation_timeout);
+        let span = tracing::info_span!("browser_request", request_id = ?context.id, tool = %request.name, session_id = tracing::field::Empty);
+        let result: Result<_> = bounded_request(budget, &context, async {
+            info!(
+                timeout_seconds = budget.as_secs(),
+                workspace = %self.workspace.display(),
+                "browser request started"
+            );
             let (id, mut request) = route_request(request)?;
+            tracing::Span::current().record("session_id", &id);
+            info!("waiting for Chrome DevTools tool catalog");
             let catalog = self.proxy.catalog.get(&self.workspace).await?;
+            info!("Chrome DevTools tool catalog available");
             if self.compact {
                 match request.name.as_ref() {
                     "dispatch" => request = expand_dispatch(request, &catalog.tools)?,
@@ -1093,16 +1115,56 @@ impl ServerHandler for Connection {
             self.proxy
                 .route_call(&catalog, &self.workspace, &id, request, &context)
                 .await
-        }
+        })
+        .instrument(span)
         .await;
-        match result {
-            Ok(result) => Ok(result.into()),
-            Err(error) => {
-                error!(%error, workspace = %self.workspace.display(), "browser tool call failed");
-                Ok(CallToolResult::error(vec![ContentBlock::text(error.to_string())]).into())
-            }
+        Ok(result
+            .unwrap_or_else(|error| {
+                CallToolResult::error(vec![ContentBlock::text(error.to_string())])
+            })
+            .into())
+    }
+}
+
+fn tool_budget(name: &str, operation_timeout: Duration) -> Duration {
+    if name == "help" {
+        super::CATALOG_TIMEOUT
+    } else {
+        operation_timeout
+    }
+}
+
+async fn bounded_request<T>(
+    budget: Duration,
+    context: &RequestContext<rmcp::RoleServer>,
+    request: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    fn interrupted(reason: impl std::fmt::Display) -> anyhow::Error {
+        anyhow!(
+            "Browser request {reason}. The action may have taken effect; inspect browser state before retrying. Interrupted workers are replaced on the next call."
+        )
+    }
+
+    let started = Instant::now();
+    let result = tokio::select! {
+        biased;
+        _ = context.ct.cancelled() => Err(interrupted("cancelled")),
+        result = timeout(budget, std::panic::AssertUnwindSafe(request).catch_unwind()) => match result {
+            Ok(Ok(result)) => result,
+            Ok(Err(payload)) => Err(interrupted(format_args!("panicked: {}", super::panic_message(payload.as_ref())))),
+            Err(_) => Err(interrupted(format_args!("exceeded its {}-second deadline", budget.as_secs()))),
+        },
+    };
+    match &result {
+        Ok(_) => info!(
+            elapsed_ms = started.elapsed().as_millis(),
+            "browser request finished"
+        ),
+        Err(error) => {
+            warn!(error = %format_args!("{error:#}"), elapsed_ms = started.elapsed().as_millis(), "browser request failed")
         }
     }
+    result
 }
 
 fn browser_server_info() -> ServerInfo {
@@ -1531,9 +1593,67 @@ fn is_transient_disconnect(error: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    use futures_util::FutureExt;
     use serde_json::{Value, json};
 
     use super::*;
+
+    #[tokio::test]
+    async fn stalled_request_returns_an_error_and_next_request_can_succeed() {
+        let path =
+            std::env::temp_dir().join(format!("browser-mcp-pending-{}.json", std::process::id()));
+        let config = Arc::new(
+            Cli::try_parse_from(["browser-mcp", "--headless=true"])
+                .unwrap()
+                .config,
+        );
+        let mut proxy =
+            BrowserProxy::new(config, OwnershipPersistence::open(path).unwrap()).unwrap();
+        proxy.operation_timeout = Duration::from_millis(10);
+        *proxy.catalog.future.lock().await = Some(futures_util::future::pending().boxed().shared());
+        let connection = Connection {
+            proxy: proxy.clone(),
+            workspace: PathBuf::from("/"),
+            compact: true,
+            lifecycle: Arc::default(),
+        };
+        let (server_io, client_io) = tokio::io::duplex(4096);
+        let (server, client) = tokio::join!(connection.serve(server_io), ().serve(client_io));
+        let server = server.unwrap();
+        let client = client.unwrap();
+        let result = timeout(
+            Duration::from_secs(1),
+            client.call_tool(CallToolRequestParams::new("dispatch")),
+        )
+        .await
+        .expect("stalled catalog kept the request open")
+        .unwrap();
+        assert!(result.is_error.unwrap_or(false));
+        assert!(
+            result.content[0]
+                .as_text()
+                .unwrap()
+                .text
+                .contains("deadline")
+        );
+        *proxy.catalog.future.lock().await = Some(
+            async {
+                Ok(Arc::new(super::super::ToolCatalog {
+                    tools: Vec::new(),
+                    page_scoped: Default::default(),
+                }))
+            }
+            .boxed()
+            .shared(),
+        );
+        let result = client
+            .call_tool(CallToolRequestParams::new("help"))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+        client.cancel().await.unwrap();
+        server.cancel().await.unwrap();
+    }
 
     #[tokio::test]
     async fn adapter_cancellation_reaches_the_broker_request() {

@@ -51,6 +51,34 @@ OpenCode loads the JavaScript `./server` package export. Codex uses the
 plugin and MCP manifests plus the session hooks. Both integrations launch
 the same packaged Rust executable.
 
+## Timeouts and diagnostics
+
+Each browser action has one deadline for catalog discovery, browser startup,
+session locking, execution, and reconciliation. `OPENCODE_BROWSER_OPERATION_SECONDS`
+sets that deadline and defaults to 540 seconds. Catalog discovery and compact
+help have a separate 70-second limit. A failed or panicking catalog discovery
+can be retried without restarting the broker.
+
+After an interrupted action, the next call replaces that session's worker and
+reconciles its existing owned tabs. Actions are never replayed automatically.
+Dispatched tab creation finishes registering ownership or closing that exact
+target after caller cancellation. Inspect the page before retrying a write
+because it may already have taken effect.
+
+The broker writes diagnostics to
+`$XDG_STATE_HOME/browser-mcp/broker-<profile-hash>.log`, or
+`~/.local/state/browser-mcp/` when `XDG_STATE_HOME` is unset. Its startup message
+prints the exact path. Logs are readable only by your user and also go to stderr.
+
+Request tracing records the tool name, session ID, current stage, and elapsed
+time. It does not record tool arguments. If a call stalls, look for its last
+stage and whether the broker recorded a deadline, cancellation, catalog failure,
+or worker replacement. Browser stderr is captured in
+`browser-<profile-hash>.log` in the same directory. Its separate writer survives
+broker replacement and exits when Chromium closes the pipe. Each broker or
+browser log retains an 8 MiB file and one rotated `.log.1` backup. A browser that
+exits during startup reports that exit immediately.
+
 ## Codex setup
 
 The release tarball contains the executable, both integrations, and a local

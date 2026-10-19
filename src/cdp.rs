@@ -98,6 +98,7 @@ struct State {
     owners: HashMap<TargetId, BrowserSessionId>, // keyed by stable tab target
     owner_revision: u64,
     retired_sessions: HashSet<BrowserSessionId>,
+    session_lifetimes: HashMap<BrowserSessionId, Arc<()>>,
     /// Every flattened CDP attachment, including direct tab attachments. This
     /// is the canonical session tree; a root has no parent session.
     sessions: HashMap<String, CdpSession>,
@@ -326,6 +327,7 @@ struct Command {
 }
 
 struct TrackerControl {
+    creation: Arc<Mutex<()>>,
     shutdown: watch::Sender<()>,
     run_loop: Mutex<Option<tokio::task::JoinHandle<()>>>,
     abort: tokio::task::AbortHandle,
@@ -339,7 +341,6 @@ pub struct TargetTracker {
     state: Arc<Mutex<State>>,
     commands: mpsc::Sender<Command>,
     synchronize_lock: Arc<Mutex<()>>,
-    tab_creation: Arc<Mutex<()>>,
     persistence: Arc<OwnershipPersistence>,
     control: Arc<TrackerControl>,
 }
@@ -376,21 +377,20 @@ impl TargetTracker {
             stopped.clone(),
         ));
         let abort = run_loop.abort_handle();
-        let tracker = Self {
+        Ok(Self {
             generation,
             state,
             commands,
             synchronize_lock: Arc::new(Mutex::new(())),
-            tab_creation: Arc::new(Mutex::new(())),
             persistence,
             control: Arc::new(TrackerControl {
+                creation: Arc::new(Mutex::new(())),
                 shutdown,
                 run_loop: Mutex::new(Some(run_loop)),
                 abort,
                 stopped,
             }),
-        };
-        Ok(tracker)
+        })
     }
 
     pub fn generation(&self) -> &str {
@@ -403,7 +403,13 @@ impl TargetTracker {
         Self::shutdown_control(&self.control).await;
     }
 
-    async fn shutdown_control(control: &Arc<TrackerControl>) {
+    async fn shutdown_control(control: &TrackerControl) {
+        // Keep the event loop alive while dispatched creations finish claiming
+        // or closing their exact targets, even if their callers went away.
+        let creation = timeout(TRACKER_SHUTDOWN_TIMEOUT, control.creation.lock()).await;
+        if creation.is_err() {
+            warn!("timed out draining browser target creation before tracker shutdown");
+        }
         let _ = control.shutdown.send(());
         if let Some(mut run_loop) = control.run_loop.lock().await.take() {
             if timeout(TRACKER_SHUTDOWN_TIMEOUT, &mut run_loop)
@@ -483,8 +489,15 @@ impl TargetTracker {
 
     /// Explicitly assigns one exact browser `tab` to a browser session.
     /// Existing ownership is never overwritten.
-    async fn claim_root_tab(&self, session: &str, tab: &str) -> Result<()> {
+    async fn claim_root_tab(&self, session: &str, lifetime: &Arc<()>, tab: &str) -> Result<bool> {
         let mut state = self.available().await?;
+        if !state
+            .session_lifetimes
+            .get(session)
+            .is_some_and(|current| Arc::ptr_eq(current, lifetime))
+        {
+            return Ok(false);
+        }
         let previous = state.owners.clone();
         state.claim_tab(session, tab)?;
         let snapshot = state.ownership_snapshot_if_changed(&previous);
@@ -496,7 +509,7 @@ impl TargetTracker {
         {
             return Err(error.context("failed to persist browser target ownership"));
         }
-        Ok(())
+        Ok(true)
     }
 
     pub async fn owner_of(&self, target: &str) -> Result<Option<BrowserSessionId>> {
@@ -504,7 +517,11 @@ impl TargetTracker {
     }
 
     pub async fn activate_session(&self, session: &str) -> Result<()> {
-        self.available().await?.retired_sessions.remove(session);
+        let mut state = self.available().await?;
+        state.retired_sessions.remove(session);
+        state
+            .session_lifetimes
+            .insert(session.to_owned(), Arc::new(()));
         Ok(())
     }
 
@@ -515,6 +532,7 @@ impl TargetTracker {
             bail!("browser session still owns browser tabs");
         }
         state.retired_sessions.insert(session.to_owned());
+        state.session_lifetimes.remove(session);
         Ok(())
     }
 
@@ -564,27 +582,31 @@ impl TargetTracker {
         preferred_anchor: Option<&str>,
         max_pages: usize,
     ) -> Result<TargetId> {
-        let owned = {
-            let state = self.available().await?;
+        // Serialize capacity checks through ownership commit, and let shutdown
+        // drain the detached transaction even if its caller goes away.
+        let creation = self.control.creation.clone().lock_owned().await;
+        let (owned, lifetime) = {
+            let mut state = self.available().await?;
             if state.retired_sessions.contains(session) {
                 bail!("browser session {session} is retiring");
             }
             let owned = state.session_tabs(session);
             ensure_page_capacity(owned.len(), max_pages)?;
-            owned
+            let lifetime = state
+                .session_lifetimes
+                .entry(session.to_owned())
+                .or_default()
+                .clone();
+            (owned, lifetime)
         };
-        let (_creation, anchor) = match layout {
-            SessionLayout::SharedWindow => (None, None),
-            SessionLayout::WindowPerSession => {
-                let creation = self.tab_creation.lock().await;
-                let anchor = preferred_anchor
-                    .filter(|preferred| owned.iter().any(|tab| tab == preferred))
-                    .map(str::to_owned)
-                    .or_else(|| owned.first().cloned());
-                (Some(creation), anchor)
-            }
+        let anchor = match layout {
+            SessionLayout::SharedWindow => None,
+            SessionLayout::WindowPerSession => preferred_anchor
+                .filter(|preferred| owned.iter().any(|tab| tab == preferred))
+                .map(str::to_owned)
+                .or_else(|| owned.first().cloned()),
         };
-        let new_window = _creation.is_some() && anchor.is_none();
+        let new_window = layout == SessionLayout::WindowPerSession && anchor.is_none();
         let expected_window = if let Some(anchor) = anchor.as_deref() {
             let window = match self.target_window(anchor).await {
                 Ok(window) => Some(window),
@@ -604,47 +626,78 @@ impl TargetTracker {
         if new_window {
             parameters["newWindow"] = Value::Bool(true);
         }
-        let result = self
-            .command("Target.createTarget", parameters, None)
-            .await?;
-        let tab = result
-            .get("targetId")
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
-            .ok_or_else(|| anyhow!("Target.createTarget returned no targetId"))?
-            .to_owned();
-        if let Err(error) = self.synchronize().await {
-            // Best-effort cleanup of the exact ID returned by CDP. Do not
-            // substitute a similarly timed target.
-            let _ = self
-                .command("Target.closeTarget", json!({"targetId": &tab}), None)
-                .await;
-            return Err(error);
-        }
-        if let Err(error) = self.claim_root_tab(session, &tab).await {
-            let _ = self
-                .command("Target.closeTarget", json!({"targetId": &tab}), None)
-                .await;
-            self.fail_closed().await;
-            return Err(error);
-        }
-        if !background && let Err(error) = self.activate_target(&tab).await {
-            warn!(%error, session_id = %session, tab, "could not focus new browser tab");
-        }
-        drop(_creation);
-        if let Some(expected_window) = expected_window {
-            match self.target_window(&tab).await {
-                Ok(actual_window) if actual_window != expected_window => {
-                    warn!(session_id = %session, tab, expected_window, actual_window, "browser placed new tab outside the session window");
-                }
-                Ok(_) => {}
-                Err(error) if self.is_available().await => {
-                    warn!(%error, session_id = %session, tab, "could not verify new tab window placement")
-                }
-                Err(error) => return Err(error),
+        let tracker = self.clone();
+        let session = session.to_owned();
+        let (reply, completion) = oneshot::channel();
+        tokio::spawn(async move {
+            let _creation = creation;
+            if reply.is_closed() {
+                return;
             }
-        }
-        Ok(tab)
+            let result = async move {
+                let result = tracker
+                    .command("Target.createTarget", parameters, None)
+                    .await?;
+                let tab = result
+                    .get("targetId")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| anyhow!("Target.createTarget returned no targetId"))?
+                    .to_owned();
+                if let Err(error) = tracker.synchronize().await {
+                    // Best-effort cleanup of the exact ID returned by CDP. Do not
+                    // substitute a similarly timed target.
+                    let _ = tracker
+                        .command("Target.closeTarget", json!({"targetId": &tab}), None)
+                        .await;
+                    return Err(error);
+                }
+                match tracker.claim_root_tab(&session, &lifetime, &tab).await {
+                    Ok(true) => {},
+                    Ok(false) => {
+                        if let Err(error) = tracker.command("Target.closeTarget", json!({"targetId": &tab}), None).await {
+                            tracker.fail_closed().await;
+                            return Err(error.context("failed to close target created for a retired session"));
+                        }
+                        bail!("browser session lifetime ended before tab ownership registration");
+                    }
+                    Err(error) => {
+                        let _ = tracker.command("Target.closeTarget", json!({"targetId": &tab}), None).await;
+                        tracker.fail_closed().await;
+                        return Err(error);
+                    }
+                }
+                if !background && let Err(error) = tracker.activate_target(&tab).await {
+                    warn!(%error, session_id = %session, tab, "could not focus new browser tab");
+                }
+                if let Some(expected_window) = expected_window {
+                    match tracker.target_window(&tab).await {
+                        Ok(actual_window) if actual_window != expected_window => {
+                            warn!(session_id = %session, tab, expected_window, actual_window, "browser placed new tab outside the session window");
+                        }
+                        Ok(_) => {}
+                        Err(error) if tracker.is_available().await => {
+                            warn!(%error, session_id = %session, tab, "could not verify new tab window placement")
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Ok(tab)
+            }.await;
+            if let Err(result) = reply.send(result) {
+                match result {
+                    Ok(tab) => {
+                        tracing::info!(tab, "registered browser target after caller cancellation")
+                    }
+                    Err(error) => {
+                        warn!(error = %format_args!("{error:#}"), "browser target creation failed after caller cancellation")
+                    }
+                }
+            }
+        });
+        completion
+            .await
+            .context("browser target creation task terminated")?
     }
 
     async fn activate_target(&self, tab: &str) -> Result<()> {
@@ -1006,6 +1059,140 @@ fn parse_target(value: &Value) -> Result<TargetRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn cancelled_creation_finishes_ownership_or_closes_the_exact_target() {
+        for mode in 0..3 {
+            let retire = mode != 0;
+            let root = std::env::temp_dir().join(format!("creation-{}-{mode}", std::process::id()));
+            std::fs::create_dir_all(&root).unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let generation = format!("ws://{}", listener.local_addr().unwrap());
+            let persistence = OwnershipPersistence::open(root.join("owners.json")).unwrap();
+            persistence.activate_generation(&generation).unwrap();
+            let (dispatched, dispatch) = oneshot::channel();
+            let (complete, response) = oneshot::channel();
+            let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let observed_closed = closed.clone();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let mut dispatched = Some(dispatched);
+                let mut response = Some(response);
+                while let Some(Ok(Message::Text(text))) = socket.next().await {
+                    let request: Value = serde_json::from_str(&text).unwrap();
+                    let result = match request["method"].as_str().unwrap() {
+                        "Target.createTarget" => {
+                            dispatched.take().unwrap().send(()).unwrap();
+                            response.take().unwrap().await.unwrap();
+                            json!({"targetId": "created"})
+                        }
+                        "Target.getTargets" => json!({"targetInfos": [
+                            {"targetId": "created", "type": "tab"},
+                            {"targetId": "unowned", "type": "tab"}
+                        ]}),
+                        "Target.attachToTarget" => {
+                            json!({"sessionId": format!("attach-{}", request["params"]["targetId"])})
+                        }
+                        "Target.setDiscoverTargets" | "Target.setAutoAttach" => json!({}),
+                        "Target.closeTarget" => {
+                            assert_eq!(request["params"]["targetId"], "created");
+                            observed_closed.store(true, std::sync::atomic::Ordering::SeqCst);
+                            json!({"success": true})
+                        }
+                        method => panic!("unexpected CDP command {method}"),
+                    };
+                    socket
+                        .send(Message::Text(
+                            json!({"id": request["id"], "result": result})
+                                .to_string()
+                                .into(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+            });
+            let tracker = TargetTracker::connect(generation, persistence, HashMap::new(), 0)
+                .await
+                .unwrap();
+            let creation = tokio::spawn({
+                let tracker = tracker.clone();
+                async move {
+                    tracker
+                        .create_owned_tab(
+                            "cancelled",
+                            "about:blank",
+                            true,
+                            SessionLayout::SharedWindow,
+                            None,
+                            1,
+                        )
+                        .await
+                }
+            });
+            dispatch.await.unwrap();
+            creation.abort();
+            assert!(creation.await.unwrap_err().is_cancelled());
+            if retire {
+                tracker.finalize_session("cancelled").await.unwrap();
+                if mode == 2 {
+                    tracker.activate_session("cancelled").await.unwrap();
+                }
+            }
+            let mut overlapping = Box::pin(tracker.create_owned_tab(
+                "cancelled",
+                "about:blank",
+                true,
+                SessionLayout::SharedWindow,
+                None,
+                1,
+            ));
+            if !retire {
+                tokio::select! {
+                    biased;
+                    result = &mut overlapping => panic!("overlapping creation did not wait: {result:?}"),
+                    _ = tokio::task::yield_now() => {},
+                }
+            }
+            complete.send(()).unwrap();
+            if !retire {
+                let error = overlapping.await.unwrap_err();
+                assert!(
+                    matches!(
+                        error.downcast_ref::<OwnershipError>(),
+                        Some(OwnershipError::TooManyPages { owned: 1, max: 1 })
+                    ),
+                    "{error:#}"
+                );
+            }
+
+            let drained = timeout(Duration::from_secs(2), tracker.control.creation.lock())
+                .await
+                .expect("creation did not finish after caller cancellation");
+            assert!(
+                tracker.is_available().await,
+                "retirement cleanup disabled unrelated sessions"
+            );
+            assert_eq!(closed.load(std::sync::atomic::Ordering::SeqCst), retire);
+            let state = tracker.state.lock().await;
+            assert_eq!(
+                state.owner("created"),
+                if retire { None } else { Some("cancelled") }
+            );
+            assert_eq!(state.owner("unowned"), None);
+            drop(state);
+            if !retire {
+                let stored: Value =
+                    serde_json::from_slice(&std::fs::read(root.join("owners.json")).unwrap())
+                        .unwrap();
+                assert_eq!(stored["owners"]["created"], "cancelled");
+            }
+            drop(drained);
+            tracker.shutdown().await;
+            server.await.unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
     fn target(id: &str, kind: &str, opener: Option<&str>) -> TargetRecord {
         TargetRecord {
             id: id.into(),

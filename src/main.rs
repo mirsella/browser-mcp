@@ -3,6 +3,7 @@ use std::{
     ffi::OsString,
     future::Future,
     os::unix::fs::PermissionsExt,
+    panic::AssertUnwindSafe,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -39,6 +40,7 @@ use tracing::{error, info, warn};
 const INTERNAL_URL: &str = "about:blank";
 const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const WORKER_START_TIMEOUT: Duration = Duration::from_secs(30);
+const CATALOG_TIMEOUT: Duration = Duration::from_secs(70);
 const WORKER_HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_SESSION_ID_BYTES: usize = 256;
 const MAX_POOLED_WORKERS: usize = 8;
@@ -141,6 +143,7 @@ fn browser_profile(config_home: &Path, executable: &Path) -> PathBuf {
 mod broker;
 mod cdp;
 mod codex;
+mod logging;
 mod persistence;
 use cdp::{SessionLayout, TargetId, TargetTracker};
 use persistence::{OwnershipPersistence, PersistedSession, RestoredState};
@@ -162,6 +165,8 @@ struct Cli {
 enum ProcessMode {
     #[command(hide = true)]
     ManagedBroker,
+    #[command(hide = true)]
+    BrowserStderr { path: PathBuf },
     /// Release the tabs owned by an agent session.
     #[command(hide = true)]
     ReleaseSession { session_id: String },
@@ -412,7 +417,7 @@ impl BrowserSupervisor {
                 .arg("--disable-popup-blocking")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stderr(logging::browser_stderr(&self.config.profile).await?)
                 .kill_on_drop(true);
             if self.config.headless {
                 command.arg("--headless=new");
@@ -429,7 +434,7 @@ impl BrowserSupervisor {
             info!(executable = %self.config.browser_executable.display(), profile = %self.config.profile.display(), headless = self.config.headless, "starting browser");
             state.process = Some(command.spawn().context("failed to start browser")?);
         }
-        match self.wait_until_ready().await {
+        match self.wait_until_ready(&mut state).await {
             Ok(identity) => {
                 state.trusted_generation = Some(identity.clone());
                 Ok(identity)
@@ -467,11 +472,21 @@ impl BrowserSupervisor {
         self.existing_trusted_endpoint(&mut state).await
     }
 
-    async fn wait_until_ready(&self) -> Result<String> {
+    async fn wait_until_ready(&self, state: &mut SupervisorState) -> Result<String> {
         let deadline = Instant::now()
             .checked_add(Duration::from_secs(self.config.startup_seconds))
             .ok_or_else(|| anyhow!("browser startup timeout is too large"))?;
         while Instant::now() < deadline {
+            if let Some(child) = state.process.as_mut()
+                && let Some(status) = child
+                    .try_wait()
+                    .context("failed to inspect starting browser")?
+            {
+                state.process = None;
+                bail!(
+                    "browser exited before its CDP endpoint became ready ({status}); inspect the browser stderr log in the diagnostics directory"
+                );
+            }
             if let Some(identity) = self.endpoint_identity().await? {
                 info!(url = %self.config.browser_url(), "browser CDP endpoint is ready");
                 return Ok(identity);
@@ -621,6 +636,8 @@ struct Session {
     /// ownership authority; this map is rebuilt from it on every reconcile.
     pages: PageState,
     downstream: Option<Downstream>,
+    /// Remains set if a request future is dropped before reconciliation finishes.
+    action_pending: bool,
 }
 
 impl Session {
@@ -707,6 +724,7 @@ async fn restore_sessions(
                 },
                 pages: PageState::default(),
                 downstream: None,
+                action_pending: false,
             },
         );
     }
@@ -727,6 +745,7 @@ async fn connect_tracker(
 }
 
 async fn spawn_downstream(config: &Config, workspace: &std::path::Path) -> Result<Downstream> {
+    info!(workspace = %workspace.display(), "starting Chrome DevTools MCP worker");
     let scratch = Path::new("/tmp/opencode");
     std::fs::create_dir_all(scratch)
         .context("failed to create browser export scratch directory")?;
@@ -755,13 +774,15 @@ async fn spawn_downstream(config: &Config, workspace: &std::path::Path) -> Resul
         .stderr(Stdio::inherit());
     let transport =
         TokioChildProcess::new(command).context("failed to start Chrome DevTools MCP")?;
-    timeout(
+    let worker = timeout(
         WORKER_START_TIMEOUT,
         DownstreamClient { roots }.serve(transport),
     )
     .await
     .context("timed out initializing Chrome DevTools MCP")?
-    .context("failed to initialize Chrome DevTools MCP")
+    .context("failed to initialize Chrome DevTools MCP")?;
+    info!(workspace = %workspace.display(), "Chrome DevTools MCP worker initialized");
+    Ok(worker)
 }
 
 async fn stop_worker(worker: Downstream) -> Result<()> {
@@ -807,6 +828,50 @@ struct ToolCatalog {
 type CatalogResult = std::result::Result<Arc<ToolCatalog>, Arc<str>>;
 type CatalogFuture = Shared<BoxFuture<'static, CatalogResult>>;
 
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("non-string panic payload")
+}
+
+async fn initialize_catalog(
+    discovery: impl Future<Output = Result<ToolCatalog>>,
+    budget: Duration,
+) -> CatalogResult {
+    let started = Instant::now();
+    info!(
+        timeout_seconds = budget.as_secs(),
+        "initializing Chrome DevTools tool catalog"
+    );
+    // A panic must become a retryable result, not poison the cached Shared future
+    // and panic every later request handler without sending an MCP response.
+    let result = match timeout(budget, AssertUnwindSafe(discovery).catch_unwind()).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(payload)) => Err(anyhow!(
+            "Chrome DevTools tool catalog initialization panicked: {}; retry to start a new discovery",
+            panic_message(payload.as_ref())
+        )),
+        Err(_) => Err(anyhow!(
+            "Chrome DevTools tool catalog initialization timed out; retry to start a new discovery"
+        )),
+    };
+    match &result {
+        Ok(catalog) => info!(
+            elapsed_ms = started.elapsed().as_millis(),
+            tool_count = catalog.tools.len(),
+            "Chrome DevTools tool catalog ready"
+        ),
+        Err(error) => {
+            warn!(error = %format_args!("{error:#}"), elapsed_ms = started.elapsed().as_millis(), "Chrome DevTools tool catalog initialization failed")
+        }
+    }
+    result
+        .map(Arc::new)
+        .map_err(|error| Arc::from(format!("{error:#}")))
+}
+
 struct CatalogLoader {
     config: Arc<Config>,
     worker_pool: WorkerPool,
@@ -832,24 +897,20 @@ impl CatalogLoader {
                     let cancel = self.cancel.subscribe();
                     let workspace = workspace.to_path_buf();
                     let future = async move {
-                        let result =
-                            discover_catalog(&config, &worker_pool, workspace, cancel).await;
-                        if let Err(error) = &result {
-                            warn!(%error, "Chrome DevTools tool catalog initialization failed");
-                        }
-                        result
-                            .map(Arc::new)
-                            .map_err(|error| Arc::from(error.to_string()))
+                        initialize_catalog(
+                            discover_catalog(&config, &worker_pool, workspace, cancel),
+                            CATALOG_TIMEOUT,
+                        )
+                        .await
                     }
                     .boxed()
                     .shared();
-                    let background = future.clone();
-                    tokio::spawn(async move { drop(background.await) });
+                    tokio::spawn(future.clone());
                     future
                 })
                 .clone()
         };
-        future.await.map_err(|error| anyhow!(error.to_string()))
+        future.await.map_err(anyhow::Error::msg)
     }
 
     fn cancel(&self) {
@@ -859,8 +920,10 @@ impl CatalogLoader {
     async fn shutdown(&self) {
         self.cancel();
         let future = self.future.lock().await.clone();
-        if let Some(future) = future {
-            drop(future.await);
+        if let Some(future) = future
+            && timeout(WORKER_STOP_TIMEOUT, future).await.is_err()
+        {
+            warn!("tool catalog did not stop before the shutdown deadline");
         }
     }
 }
@@ -887,6 +950,7 @@ async fn discover_catalog(
         result = spawn_downstream(config, &workspace) => result?,
     };
     let catalog = async {
+        info!("retrieving Chrome DevTools tool catalog");
         let listed = tokio::select! {
             biased;
             _ = cancelled(&mut cancel) => bail!("Chrome DevTools tool catalog initialization stopped"),
@@ -1156,6 +1220,7 @@ impl BrowserProxy {
             self.prune_slot(id, &slot).await;
             bail!("browser session is pending owned-tab cleanup");
         };
+        info!("waiting for browser runtime");
         let tracker_lease = match self.tracker_lease().await {
             Ok(tracker) => tracker,
             Err(error) => {
@@ -1164,6 +1229,7 @@ impl BrowserProxy {
             }
         }; // Must outlive every browser operation below.
         let tracker = &*tracker_lease;
+        info!("waiting for browser session lock");
         let mut guard = match Self::acquire_session_lock(
             &slot.session,
             self.operation_timeout,
@@ -1211,6 +1277,7 @@ impl BrowserProxy {
                 },
                 pages: PageState::default(),
                 downstream: Some(downstream),
+                action_pending: false,
             };
             if let Err(error) = self.persist_session(id, &session) {
                 session.stop_worker(id).await;
@@ -1228,11 +1295,15 @@ impl BrowserProxy {
         if session.persisted.cleanup_pending {
             bail!("browser session is pending owned-tab cleanup");
         }
-        if let Some(worker) = session.downstream.as_ref()
-            && (worker.is_closed() || worker.is_transport_closed())
+        if session.action_pending
+            || session
+                .downstream
+                .as_ref()
+                .is_some_and(|worker| worker.is_closed() || worker.is_transport_closed())
         {
-            warn!(session_id = %id, "restarting unhealthy Chrome DevTools worker; retaining owned tabs");
+            warn!(session_id = %id, interrupted_action = session.action_pending, "restarting unhealthy Chrome DevTools worker; retaining owned tabs");
             session.stop_worker(id).await;
+            session.action_pending = false;
         }
         if session.downstream.is_none() {
             session.downstream = Some(self.acquire_worker(workspace).await?);
@@ -1241,9 +1312,12 @@ impl BrowserProxy {
             bail!("browser request cancelled before dispatch");
         }
         let closes_page = request.name == "close_page";
+        session.action_pending = true;
+        info!(action = %request.name, "dispatching browser action");
         let mut result = self
             .call_session(catalog, tracker, id, session, request)
             .await;
+        session.action_pending = false;
         session.persisted.last_activity_unix_seconds = unix_time_seconds()?;
         if let Err(error) = self.persist_session(id, session) {
             result = Err(error);
@@ -1258,6 +1332,14 @@ impl BrowserProxy {
             && let Err(error) = self.finalize_session(id, tracker, &mut guard, true).await
         {
             result = Err(error.context("failed to finalize closed browser session"));
+        }
+        if result
+            .as_ref()
+            .map_or(true, |result| result.is_error.unwrap_or(false))
+            && let Some(session) = guard.as_mut()
+        {
+            warn!(session_id = %id, "browser call failed; resetting worker without replaying the call or closing owned tabs");
+            session.stop_worker(id).await;
         }
         if slot.cleanup_requested() {
             let recycle_worker = result.is_ok();
@@ -1276,13 +1358,6 @@ impl BrowserProxy {
                     result = Err(error.context("failed to release browser session"));
                 }
             }
-        } else if result
-            .as_ref()
-            .map_or(true, |result| result.is_error.unwrap_or(false))
-            && let Some(session) = guard.as_mut()
-        {
-            warn!(session_id = %id, "browser call failed; resetting worker without replaying the call or closing owned tabs");
-            session.stop_worker(id).await;
         }
         drop(guard);
         self.prune_slot(id, &slot).await;
@@ -1361,7 +1436,10 @@ impl BrowserProxy {
         self.mark_cleanup_pending(id, session)?;
         session.pages.local_to_tab.clear();
         let closed = self.close_owned_pages(id, tracker).await;
-        if reuse_worker {
+        if session.action_pending {
+            warn!(session_id = %id, "discarding interrupted worker during session retirement");
+        }
+        if reuse_worker && !session.action_pending {
             if let Some(worker) = session.downstream.take() {
                 recycle_worker(
                     &self.worker_pool,
@@ -1389,7 +1467,7 @@ impl BrowserProxy {
         let mut session = slot
             .take()
             .ok_or_else(|| anyhow!("browser session disappeared during finalization"))?;
-        if reuse_worker {
+        if reuse_worker && !session.action_pending {
             if let Some(worker) = session.downstream {
                 recycle_worker(&self.worker_pool, session.persisted.workspace, worker).await;
             }
@@ -1462,6 +1540,9 @@ impl BrowserProxy {
         session: &Session,
         request: CallToolRequestParams,
     ) -> Result<CallToolResult> {
+        let started = Instant::now();
+        let action = request.name.clone();
+        info!(%action, "sending Chrome DevTools request");
         let request = ClientRequest::CallToolRequest(CallToolRequest::new(request));
         let response = session
             .downstream
@@ -1476,6 +1557,7 @@ impl BrowserProxy {
             .await_response()
             .await
             .map_err(|error| anyhow!("Chrome DevTools tool call interrupted: {error}. The action may have taken effect; inspect browser state before retrying. Subsequent calls replace failed workers automatically."))?;
+        info!(%action, elapsed_ms = started.elapsed().as_millis(), "Chrome DevTools request finished");
         match response {
             ServerResult::CallToolResult(result) => Ok(result),
             _ => bail!("Chrome DevTools returned an unexpected tool response"),
@@ -2000,16 +2082,16 @@ fn filter_page_content(
     Ok(result)
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "browser_mcp=info".into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-    broker::run(Cli::parse()).await
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    if let Some(ProcessMode::BrowserStderr { path }) = &cli.command {
+        return logging::run_browser_stderr(path);
+    }
+    logging::init();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(broker::run(cli))
 }
 fn validate_config(config: &Config) -> Result<()> {
     if !is_executable_file(&config.browser_executable) {
@@ -2247,6 +2329,89 @@ mod tests {
         );
         assert!(!state.local_to_tab.contains_key(&4));
     }
+    #[tokio::test]
+    async fn replacing_a_worker_preserves_an_active_request_marker() {
+        let mut session = Session {
+            persisted: PersistedSession {
+                workspace: PathBuf::new(),
+                current_tab: None,
+                last_activity_unix_seconds: 0,
+                cleanup_pending: false,
+            },
+            pages: PageState::default(),
+            downstream: None,
+            action_pending: true,
+        };
+        session.stop_worker("active-request").await;
+        assert!(
+            session.action_pending,
+            "worker replacement must not complete the caller's request"
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_startup_reports_an_early_exit_without_waiting_for_the_deadline() {
+        let mut config = Cli::try_parse_from([
+            "browser-mcp",
+            "--headless=true",
+            "--browser-executable=/bin/false",
+        ])
+        .unwrap()
+        .config;
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        config.cdp_port = listener.local_addr().unwrap().port();
+        let supervisor = BrowserSupervisor::new(Arc::new(config), None).unwrap();
+        drop(listener);
+        let mut state = supervisor.state.lock().await;
+        state.process = Some(Command::new("/bin/false").spawn().unwrap());
+        let error = timeout(
+            Duration::from_secs(2),
+            supervisor.wait_until_ready(&mut state),
+        )
+        .await
+        .expect("browser startup waited despite an exited child")
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("browser exited before its CDP endpoint became ready")
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_panic_is_shared_as_a_retryable_error() {
+        let discovery = initialize_catalog(
+            async { panic!("simulated catalog panic") },
+            Duration::from_secs(1),
+        )
+        .boxed()
+        .shared();
+        let (first, second) = tokio::join!(discovery.clone(), discovery.clone());
+        for result in [first, second] {
+            assert!(result.err().unwrap().contains("initialization panicked"));
+        }
+        assert!(
+            discovery.peek().unwrap().is_err(),
+            "cached discovery must remain inspectable for retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn hung_catalog_discovery_releases_all_waiters() {
+        let discovery =
+            initialize_catalog(futures_util::future::pending(), Duration::from_millis(10))
+                .boxed()
+                .shared();
+        let (first, second) = timeout(Duration::from_secs(1), async {
+            tokio::join!(discovery.clone(), discovery.clone())
+        })
+        .await
+        .expect("catalog callers remained stuck");
+        for result in [first, second] {
+            assert!(result.err().unwrap().contains("initialization timed out"));
+        }
+    }
+
     #[tokio::test]
     async fn session_lock_wait_times_out_while_held() {
         let session: Mutex<Option<Session>> = Mutex::new(None);
