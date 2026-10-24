@@ -136,6 +136,13 @@ The plugin:
 - releases owned tabs when an OpenCode session is deleted;
 - registers the bundled browser automation skill when the server is enabled.
 
+The adapter preserves OpenCode's MCP request metadata and routes calls by
+`_meta["ai.opencode/sessionID"]`, including calls that bypass the plugin tool
+hook. Legacy plugin routing and Codex hooks remain supported. Conflicting or
+missing identities fail closed; unidentified callers never share a browser
+session. The broker still binds each session to its original workspace and
+keeps tab ownership separate.
+
 OpenCode sees two compact tools by default:
 
 - `browser_dispatch` executes one browser action.

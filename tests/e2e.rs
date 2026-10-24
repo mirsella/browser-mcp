@@ -26,9 +26,16 @@ const SESSION_KEY: &str = "__opencode_session_id";
 type Client = rmcp::service::RunningService<rmcp::RoleClient, ()>;
 
 fn request(name: &str, session_id: &str, arguments: Value) -> CallToolRequestParams {
-    let mut arguments = arguments.as_object().cloned().unwrap_or_else(Map::new);
-    arguments.insert(SESSION_KEY.to_owned(), Value::from(session_id));
-    CallToolRequestParams::new(name.to_owned()).with_arguments(arguments)
+    let mut request = CallToolRequestParams::new(name.to_owned())
+        .with_arguments(arguments.as_object().cloned().unwrap_or_else(Map::new));
+    request.meta = Some(
+        json!({"ai.opencode/sessionID": session_id})
+            .as_object()
+            .unwrap()
+            .clone()
+            .into(),
+    );
+    request
 }
 
 fn text(result: &CallToolResult) -> String {
@@ -1266,7 +1273,11 @@ async fn exercise_shared_broker() {
     let starter = TokioChildProcess::new(starter).expect("start broker-launching MCP adapter");
     let starter = ().serve(starter).await.expect("initialize MCP adapter");
     let client_a = client(&root, true, &profile, port, "shared-window").await;
-    let client_b = client(&root, true, &profile, port, "shared-window").await;
+    let workspace_b = root.join("workspace-b");
+    std::fs::create_dir(&workspace_b).unwrap();
+    let mut command_b = adapter_command(&root, true, &profile, port, "shared-window");
+    command_b.current_dir(&workspace_b);
+    let client_b = ().serve(TokioChildProcess::new(command_b).unwrap()).await.unwrap();
     starter.cancel().await.expect("stop starter MCP adapter");
     std::fs::remove_dir(&broker_launch).expect("remove broker launch directory");
 
@@ -1309,6 +1320,12 @@ async fn exercise_shared_broker() {
     let navigate_b = isolated_view(&navigate_b, "example.org", "example.com");
     assert_no_page_ids(&navigate_a);
     assert_no_page_ids(&navigate_b);
+    let wrong_workspace = client_b
+        .call_tool(request("list_pages", "smoke-a", json!({})))
+        .await
+        .unwrap();
+    assert!(wrong_workspace.is_error.unwrap_or(false));
+    assert!(text(&wrong_workspace).contains("bound to a different workspace"));
     create_unowned_tab(port).await;
 
     let window_a = window_for_url(port, "example.com").await;
@@ -1493,7 +1510,9 @@ async fn exercise_shared_broker() {
         "browser stopped before the adapter reconnect grace elapsed"
     );
 
-    let reconnected = client(&root, true, &profile, port, "shared-window").await;
+    let mut command_b = adapter_command(&root, true, &profile, port, "shared-window");
+    command_b.current_dir(&workspace_b);
+    let reconnected = ().serve(TokioChildProcess::new(command_b).unwrap()).await.unwrap();
     let pages_b = call_ok(&reconnected, "list_pages", "smoke-b", json!({})).await;
     isolated_view(&pages_b, "Session%20B", "Session%20A");
 

@@ -23,8 +23,8 @@ use rmcp::{
     model::{
         CallToolRequest, CallToolRequestParams, CallToolResponse, CallToolResult,
         CancelledNotificationParam, ClientRequest, ContentBlock, Implementation, ListToolsRequest,
-        ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, ServerResult,
-        Tool, ToolAnnotations,
+        ListToolsResult, PaginatedRequestParams, RequestMetaObject, ServerCapabilities, ServerInfo,
+        ServerResult, Tool, ToolAnnotations,
     },
     service::{PeerRequestOptions, RequestContext, RunningService, ServiceError},
 };
@@ -63,11 +63,7 @@ static PACKAGE_VERSION: LazyLock<Version> = LazyLock::new(|| {
 
 pub(super) const SESSION_KEY: &str = "__opencode_session_id";
 pub(super) const CODEX_SESSION_KEY: &str = "__codex_session_id";
-
-/// Assumed session when the caller supplies no identifier (direct harness
-/// use without the plugin's injection). All keyless callers share one
-/// browser session per profile; keyed callers keep full isolation.
-const DIRECT_SESSION_ID: &str = "direct";
+const SESSION_META_KEY: &str = "ai.opencode/sessionID";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SessionClient {
@@ -276,7 +272,10 @@ impl Adapter {
         };
         let request_timeout = budget + HANDSHAKE_TIMEOUT;
         let handle = client
-            .send_cancellable_request(request, PeerRequestOptions::with_timeout(request_timeout))
+            .send_cancellable_request(
+                request,
+                PeerRequestOptions::with_timeout(request_timeout).with_meta(context.meta.clone()),
+            )
             .await
             .map_err(adapter_request_error)?;
         let request_id = handle.id.clone();
@@ -898,21 +897,30 @@ impl Drop for ConnectionLease {
     }
 }
 
-fn route_request(mut request: CallToolRequestParams) -> Result<(String, CallToolRequestParams)> {
+fn route_request(
+    mut request: CallToolRequestParams,
+    meta: &RequestMetaObject,
+) -> Result<(String, CallToolRequestParams)> {
     let arguments = request.arguments.get_or_insert_default();
+    let opencode = arguments.remove(SESSION_KEY);
+    let codex = arguments.remove(CODEX_SESSION_KEY);
     let (client, id) = match (
-        arguments.remove(SESSION_KEY),
-        arguments.remove(CODEX_SESSION_KEY),
+        meta.get(SESSION_META_KEY),
+        opencode.as_ref(),
+        codex.as_ref(),
     ) {
-        (Some(id), None) => (SessionClient::OpenCode, id),
-        (None, Some(id)) => (SessionClient::Codex, id),
-        (Some(_), Some(_)) => bail!("browser call contains conflicting agent session identifiers"),
-        (None, None) => {
-            return Ok((
-                SessionClient::OpenCode.owner_id(DIRECT_SESSION_ID)?,
-                request,
-            ));
+        (Some(id), injected, None) => {
+            if injected.is_some_and(|injected| injected != id) {
+                bail!("browser call contains conflicting agent session identifiers");
+            }
+            (SessionClient::OpenCode, id)
         }
+        (None, Some(id), None) => (SessionClient::OpenCode, id),
+        (None, None, Some(id)) => (SessionClient::Codex, id),
+        (None, None, None) => bail!(
+            "browser call is missing host session identity; use OpenCode MCP session metadata or the OpenCode/Codex routing hooks"
+        ),
+        _ => bail!("browser call contains conflicting agent session identifiers"),
     };
     let id = id
         .as_str()
@@ -1100,7 +1108,7 @@ impl ServerHandler for Connection {
                 workspace = %self.workspace.display(),
                 "browser request started"
             );
-            let (id, mut request) = route_request(request)?;
+            let (id, mut request) = route_request(request, &context.meta)?;
             tracing::Span::current().record("session_id", &id);
             info!("waiting for Chrome DevTools tool catalog");
             let catalog = self.proxy.catalog.get(&self.workspace).await?;
@@ -1598,6 +1606,12 @@ mod tests {
 
     use super::*;
 
+    fn session_meta(id: impl Into<Value>) -> RequestMetaObject {
+        let mut meta = RequestMetaObject::default();
+        meta.insert(SESSION_META_KEY.to_owned(), id.into());
+        meta
+    }
+
     #[tokio::test]
     async fn stalled_request_returns_an_error_and_next_request_can_succeed() {
         let path =
@@ -1622,13 +1636,12 @@ mod tests {
         let (server, client) = tokio::join!(connection.serve(server_io), ().serve(client_io));
         let server = server.unwrap();
         let client = client.unwrap();
-        let result = timeout(
-            Duration::from_secs(1),
-            client.call_tool(CallToolRequestParams::new("dispatch")),
-        )
-        .await
-        .expect("stalled catalog kept the request open")
-        .unwrap();
+        let mut request = CallToolRequestParams::new("dispatch");
+        request.meta = Some(session_meta("session-a"));
+        let result = timeout(Duration::from_secs(1), client.call_tool(request))
+            .await
+            .expect("stalled catalog kept the request open")
+            .unwrap();
         assert!(result.is_error.unwrap_or(false));
         assert!(
             result.content[0]
@@ -1647,17 +1660,16 @@ mod tests {
             .boxed()
             .shared(),
         );
-        let result = client
-            .call_tool(CallToolRequestParams::new("help"))
-            .await
-            .unwrap();
+        let mut request = CallToolRequestParams::new("help");
+        request.meta = Some(session_meta("session-a"));
+        let result = client.call_tool(request).await.unwrap();
         assert!(!result.is_error.unwrap_or(false));
         client.cancel().await.unwrap();
         server.cancel().await.unwrap();
     }
 
     #[tokio::test]
-    async fn adapter_cancellation_reaches_the_broker_request() {
+    async fn adapter_preserves_host_metadata_and_cancellation() {
         struct PendingBroker(tokio::sync::mpsc::UnboundedSender<RequestContext<rmcp::RoleServer>>);
         impl ServerHandler for PendingBroker {
             fn get_info(&self) -> ServerInfo {
@@ -1701,7 +1713,7 @@ mod tests {
                 ClientRequest::CallToolRequest(CallToolRequest::new(CallToolRequestParams::new(
                     "pending",
                 ))),
-                PeerRequestOptions::no_options(),
+                PeerRequestOptions::no_options().with_meta(session_meta("session-a")),
             )
             .await
             .unwrap();
@@ -1709,6 +1721,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(
+            dispatched.meta.get(SESSION_META_KEY),
+            Some(&json!("session-a"))
+        );
         request.cancel(Some("caller stopped".into())).await.unwrap();
         timeout(Duration::from_secs(1), dispatched.ct.cancelled())
             .await
@@ -1719,14 +1735,15 @@ mod tests {
     }
 
     #[test]
-    fn session_id_is_removed_and_defaults_when_missing() {
+    fn legacy_session_id_is_removed_and_unattributed_calls_are_rejected() {
         let request = CallToolRequestParams::new("list_pages").with_arguments(
             json!({(SESSION_KEY): "session-a"})
                 .as_object()
                 .expect("request arguments")
                 .clone(),
         );
-        let (id, request) = route_request(request).expect("route OpenCode request");
+        let (id, request) =
+            route_request(request, &RequestMetaObject::default()).expect("route OpenCode request");
         assert_eq!(id, "opencode:session-a");
         assert!(
             request
@@ -1734,9 +1751,52 @@ mod tests {
                 .is_some_and(|arguments| !arguments.contains_key(SESSION_KEY))
         );
         assert!(
-            route_request(CallToolRequestParams::new("list_pages"))
-                .is_ok_and(|(id, _)| id == "opencode:direct")
+            route_request(
+                CallToolRequestParams::new("list_pages"),
+                &RequestMetaObject::default()
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("missing host session identity")
         );
+    }
+
+    #[test]
+    fn host_metadata_routes_without_plugin_injection_and_rejects_conflicts() {
+        for injected in [json!({}), json!({(SESSION_KEY): "session-a"})] {
+            let (id, request) = route_request(
+                CallToolRequestParams::new("dispatch")
+                    .with_arguments(injected.as_object().unwrap().clone()),
+                &session_meta("session-a"),
+            )
+            .unwrap();
+            assert_eq!(id, "opencode:session-a");
+            assert!(request.arguments.unwrap().is_empty());
+        }
+        for arguments in [
+            json!({(SESSION_KEY): "another-session"}),
+            json!({(SESSION_KEY): null}),
+            json!({(CODEX_SESSION_KEY): "session-a"}),
+        ] {
+            assert!(
+                route_request(
+                    CallToolRequestParams::new("dispatch")
+                        .with_arguments(arguments.as_object().unwrap().clone()),
+                    &session_meta("session-a"),
+                )
+                .is_err()
+            );
+        }
+        for id in [
+            Value::Null,
+            json!(42),
+            json!(""),
+            json!("x".repeat(MAX_SESSION_ID_BYTES)),
+        ] {
+            assert!(
+                route_request(CallToolRequestParams::new("dispatch"), &session_meta(id)).is_err()
+            );
+        }
     }
 
     #[test]
@@ -1747,7 +1807,7 @@ mod tests {
                 .unwrap()
                 .clone(),
         );
-        let (id, request) = route_request(request).unwrap();
+        let (id, request) = route_request(request, &RequestMetaObject::default()).unwrap();
         assert_eq!(id, "codex:session-a");
         assert!(request.arguments.unwrap().is_empty());
         for arguments in [
@@ -1758,7 +1818,8 @@ mod tests {
             assert!(
                 route_request(
                     CallToolRequestParams::new("help")
-                        .with_arguments(arguments.as_object().unwrap().clone())
+                        .with_arguments(arguments.as_object().unwrap().clone()),
+                    &RequestMetaObject::default(),
                 )
                 .is_err()
             );
