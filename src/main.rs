@@ -2424,7 +2424,7 @@ mod tests {
             loop {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = [0; 2048];
-                stream.read(&mut request).await.unwrap();
+                assert_ne!(stream.read(&mut request).await.unwrap(), 0);
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
@@ -2479,7 +2479,7 @@ mod tests {
             loop {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = [0; 2048];
-                stream.read(&mut request).await.unwrap();
+                assert_ne!(stream.read(&mut request).await.unwrap(), 0);
                 stream
                     .write_all(
                         b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nweb",
