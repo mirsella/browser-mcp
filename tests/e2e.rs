@@ -1602,6 +1602,75 @@ async fn isolates_sessions_in_both_window_layouts() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Chromium and the real Chrome DevTools MCP worker"]
+async fn occupied_cdp_port_preserves_foreign_listener_and_recovers_its_own_browser() {
+    let root =
+        std::env::temp_dir().join(format!("browser-mcp-port-collision-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let profile = root.join("profile");
+    let socket = broker_socket(&profile);
+    let (foreign_url, foreign_server) = start_test_site().await;
+    let preferred_port = reqwest::Url::parse(&foreign_url).unwrap().port().unwrap();
+    let adapter = client(&root, false, &profile, preferred_port, "shared-window").await;
+    call_ok(&adapter, "dispatch", "collision", json!({
+        "action": "navigate_page", "arguments": {"url": "data:text/html,<title>Owned collision test</title>"}
+    })).await;
+    let persisted: Value = serde_json::from_slice(
+        &std::fs::read(profile.join("opencode-browser-mcp.state.json")).unwrap(),
+    )
+    .unwrap();
+    let identity = persisted["generation"].as_str().unwrap();
+    let actual_port = reqwest::Url::parse(identity).unwrap().port().unwrap();
+    assert_ne!(actual_port, preferred_port);
+    let before = browser_tabs(actual_port).await;
+    assert!(
+        before
+            .iter()
+            .any(|page| page["title"] == "Owned collision test")
+    );
+
+    let old_pid = broker_pid(&socket).await;
+    kill_process(old_pid, libc::SIGKILL);
+    wait_for_profile_lease(&profile).await;
+    let restored = call_ok(
+        &adapter,
+        "dispatch",
+        "collision",
+        json!({"action": "list_pages"}),
+    )
+    .await;
+    assert!(text(&restored).contains("Owned collision test"));
+    assert_ne!(broker_pid(&socket).await, old_pid);
+    assert_eq!(
+        browser_json(actual_port, "version").await["webSocketDebuggerUrl"],
+        identity
+    );
+    assert_eq!(browser_tabs(actual_port).await, before);
+
+    adapter.cancel().await.unwrap();
+    wait_for_broker_exit(&socket, &profile).await;
+    wait_for_browser_exit(actual_port).await;
+    let foreign = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .get(&foreign_url)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        foreign
+            .text()
+            .await
+            .unwrap()
+            .contains("Shared broker origin")
+    );
+    foreign_server.abort();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Chromium and the real Chrome DevTools MCP worker"]
 async fn interrupted_worker_is_replaced_without_replaying_the_action() {
     let root = std::env::temp_dir().join(format!("browser-mcp-interrupted-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();

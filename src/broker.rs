@@ -561,7 +561,7 @@ async fn run_broker(config: Arc<Config>, paths: RuntimePaths, _socket_lease: Fil
     let persistence = OwnershipPersistence::open(config.profile.join(STATE_FILE))?;
     let signal = shutdown_signal();
     tokio::pin!(signal);
-    let proxy = BrowserProxy::new(config.clone(), persistence)?;
+    let proxy = BrowserProxy::new(config.clone(), persistence).await?;
     // Keep the socket unpublished until initialization succeeds so clients
     // cannot connect to a broker that has not become ready yet.
     let listener = tokio::select! {
@@ -1607,8 +1607,9 @@ mod tests {
                 .unwrap()
                 .config,
         );
-        let mut proxy =
-            BrowserProxy::new(config, OwnershipPersistence::open(path).unwrap()).unwrap();
+        let mut proxy = BrowserProxy::new(config, OwnershipPersistence::open(path).unwrap())
+            .await
+            .unwrap();
         proxy.operation_timeout = Duration::from_millis(10);
         *proxy.catalog.future.lock().await = Some(futures_util::future::pending().boxed().shared());
         let connection = Connection {

@@ -345,6 +345,51 @@ impl SupervisorState {
 }
 
 impl BrowserSupervisor {
+    /// Keep the configured port as a preference, not a claim on another process.
+    /// Only an exact persisted browser generation may be reused after a restart.
+    async fn select_config(
+        config: Arc<Config>,
+        trusted_generation: Option<&str>,
+    ) -> Result<Arc<Config>> {
+        if let Some(identity) = trusted_generation {
+            let endpoint = Url::parse(identity).context("invalid persisted browser generation")?;
+            let mut restored = (*config).clone();
+            restored.cdp_port = endpoint
+                .port_or_known_default()
+                .context("persisted browser generation has no port")?;
+            let restored = Arc::new(restored);
+            let supervisor = Self::new(restored.clone(), Some(identity.to_owned()))?;
+            match supervisor.endpoint_identity().await {
+                Ok(Some(actual)) if actual == identity => return Ok(restored),
+                Ok(_) => {
+                    warn!(
+                        "persisted browser generation is no longer reachable; selecting a new endpoint"
+                    );
+                }
+                Err(error) => {
+                    warn!(%error, "persisted browser endpoint could not be verified; selecting a new endpoint without adopting it");
+                }
+            }
+        }
+
+        match std::net::TcpListener::bind((config.cdp_host.as_str(), config.cdp_port)) {
+            Ok(_) => Ok(config),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                let listener = std::net::TcpListener::bind((config.cdp_host.as_str(), 0))
+                    .context("failed to select an available browser CDP port")?;
+                let mut available = (*config).clone();
+                available.cdp_port = listener.local_addr()?.port();
+                warn!(
+                    configured_port = config.cdp_port,
+                    selected_port = available.cdp_port,
+                    "browser CDP port is occupied; using a free port without adopting the existing listener"
+                );
+                Ok(Arc::new(available))
+            }
+            Err(error) => Err(error).context("failed to reserve the browser CDP port"),
+        }
+    }
+
     fn new(config: Arc<Config>, trusted_generation: Option<String>) -> Result<Self> {
         Ok(Self {
             config,
@@ -1006,11 +1051,10 @@ struct BrowserProxy {
 }
 
 impl BrowserProxy {
-    fn new(config: Arc<Config>, persistence: Arc<OwnershipPersistence>) -> Result<Self> {
-        let supervisor = Arc::new(BrowserSupervisor::new(
-            config.clone(),
-            persistence.generation(),
-        )?);
+    async fn new(config: Arc<Config>, persistence: Arc<OwnershipPersistence>) -> Result<Self> {
+        let generation = persistence.generation();
+        let config = BrowserSupervisor::select_config(config, generation.as_deref()).await?;
+        let supervisor = Arc::new(BrowserSupervisor::new(config.clone(), generation)?);
         let worker_pool = Arc::new(Mutex::new(HashMap::new()));
         let (catalog_cancel, _) = watch::channel(false);
         Ok(Self {
@@ -2347,6 +2391,111 @@ mod tests {
             session.action_pending,
             "worker replacement must not complete the caller's request"
         );
+    }
+
+    #[tokio::test]
+    async fn occupied_cdp_port_selects_a_different_port_without_changing_adapter_config() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mut config = broker_config(&[]);
+        config.cdp_port = listener.local_addr().unwrap().port();
+        let original = Arc::new(config);
+        let selected = BrowserSupervisor::select_config(original.clone(), None)
+            .await
+            .unwrap();
+        assert_ne!(selected.cdp_port, original.cdp_port);
+        assert_eq!(original.cdp_port, listener.local_addr().unwrap().port());
+        assert!(std::net::TcpListener::bind(("127.0.0.1", selected.cdp_port)).is_ok());
+        drop(listener);
+        let selected = BrowserSupervisor::select_config(original.clone(), None)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&selected, &original));
+    }
+
+    async fn mock_browser_endpoint() -> (u16, String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let identity = format!("ws://127.0.0.1:{port}/devtools/browser/trusted");
+        let body = json!({"webSocketDebuggerUrl": identity}).to_string();
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 2048];
+                stream.read(&mut request).await.unwrap();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (port, identity, task)
+    }
+
+    #[tokio::test]
+    async fn persisted_alternate_port_is_reused_only_for_the_exact_browser_generation() {
+        let (port, identity, server) = mock_browser_endpoint().await;
+        let mut config = broker_config(&[]);
+        let preferred = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        config.cdp_port = preferred.local_addr().unwrap().port();
+        let config = Arc::new(config);
+        let selected = BrowserSupervisor::select_config(config.clone(), Some(&identity))
+            .await
+            .unwrap();
+        assert_eq!(selected.cdp_port, port);
+
+        let stale = identity.replace("/trusted", "/stale");
+        let selected = BrowserSupervisor::select_config(config.clone(), Some(&stale))
+            .await
+            .unwrap();
+        assert_ne!(selected.cdp_port, port);
+        assert_ne!(selected.cdp_port, config.cdp_port);
+
+        let mut occupied = (*config).clone();
+        occupied.cdp_port = port;
+        let supervisor = BrowserSupervisor::new(Arc::new(occupied), Some(stale)).unwrap();
+        assert!(
+            supervisor
+                .ensure_running()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("refusing to adopt")
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn persisted_port_reused_by_a_non_browser_listener_selects_a_new_endpoint() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 2048];
+                stream.read(&mut request).await.unwrap();
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nweb",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let identity = format!("ws://127.0.0.1:{port}/devtools/browser/old");
+        let mut config = broker_config(&[]);
+        config.cdp_port = port;
+        let selected = BrowserSupervisor::select_config(Arc::new(config), Some(&identity))
+            .await
+            .unwrap();
+        assert_ne!(selected.cdp_port, port);
+        server.abort();
     }
 
     #[tokio::test]

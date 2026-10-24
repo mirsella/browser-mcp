@@ -47,6 +47,12 @@ Concurrent Codex and OpenCode instances converge on the same private socket and 
 profile. The broker remains available while at least one adapter is connected,
 then closes the browser and exits shortly after the final adapter disconnects.
 
+The CDP port defaults to `9222`. If that port is occupied, the broker logs the
+collision and selects a free loopback port without adopting or stopping the
+other listener. Adapters keep the same configuration and share the selected
+endpoint. A replacement broker reuses that port only when the exact persisted
+browser generation is still running.
+
 OpenCode loads the JavaScript `./server` package export. Codex uses the
 plugin and MCP manifests plus the session hooks. Both integrations launch
 the same packaged Rust executable.
@@ -216,7 +222,7 @@ shared by both integrations):
 | `OPENCODE_BROWSER_PROFILE` | browser-dependent | Shared browser data directory |
 | `OPENCODE_BROWSER_HEADLESS` | `false` | Run without a visible window |
 | `OPENCODE_BROWSER_SESSION_LAYOUT` | `shared-window` | `shared-window` or `window-per-session` |
-| `OPENCODE_BROWSER_CDP_PORT` | `9222` | Loopback CDP port |
+| `OPENCODE_BROWSER_CDP_PORT` | `9222` | Preferred loopback CDP port; a free port is selected on collision |
 | `OPENCODE_BROWSER_IDLE_MINUTES` | `30` | Fallback cleanup for routed sessions |
 | `OPENCODE_BROWSER_MAX_PAGES` | `5` | Max owned tabs per agent session |
 | `OPENCODE_BROWSER_STARTUP_SECONDS` | `20` | Browser startup deadline |
