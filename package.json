@@ -1,6 +1,6 @@
 {
   "name": "@mirsella/browser-mcp",
-  "version": "2.0.4",
+  "version": "2.0.5",
   "description": "Session-isolated browser automation over MCP and Chrome DevTools Protocol",
   "type": "module",
   "exports": {

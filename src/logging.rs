@@ -16,7 +16,7 @@ use tokio::{
     process::Command,
     time::{Duration, timeout},
 };
-use tracing_subscriber::fmt::writer::{MakeWriter, MakeWriterExt, OptionalWriter};
+use tracing_subscriber::fmt::writer::{EitherWriter, MakeWriter};
 use xxhash_rust::xxh3::xxh3_64;
 
 const MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
@@ -29,9 +29,13 @@ pub(super) fn init() {
                 .unwrap_or_else(|_| "browser_mcp=info".into()),
         )
         .with_ansi(false)
-        .with_writer(
-            std::io::stderr.and(|| OptionalWriter::from(LOG.get().map(MakeWriter::make_writer))),
-        )
+        // A managed broker outlives the adapter that launched it. Once durable
+        // diagnostics are enabled, never also write to that adapter's stderr:
+        // tracing reports a failed write with eprintln!, which can itself panic.
+        .with_writer(|| match LOG.get() {
+            Some(log) => EitherWriter::A(log.make_writer()),
+            None => EitherWriter::B(std::io::stderr()),
+        })
         .init();
 }
 
@@ -191,6 +195,50 @@ impl Write for RotatingLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persistent_diagnostics_survive_closed_host_stderr() {
+        const CHILD: &str = "BROWSER_MCP_CLOSED_STDERR_TEST";
+        if std::env::var_os(CHILD).is_some() {
+            init();
+            enable(Path::new("test-profile")).unwrap();
+            tracing::info!("request completed after host disconnected");
+            return;
+        }
+        let directory =
+            std::env::temp_dir().join(format!("browser-mcp-closed-stderr-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        drop(reader);
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "logging::tests::persistent_diagnostics_survive_closed_host_stderr",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("XDG_STATE_HOME", &directory)
+            .stdout(Stdio::null())
+            .stderr(std::os::fd::OwnedFd::from(writer))
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "diagnostics panicked on disconnected host stderr"
+        );
+        let path = fs::read_dir(directory.join("browser-mcp"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert!(
+            fs::read_to_string(path)
+                .unwrap()
+                .contains("request completed after host disconnected")
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn logs_rotate_and_remain_private() {
