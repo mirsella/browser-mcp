@@ -366,9 +366,10 @@ async fn failed_catalog_discovery_can_be_retried() {
     let socket = broker_socket(&profile);
     let downstream = root.join("downstream");
     std::fs::write(&downstream, r##"#!/usr/bin/env bun
-import { existsSync, writeFileSync } from 'node:fs';
+import { existsSync, writeFileSync, writeSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 if (!existsSync('failed-once')) { writeFileSync('failed-once', ''); process.exit(1); }
+writeSync(2, 'worker survived disconnected host stderr\n');
 for await (const line of createInterface({ input: process.stdin })) {
   const request = JSON.parse(line);
   if (request.id === undefined) continue;
@@ -388,7 +389,13 @@ for await (const line of createInterface({ input: process.stdin })) {
     command
         .current_dir(&root)
         .env("OPENCODE_BROWSER_DOWNSTREAM_COMMAND", downstream);
-    let client = ().serve(TokioChildProcess::new(command).unwrap()).await.unwrap();
+    let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    drop(reader);
+    let (transport, _) = TokioChildProcess::builder(command)
+        .stderr(std::os::fd::OwnedFd::from(writer))
+        .spawn()
+        .unwrap();
+    let client = ().serve(transport).await.unwrap();
     let failed = client
         .call_tool(request("help", "catalog", json!({})))
         .await

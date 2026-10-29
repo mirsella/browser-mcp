@@ -61,6 +61,19 @@ pub(super) fn enable(profile: &Path) -> Result<()> {
     Ok(())
 }
 
+pub(super) async fn capture_worker_stderr(
+    mut stderr: tokio::process::ChildStderr,
+) -> io::Result<()> {
+    let mut buffer = [0; 8192];
+    loop {
+        let count = stderr.read(&mut buffer).await?;
+        if count == 0 {
+            return Ok(());
+        }
+        tracing::info!(target: "browser_mcp::worker", diagnostic = %String::from_utf8_lossy(&buffer[..count]).trim_end(), "Chrome DevTools MCP stderr");
+    }
+}
+
 /// The browser owns the pipe writer; a separate process owns the reader so
 /// replacing the broker cannot close it. EOF ends the writer automatically.
 pub(super) async fn browser_stderr(profile: &Path) -> Result<Stdio> {

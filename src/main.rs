@@ -815,10 +815,19 @@ async fn spawn_downstream(config: &Config, workspace: &std::path::Path) -> Resul
         .arg("--no-performance-crux")
         .arg("--redact-network-headers")
         .current_dir(workspace)
-        .env("CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS", "1")
-        .stderr(Stdio::inherit());
-    let transport =
-        TokioChildProcess::new(command).context("failed to start Chrome DevTools MCP")?;
+        .env("CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS", "1");
+    // A surviving broker must not pass its disconnected host's stderr to workers.
+    let (transport, stderr) = TokioChildProcess::builder(command)
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to start Chrome DevTools MCP")?;
+    tokio::spawn(async move {
+        if let Err(error) =
+            logging::capture_worker_stderr(stderr.expect("worker stderr was piped")).await
+        {
+            warn!(%error, "failed to capture Chrome DevTools MCP diagnostics");
+        }
+    });
     let worker = timeout(
         WORKER_START_TIMEOUT,
         DownstreamClient { roots }.serve(transport),

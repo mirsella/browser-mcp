@@ -77,7 +77,9 @@ The broker writes diagnostics to
 prints the exact path. Logs are readable only by your user and also go to stderr.
 
 Request tracing records the tool name, session ID, current stage, and elapsed
-time. It does not record tool arguments. If a call stalls, look for its last
+time. Chrome DevTools worker stderr is drained into that private broker log,
+so replacement workers survive a disconnected host's stderr. Request tracing
+does not record tool arguments. If a call stalls, look for its last
 stage and whether the broker recorded a deadline, cancellation, catalog failure,
 or worker replacement. Browser stderr is captured in
 `browser-<profile-hash>.log` in the same directory. Its separate writer survives
