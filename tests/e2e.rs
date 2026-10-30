@@ -1628,6 +1628,115 @@ async fn isolates_sessions_in_both_window_layouts() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Chromium and the real Chrome DevTools MCP worker"]
+async fn existing_non_debug_browser_reports_profile_conflict_without_stopping_it() {
+    let root = std::env::temp_dir().join(format!(
+        "browser-mcp-profile-conflict-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let profile = root.join("profile");
+    let mut command = Command::new(
+        std::env::var_os("OPENCODE_BROWSER_EXECUTABLE").unwrap_or_else(|| "chromium".into()),
+    );
+    command
+        .arg(format!("--user-data-dir={}", profile.display()))
+        .arg("--no-first-run")
+        .arg("--no-default-browser-check")
+        .arg("--disable-breakpad")
+        .arg("--disable-crash-reporter")
+        .arg("--ozone-platform=x11")
+        .arg("data:text/html,<title>Existing non-debug browser</title>")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true);
+    if std::env::var_os("DISPLAY").is_none() {
+        command.arg("--headless=new");
+    }
+    let mut browser = command.spawn().unwrap();
+    let lock = profile.join("SingletonLock");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let owner = loop {
+        assert!(
+            browser.try_wait().unwrap().is_none(),
+            "test browser exited before acquiring its profile"
+        );
+        if let Ok(owner) = std::fs::read_link(&lock) {
+            break owner;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "test browser did not acquire its profile"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut command = adapter_command(&root, false, &profile, port, "shared-window");
+    command.env("XDG_STATE_HOME", root.join("state"));
+    let adapter = ().serve(TokioChildProcess::new(command).unwrap()).await.unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        adapter.call_tool(request(
+            "dispatch",
+            "profile-conflict",
+            json!({"action": "list_pages"}),
+        )),
+    )
+    .await
+    .expect("profile conflict did not return within the startup deadline")
+    .unwrap();
+    assert!(result.is_error.unwrap_or(false));
+    let error = text(&result);
+    assert!(
+        error.contains("already open in another local process"),
+        "{error}"
+    );
+    assert!(error.contains("without remote debugging"), "{error}");
+    assert!(error.contains("close that browser gracefully"), "{error}");
+    assert!(error.contains("OPENCODE_BROWSER_PROFILE"), "{error}");
+    assert!(
+        browser.try_wait().unwrap().is_none(),
+        "MCP stopped the existing browser"
+    );
+    assert_eq!(
+        std::fs::read_link(&lock).unwrap(),
+        owner,
+        "MCP changed the existing profile lock"
+    );
+    adapter.cancel().await.unwrap();
+    wait_for_broker_exit(&broker_socket(&profile), &profile).await;
+    assert!(
+        browser.try_wait().unwrap().is_none(),
+        "broker shutdown stopped the existing browser"
+    );
+    kill_process(browser.id().unwrap() as i32, libc::SIGTERM);
+    tokio::time::timeout(Duration::from_secs(10), browser.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    // Chromium helpers can finish cache writes just after the main process exits.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match std::fs::remove_dir_all(&root) {
+            Ok(()) => break,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::DirectoryNotEmpty
+                    && Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(error) => panic!("failed to remove test browser profile: {error}"),
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Chromium and the real Chrome DevTools MCP worker"]
 async fn occupied_cdp_port_preserves_foreign_listener_and_recovers_its_own_browser() {
     let root =
         std::env::temp_dir().join(format!("browser-mcp-port-collision-{}", std::process::id()));

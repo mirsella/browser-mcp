@@ -264,6 +264,7 @@ action. Explicitly disabled or disconnected MCP entries stay disabled.
 
 - A headed startup error mentioning `DISPLAY` or `WAYLAND_DISPLAY` means no graphical session could be found. Set `OPENCODE_BROWSER_HEADLESS=true` when running without one.
 - A profile or socket lease error means another live package process owns it or a stale process is still running. Do not bypass the locks.
+- If startup reports that the profile is already open in another local process, that browser may have been opened without remote debugging. Save your work, close it gracefully, and retry the MCP action. MCP will start the same profile with remote debugging enabled. To leave that browser running, use a separate `OPENCODE_BROWSER_PROFILE` or `--profile` instead. Never delete Chromium's `SingletonLock` or kill the existing browser automatically.
 - A process on the configured CDP port must belong to the exact managed browser generation. Stop it or choose another port.
 - If downstream startup fails, verify that `bunx` is available to OpenCode.
 - The plugin refuses to replace an unrelated `mcp.servers.browser` entry.

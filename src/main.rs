@@ -319,6 +319,19 @@ fn canonicalize_path(path: &Path) -> Result<PathBuf> {
     Ok(canonicalize_path(parent)?.join(name))
 }
 
+/// Chromium's singleton symlink is evidence for a diagnostic, never a lease we can remove.
+fn live_chromium_profile_owner(profile: &Path) -> Option<u32> {
+    let lock = std::fs::read_link(profile.join("SingletonLock")).ok()?;
+    let (hostname, pid) = lock.to_str()?.rsplit_once('-')?;
+    let local_hostname = std::fs::read_to_string("/proc/sys/kernel/hostname").ok()?;
+    if hostname != local_hostname.trim_end() {
+        return None;
+    }
+    let pid: u32 = pid.parse().ok()?;
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    (!cmdline.is_empty()).then_some(pid)
+}
+
 struct BrowserSupervisor {
     config: Arc<Config>,
     client: Client,
@@ -517,6 +530,19 @@ impl BrowserSupervisor {
         self.existing_trusted_endpoint(&mut state).await
     }
 
+    fn startup_error(&self, reason: &str, starting_pid: Option<u32>) -> anyhow::Error {
+        if let Some(pid) = live_chromium_profile_owner(&self.config.profile)
+            && Some(pid) != starting_pid
+        {
+            return anyhow!(
+                "{reason}; browser profile {} is already open in another local process (PID {pid}), but its CDP endpoint is not available at {}. This commonly happens when Chromium or Helium was opened without remote debugging. Save your work and close that browser gracefully, then retry the MCP action so MCP can restart it with remote debugging. Alternatively, select a separate profile with OPENCODE_BROWSER_PROFILE or --profile. Do not delete SingletonLock or kill the existing browser automatically",
+                self.config.profile.display(),
+                self.config.browser_url(),
+            );
+        }
+        anyhow!("{reason}; inspect the browser stderr log in the diagnostics directory")
+    }
+
     async fn wait_until_ready(&self, state: &mut SupervisorState) -> Result<String> {
         let deadline = Instant::now()
             .checked_add(Duration::from_secs(self.config.startup_seconds))
@@ -528,9 +554,10 @@ impl BrowserSupervisor {
                     .context("failed to inspect starting browser")?
             {
                 state.process = None;
-                bail!(
-                    "browser exited before its CDP endpoint became ready ({status}); inspect the browser stderr log in the diagnostics directory"
-                );
+                return Err(self.startup_error(
+                    &format!("browser exited before its CDP endpoint became ready ({status})"),
+                    None,
+                ));
             }
             if let Some(identity) = self.endpoint_identity().await? {
                 info!(url = %self.config.browser_url(), "browser CDP endpoint is ready");
@@ -538,10 +565,13 @@ impl BrowserSupervisor {
             }
             sleep(Duration::from_millis(200)).await;
         }
-        bail!(
-            "browser CDP endpoint {} did not become ready",
-            self.config.browser_url()
-        )
+        Err(self.startup_error(
+            &format!(
+                "browser CDP endpoint {} did not become ready",
+                self.config.browser_url()
+            ),
+            state.process.as_ref().and_then(Child::id),
+        ))
     }
 
     async fn wait_for_browser_exit(&self) -> Result<()> {
@@ -2534,6 +2564,125 @@ mod tests {
                 .to_string()
                 .contains("browser exited before its CDP endpoint became ready")
         );
+    }
+
+    fn profile_diagnostic_fixture() -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "browser-mcp-profile-diagnostic-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        root
+    }
+
+    #[tokio::test]
+    async fn successful_browser_handoff_reports_the_live_profile_owner() {
+        let profile = profile_diagnostic_fixture();
+        let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap();
+        let owner = format!("{}-{}", hostname.trim_end(), std::process::id());
+        let lock = profile.join("SingletonLock");
+        std::os::unix::fs::symlink(&owner, &lock).unwrap();
+        let mut config = broker_config(&[]);
+        config.profile = profile.clone();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        config.cdp_port = listener.local_addr().unwrap().port();
+        let supervisor = BrowserSupervisor::new(Arc::new(config), None).unwrap();
+        drop(listener);
+        let mut state = supervisor.state.lock().await;
+        state.process = Some(Command::new("/bin/true").spawn().unwrap());
+        let error = timeout(
+            Duration::from_secs(2),
+            supervisor.wait_until_ready(&mut state),
+        )
+        .await
+        .expect("successful browser handoff was not reported promptly")
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("exit status: 0"), "{error}");
+        assert!(
+            error.contains(&format!("PID {}", std::process::id())),
+            "{error}"
+        );
+        assert!(error.contains("without remote debugging"), "{error}");
+        assert!(error.contains("close that browser gracefully"), "{error}");
+        assert!(error.contains("OPENCODE_BROWSER_PROFILE"), "{error}");
+        assert!(error.contains("Do not delete SingletonLock"), "{error}");
+        assert!(state.process.is_none());
+        assert_eq!(std::fs::read_link(&lock).unwrap(), PathBuf::from(owner));
+        std::fs::remove_dir_all(profile).unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_timeout_reports_the_live_profile_owner() {
+        let profile = profile_diagnostic_fixture();
+        let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap();
+        std::os::unix::fs::symlink(
+            format!("{}-{}", hostname.trim_end(), std::process::id()),
+            profile.join("SingletonLock"),
+        )
+        .unwrap();
+        let mut config = broker_config(&[]);
+        config.profile = profile.clone();
+        config.startup_seconds = 0;
+        let supervisor = BrowserSupervisor::new(Arc::new(config), None).unwrap();
+        let mut state = supervisor.state.lock().await;
+        let error = supervisor
+            .wait_until_ready(&mut state)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("did not become ready"), "{error}");
+        assert!(
+            error.contains("already open in another local process"),
+            "{error}"
+        );
+        let managed_error = supervisor
+            .startup_error("startup timed out", Some(std::process::id()))
+            .to_string();
+        assert!(!managed_error.contains("already open"), "{managed_error}");
+        assert!(
+            managed_error.contains("inspect the browser stderr log"),
+            "{managed_error}"
+        );
+        std::fs::remove_dir_all(profile).unwrap();
+    }
+
+    #[test]
+    fn startup_diagnostic_does_not_claim_missing_stale_foreign_or_malformed_locks() {
+        let profile = profile_diagnostic_fixture();
+        let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap();
+        let mut config = broker_config(&[]);
+        config.profile = profile.clone();
+        let supervisor = BrowserSupervisor::new(Arc::new(config), None).unwrap();
+        let lock = profile.join("SingletonLock");
+        for owner in [
+            None,
+            Some(format!("{}-{}", hostname.trim_end(), u32::MAX)),
+            Some(format!(
+                "{}-foreign-{}",
+                hostname.trim_end(),
+                std::process::id()
+            )),
+            Some(format!("{}-not-a-pid", hostname.trim_end())),
+            Some(format!("{}-0", hostname.trim_end())),
+            Some("malformed".to_owned()),
+        ] {
+            if let Some(owner) = &owner {
+                std::os::unix::fs::symlink(owner, &lock).unwrap();
+            }
+            let error = supervisor.startup_error("startup failed", None).to_string();
+            assert!(!error.contains("already open"), "{owner:?}: {error}");
+            assert!(error.contains("inspect the browser stderr log"), "{error}");
+            if let Some(owner) = owner {
+                assert_eq!(std::fs::read_link(&lock).unwrap(), PathBuf::from(owner));
+                std::fs::remove_file(&lock).unwrap();
+            }
+        }
+        std::fs::remove_dir_all(profile).unwrap();
     }
 
     #[tokio::test]
