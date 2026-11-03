@@ -7,7 +7,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{Mutex, OnceLock},
+    sync::{Mutex, MutexGuard, OnceLock},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -16,7 +16,7 @@ use tokio::{
     process::Command,
     time::{Duration, timeout},
 };
-use tracing_subscriber::fmt::writer::{EitherWriter, MakeWriter};
+use tracing_subscriber::fmt::writer::EitherWriter;
 use xxhash_rust::xxh3::xxh3_64;
 
 const MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
@@ -33,10 +33,37 @@ pub(super) fn init() {
         // diagnostics are enabled, never also write to that adapter's stderr:
         // tracing reports a failed write with eprintln!, which can itself panic.
         .with_writer(|| match LOG.get() {
-            Some(log) => EitherWriter::A(log.make_writer()),
+            Some(log) => EitherWriter::A(BrokerWriter(log)),
             None => EitherWriter::B(std::io::stderr()),
         })
         .init();
+}
+
+// Hold the mutex only during I/O, not while the caller formats an event.
+struct BrokerWriter<'a>(&'a Mutex<RotatingLog>);
+
+impl BrokerWriter<'_> {
+    fn lock(&self) -> MutexGuard<'_, RotatingLog> {
+        self.0.lock().unwrap_or_else(|poisoned| {
+            let mut log = poisoned.into_inner();
+            let _ = writeln!(
+                log,
+                "WARN browser broker diagnostics recovered a poisoned log lock"
+            );
+            self.0.clear_poison();
+            log
+        })
+    }
+}
+
+impl Write for BrokerWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.lock().write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.lock().flush()
+    }
 }
 
 fn log_path(profile: &Path, prefix: &str) -> Result<PathBuf> {
@@ -208,6 +235,57 @@ impl Write for RotatingLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_writer_recovers_a_poisoned_log() {
+        let directory =
+            std::env::temp_dir().join(format!("browser-mcp-poisoned-log-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("broker.log");
+        let log = Mutex::new(RotatingLog::open(path.clone(), MAX_LOG_BYTES).unwrap());
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = log.lock().unwrap();
+            panic!("simulated diagnostic panic");
+        });
+        assert!(log.is_poisoned());
+        BrokerWriter(&log)
+            .write_all(b"request completed\n")
+            .unwrap();
+        BrokerWriter(&log).flush().unwrap();
+        assert!(!log.is_poisoned());
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            "WARN browser broker diagnostics recovered a poisoned log lock\nrequest completed\n"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn formatting_panic_does_not_poison_diagnostics() {
+        struct PanickingDisplay;
+        impl std::fmt::Display for PanickingDisplay {
+            fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                panic!("simulated formatting panic");
+            }
+        }
+
+        let directory =
+            std::env::temp_dir().join(format!("browser-mcp-format-panic-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("broker.log");
+        let log = Mutex::new(RotatingLog::open(path.clone(), MAX_LOG_BYTES).unwrap());
+        let result = std::panic::catch_unwind(|| {
+            let mut writer = BrokerWriter(&log);
+            write!(writer, "{PanickingDisplay}").unwrap();
+        });
+        assert!(result.is_err());
+        assert!(!log.is_poisoned());
+        BrokerWriter(&log)
+            .write_all(b"request completed\n")
+            .unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), "request completed\n");
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn persistent_diagnostics_survive_closed_host_stderr() {
