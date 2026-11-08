@@ -1025,7 +1025,13 @@ fn detach_event(params: &Value, state: &mut State) -> Result<()> {
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("Target.detachedFromTarget missing sessionId"))?;
     if !state.sessions.contains_key(session) {
-        bail!("Target.detachedFromTarget has unknown session {session}");
+        // Target destruction and parent detachment also remove descendant
+        // sessions. Their later detach notifications have no remaining joins.
+        tracing::info!(
+            session,
+            "CDP detach has no live attachment; target or ancestor may already be removed"
+        );
+        return Ok(());
     }
     state.detach_subtree(session);
     Ok(())
@@ -1403,6 +1409,31 @@ mod tests {
         assert_eq!(state.records["page"].tab_id, None);
         assert_eq!(state.records["worker"].tab_id, None);
         assert!(!state.sessions.contains_key("grandchild"));
+        detach_event(&json!({"sessionId":"grandchild"}), &mut state).unwrap();
+        assert!(state.sessions.contains_key("root"));
+    }
+
+    #[test]
+    fn detach_after_target_destruction_preserves_live_ownership() {
+        let mut state = State {
+            connected: true,
+            ..Default::default()
+        };
+        for id in ["closed", "live"] {
+            attach_event(
+                &json!({"sessionId":id,"targetInfo":{"targetId":id,"type":"tab"}}),
+                None,
+                &mut state,
+            )
+            .unwrap();
+            state.claim_tab("owner", id).unwrap();
+        }
+        state.remove("closed");
+        detach_event(&json!({"sessionId":"closed"}), &mut state).unwrap();
+        assert!(state.connected);
+        assert_eq!(state.session_tabs("owner"), ["live"]);
+        assert_eq!(state.sessions.len(), 1);
+        assert!(state.sessions.contains_key("live"));
     }
 
     #[test]
