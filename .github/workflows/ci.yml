@@ -19,13 +19,15 @@ jobs:
         with:
           node-version: 24
       - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.3
       - uses: pnpm/action-setup@v4
         with:
           version: 10
       - run: pnpm install --frozen-lockfile
       - run: cargo fmt --check
       - run: cargo test --all-targets
-      - run: bun test tests/plugin.test.ts
+      - run: bun test tests/plugin.test.ts tests/model-eval.test.ts
       - run: cargo clippy --all-targets -- -D warnings
       - name: Prepare real browser routing
         run: |
