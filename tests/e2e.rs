@@ -56,13 +56,18 @@ async fn call_ok(
     session_id: &str,
     arguments: Value,
 ) -> CallToolResult {
+    let action = arguments
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or(name)
+        .to_owned();
     let result = client
         .call_tool(request(name, session_id, arguments))
         .await
         .expect("tool call transport");
     assert!(
         !result.is_error.unwrap_or(false),
-        "{name} for {session_id} returned a tool error: {}",
+        "{name} ({action}) for {session_id} returned a tool error: {}",
         text(&result)
     );
     result
