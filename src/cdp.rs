@@ -700,7 +700,7 @@ impl TargetTracker {
             .context("browser target creation task terminated")?
     }
 
-    async fn activate_target(&self, tab: &str) -> Result<()> {
+    pub async fn activate_target(&self, tab: &str) -> Result<()> {
         self.command("Target.activateTarget", json!({"targetId": tab}), None)
             .await
             .map(|_| ())

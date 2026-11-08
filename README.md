@@ -169,6 +169,67 @@ Settings:
 }
 ```
 
+## Agent workflow and context
+
+The initial MCP catalog remains two tools. Help returns one short signature and
+argument schema. Structured upstream data is validated internally, then the
+agent receives one readable copy plus any images. Text is limited to 32 KiB with
+an explicit truncation notice. Network and console lists default to 50 entries.
+
+- `list_pages` exposes stable session-local handles such as `p1`. `select_page`
+  changes current; optional `page` on scoped actions targets another owned page
+  without changing current. Closed handles fail rather than selecting another tab.
+- `take_snapshot` adds `find`, `within`, `interactive`, `diff`, and `maxLines`
+  (default 300, maximum 2000). Search includes ancestors. Diff requires compatible
+  document/worker/verbosity state; an unavailable baseline is explicitly reported
+  and replaced with a bounded full view. Baselines use at most 2 MiB per session.
+- Inline snapshot UIDs include a worker namespace. Old-worker references fail
+  before execution. Saved snapshot files retain upstream UIDs and are diagnostic
+  exports; obtain actionable references from an inline snapshot.
+- Compact-only `batch` runs up to 8 known actions under one session lock and
+  deadline. All arguments, explicit pages and existing UIDs are checked first.
+  Only the final step may return a snapshot. It stops on the first error and
+  reports completed/not-run counts. Actions are never replayed automatically.
+- `handoff` with `mode: "start"` focuses an exact headed page for user work and
+  returns immediately. End the turn, request the user's work, then finish only
+  after confirmation. Automation on that page pauses and normal idle cleanup is
+  delayed for at most 24 hours. Explicit session release still closes owned tabs.
+- `status` observes existing state without starting a browser or worker.
+  `browser-mcp doctor` checks local configuration without starting services.
+
+Ordinary action errors retain a healthy, reconciled worker and its element
+references. Transport failures, interrupted calls and failed reconciliation still
+replace the worker. New pages default to background; per-session window placement
+may briefly activate an existing anchor window.
+
+Recording is explicitly enabled with `--recording` or
+`OPENCODE_BROWSER_RECORDING=true`. It requires `ffmpeg`; `--ffmpeg` or
+`OPENCODE_BROWSER_FFMPEG` selects its executable. Only then do `screencast_start`
+and `screencast_stop` appear. Artifacts are assigned under the conversation
+workspace's `.scratch/browser-mcp/`. Stop recording before cleanup. Worker loss
+can leave an incomplete file. Recordings use WebM. The encoder launcher rounds
+padding to even dimensions to fix the pinned recorder's odd-viewport failure;
+recording operations stop waiting after 30 seconds and report an incomplete
+recording. There is no automatic or rolling capture.
+
+Optional `--secrets-file` / `OPENCODE_BROWSER_SECRETS_FILE` enables `fill_secret`.
+The existing file must be a same-user, nonsymlink, regular file with mode `0600`,
+at most 64 KiB. No store is created. Its format is:
+
+```json
+{"account_password":{"value":"example-placeholder","origins":["https://example.com"]}}
+```
+
+Each name has a nonempty single-line value up to 4096 bytes and exact HTTPS
+origins. `fill_secret` takes a name, an editable inline-snapshot UID and optional
+page handle. It checks the top-level origin in the same synchronous function as
+insertion and returns no value. Treat recordings and exported artifacts as
+sensitive; see [SECURITY.md](SECURITY.md).
+
+HAR export is deferred: the current worker does not expose the timing data needed
+for an accurate HAR. Use paginated network lists and `get_network_request` with
+`requestFilePath` / `responseFilePath` for focused diagnostics instead.
+
 ## Architecture
 
 ```mermaid

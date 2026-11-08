@@ -58,24 +58,38 @@ impl BrokerWriter<'_> {
 
 impl Write for BrokerWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.lock().write(bytes)
+        let decoded = String::from_utf8_lossy(bytes);
+        let message = super::privacy::known(&decoded);
+        self.lock().write_all(message.as_bytes())?;
+        Ok(bytes.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
         self.lock().flush()
     }
+    fn write_fmt(&mut self, args: std::fmt::Arguments<'_>) -> io::Result<()> {
+        let formatted = std::fmt::format(args);
+        let message = super::privacy::known(&formatted);
+        self.lock().write_all(message.as_bytes())
+    }
 }
 
-fn log_path(profile: &Path, prefix: &str) -> Result<PathBuf> {
+pub(super) fn location(profile: &Path, prefix: &str) -> Result<PathBuf> {
     let state = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
         .ok_or_else(|| anyhow!("HOME or XDG_STATE_HOME is required for broker diagnostics"))?;
     let directory = state.join("browser-mcp");
-    fs::create_dir_all(&directory).context("failed to create browser broker log directory")?;
-    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
     let id = xxh3_64(profile.as_os_str().as_encoded_bytes());
     Ok(directory.join(format!("{prefix}-{id:016x}.log")))
+}
+
+fn log_path(profile: &Path, prefix: &str) -> Result<PathBuf> {
+    let path = location(profile, prefix)?;
+    let directory = path.parent().expect("log directory");
+    fs::create_dir_all(directory).context("failed to create browser broker log directory")?;
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+    Ok(path)
 }
 
 pub(super) fn enable(profile: &Path) -> Result<()> {

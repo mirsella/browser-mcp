@@ -11,7 +11,8 @@ const skills = fileURLToPath(new URL("../skills/", import.meta.url));
 const directTools = `click close_page drag emulate evaluate_script fill fill_form get_console_message
 get_network_request handle_dialog hover lighthouse_audit list_console_messages list_network_requests
 list_pages navigate_page new_page performance_analyze_insight performance_start_trace performance_stop_trace
-press_key resize_page take_heapsnapshot take_screenshot take_snapshot type_text upload_file wait_for`
+press_key resize_page take_heapsnapshot take_screenshot take_snapshot type_text upload_file wait_for
+status select_page handoff batch fill_secret screencast_start screencast_stop`
   .split(/\s+/).map(name => `browser_${name}`);
 
 function partialPolicy(agents: Array<{ permissions: readonly { action: string }[] }>) {

@@ -100,6 +100,7 @@ pub(super) async fn run(cli: Cli) -> Result<()> {
         command,
     } = cli;
     match command {
+        Some(ProcessMode::Doctor) => doctor(config, profile_override),
         Some(ProcessMode::BrowserStderr { .. }) => {
             bail!("browser stderr writer must run outside the broker runtime")
         }
@@ -126,6 +127,85 @@ pub(super) async fn run(cli: Cli) -> Result<()> {
             bridge(paths, direct_tools, config).await
         }
     }
+}
+
+fn doctor(mut config: Config, profile_override: Option<PathBuf>) -> Result<()> {
+    let mut healthy = true;
+    for (label, path) in [
+        ("browser", &config.browser_executable),
+        ("worker launcher", &config.downstream_command),
+    ] {
+        match super::resolve_executable(path, label) {
+            Ok(path) => println!("ok {label}: {}", path.display()),
+            Err(error) => {
+                healthy = false;
+                println!("fail {label}: {error}");
+            }
+        }
+    }
+    config.profile = super::canonicalize_path(&profile_override.unwrap_or_else(|| {
+        super::browser_profile(&super::config_home(), &config.browser_executable)
+    }))?;
+    let paths = RuntimePaths::new(&config)?;
+    println!("profile: {}", config.profile.display());
+    match super::live_chromium_profile_owner(&config.profile) {
+        Some(pid) => println!("profile owner: live local process {pid}; do not remove its lock"),
+        None => println!("profile owner: no verified live local Chromium owner"),
+    }
+    let state = config.profile.join(STATE_FILE);
+    if state.exists() {
+        match super::persistence::OwnershipPersistence::open(state) {
+            Ok(_) => println!("ownership state: private and readable"),
+            Err(error) => {
+                healthy = false;
+                println!("fail ownership state: {error}");
+            }
+        }
+    } else {
+        println!("ownership state: absent");
+    }
+    println!(
+        "broker socket: {} ({})",
+        paths.socket.display(),
+        if paths.socket.exists() {
+            "present; not contacted"
+        } else {
+            "absent"
+        }
+    );
+    println!(
+        "display: {}",
+        if config.headless {
+            "headless"
+        } else if std::env::var_os("DISPLAY").is_some()
+            || std::env::var_os("WAYLAND_DISPLAY").is_some()
+        {
+            "configured"
+        } else {
+            "not in environment; broker may recover desktop environment"
+        }
+    );
+    println!(
+        "logs: {}",
+        super::logging::location(&config.profile, "broker")?.display()
+    );
+    if let Err(error) = super::privacy::Secrets::load(config.secrets_file.as_deref()) {
+        healthy = false;
+        println!("fail secrets configuration: {error}");
+    }
+    if config.recording
+        && let Err(error) = super::resolve_executable(
+            config.ffmpeg.as_deref().unwrap_or(Path::new("ffmpeg")),
+            "ffmpeg",
+        )
+    {
+        healthy = false;
+        println!("fail recording: {error}");
+    }
+    if !healthy {
+        bail!("doctor found configuration failures; no services were started");
+    }
+    Ok(())
 }
 
 struct RuntimePaths {
@@ -928,7 +1008,7 @@ fn route_request(
     Ok((client.owner_id(id)?, request))
 }
 
-fn compact_tools() -> Vec<Tool> {
+pub(super) fn compact_tools() -> Vec<Tool> {
     let dispatch_schema = json!({
         "type": "object",
         "properties": {
@@ -1040,8 +1120,7 @@ fn compact_help(request: CallToolRequestParams, tools: &[Tool]) -> Result<CallTo
     if let Some(action) = action {
         let tool = browser_tool(tools, &action)
             .ok_or_else(|| anyhow!("unknown browser action {action:?}; call browser_help without an action to list available actions"))?;
-        let text = serde_json::to_string_pretty(tool)
-            .context("failed to format browser action definition")?;
+        let text = super::actions::help(tool);
         return Ok(CallToolResult::success(vec![ContentBlock::text(text)]));
     }
     let mut actions = tools
@@ -1076,7 +1155,10 @@ impl ServerHandler for Connection {
             .await
             .map_err(|error| rmcp::ErrorData::internal_error(error.to_string(), None))?
             .tools
-            .clone()
+            .iter()
+            .filter(|tool| tool.name != "batch")
+            .cloned()
+            .collect()
         };
         Ok(ListToolsResult::with_all_items(tools))
     }
@@ -1110,6 +1192,41 @@ impl ServerHandler for Connection {
             );
             let (id, mut request) = route_request(request, &context.meta)?;
             tracing::Span::current().record("session_id", &id);
+            let observing = request.name == "status"
+                || (self.compact
+                    && request.name == "dispatch"
+                    && request
+                        .arguments
+                        .as_ref()
+                        .and_then(|args| args.get("action"))
+                        .and_then(Value::as_str)
+                        == Some("status"));
+            if observing {
+                let tools = super::actions::builtins(false);
+                if self.compact {
+                    request = expand_dispatch(request, &tools)?;
+                }
+                super::actions::validate(
+                    browser_tool(&tools, "status").expect("builtin status"),
+                    request
+                        .arguments
+                        .as_ref()
+                        .unwrap_or(&serde_json::Map::new()),
+                )?;
+                return self.proxy.status(&self.workspace, &id).await;
+            }
+            if self.compact && request.name == "help" {
+                let builtins = super::actions::builtins(self.proxy.config.secrets_file.is_some());
+                if request
+                    .arguments
+                    .as_ref()
+                    .and_then(|args| args.get("action"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|action| browser_tool(&builtins, action).is_some())
+                {
+                    return compact_help(request, &builtins);
+                }
+            }
             info!("waiting for Chrome DevTools tool catalog");
             let catalog = self.proxy.catalog.get(&self.workspace).await?;
             info!("Chrome DevTools tool catalog available");
@@ -1120,17 +1237,41 @@ impl ServerHandler for Connection {
                     _ => unreachable!("compact tool name checked above"),
                 }
             }
+            if !self.compact && request.name == "batch" {
+                bail!(
+                    "batch is unavailable with per-action/direct permissions; call individual tools"
+                );
+            }
+            let tool =
+                browser_tool(&catalog.tools, &request.name).context("unknown browser action")?;
+            super::actions::validate(
+                tool,
+                request
+                    .arguments
+                    .as_ref()
+                    .unwrap_or(&serde_json::Map::new()),
+            )?;
+            if request.name == "batch" {
+                super::actions::batch_steps(
+                    request
+                        .arguments
+                        .as_ref()
+                        .context("batch arguments missing")?,
+                    &catalog.tools,
+                )?;
+            }
             self.proxy
                 .route_call(&catalog, &self.workspace, &id, request, &context)
                 .await
         })
         .instrument(span)
         .await;
-        Ok(result
-            .unwrap_or_else(|error| {
+        Ok(
+            super::responses::model_result(result.unwrap_or_else(|error| {
                 CallToolResult::error(vec![ContentBlock::text(error.to_string())])
-            })
-            .into())
+            }))
+            .into(),
+        )
     }
 }
 
@@ -1963,13 +2104,12 @@ mod tests {
             &tools,
         )
         .unwrap();
-        let definition: Value = serde_json::from_str(&detailed.content[0].as_text().unwrap().text)
-            .expect("browser tool definition");
-        assert_eq!(definition["name"], "navigate_page");
-        assert_eq!(
-            definition["inputSchema"]["properties"]["url"]["type"],
-            "string"
-        );
+        let text = &detailed.content[0].as_text().unwrap().text;
+        assert!(text.starts_with("navigate_page(url?: string)"));
+        let definition: Value =
+            serde_json::from_str(text.lines().last().unwrap()).expect("compact argument schema");
+        assert_eq!(definition["properties"]["url"]["type"], "string");
+        assert!(!text.contains("inputSchema"));
     }
 
     #[tokio::test]

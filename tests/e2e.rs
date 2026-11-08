@@ -944,7 +944,8 @@ async fn recovers_from_browser_worker_and_broker_process_deaths() {
         0o600
     );
     let empty = call_ok(&a, "list_pages", "crash-a", json!({})).await;
-    assert_eq!(empty.structured_content.unwrap()["pages"], json!([]));
+    assert!(empty.structured_content.is_none());
+    assert_eq!(text(&empty).trim(), "## Pages\n-");
     assert_ne!(
         browser_json(port, "version").await["webSocketDebuggerUrl"],
         generation["webSocketDebuggerUrl"]
@@ -981,7 +982,8 @@ async fn recovers_from_browser_worker_and_broker_process_deaths() {
     wait_for_profile_lease(&profile).await;
     wait_for_browser_exit(port).await;
     let empty = call_ok(&b, "list_pages", "crash-b", json!({})).await;
-    assert_eq!(empty.structured_content.unwrap()["pages"], json!([]));
+    assert!(empty.structured_content.is_none());
+    assert_eq!(text(&empty).trim(), "## Pages\n-");
     call_ok(
         &a,
         "navigate_page",
@@ -996,7 +998,8 @@ async fn recovers_from_browser_worker_and_broker_process_deaths() {
     kill_process(browser_process_id(port).await, libc::SIGKILL);
     wait_for_browser_exit(port).await;
     let empty = call_ok(&a, "list_pages", "crash-a", json!({})).await;
-    assert_eq!(empty.structured_content.unwrap()["pages"], json!([]));
+    assert!(empty.structured_content.is_none());
+    assert_eq!(text(&empty).trim(), "## Pages\n-");
 
     a.cancel().await.unwrap();
     b.cancel().await.unwrap();
@@ -1184,6 +1187,15 @@ async fn compact_startup_does_not_require_downstream() {
         !downstream_started.exists(),
         "compact startup ran downstream"
     );
+    let status = call_ok(
+        &client,
+        "dispatch",
+        "observational-status",
+        json!({"action":"status"}),
+    )
+    .await;
+    assert!(text(&status).contains("not started"));
+    assert!(!downstream_started.exists(), "status launched a worker");
     assert!(
         tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
@@ -1299,7 +1311,10 @@ async fn exercise_shared_broker() {
         "tool discovery started the browser"
     );
     for tool in direct_tools {
-        assert_ne!(tool.name, "select_page");
+        if tool.name == "select_page" {
+            assert!(tool.input_schema["properties"].get("page").is_some());
+        }
+        assert_ne!(tool.name, "batch");
         assert_ne!(tool.name, "get_tab_id");
         let properties = tool
             .input_schema
@@ -2153,5 +2168,653 @@ async fn codex_hooks_share_profile_isolate_sessions_and_queue_cleanup() {
     wait_for_broker_exit(&socket, &profile).await;
     site_task.abort();
     let _ = site_task.await;
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+async fn dispatch_ok(
+    client: &Client,
+    session: &str,
+    action: &str,
+    arguments: Value,
+) -> CallToolResult {
+    call_ok(
+        client,
+        "dispatch",
+        session,
+        json!({"action":action,"arguments":arguments}),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Chromium and the real Chrome DevTools MCP worker"]
+async fn headless_screenshots_survive_background_tabs_and_popup_closure() {
+    let root = std::env::current_dir().unwrap().join(format!(
+        ".scratch/headless-screenshots-{}",
+        std::process::id()
+    ));
+    // Profiles and images stay on disk; only the small socket lives in /tmp.
+    let runtime = std::env::temp_dir().join(format!("browser-shots-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&runtime).unwrap();
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let profile = root.join("profile");
+    let socket = broker_socket(&profile);
+    let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let command = || {
+        let mut command = runtime_command(&runtime, &profile, port, "window-per-session");
+        command
+            .env("OPENCODE_BROWSER_HEADLESS", "true")
+            .env("OPENCODE_BROWSER_OPERATION_SECONDS", "8");
+        command
+    };
+    let client = ().serve(TokioChildProcess::new(command()).unwrap()).await.unwrap();
+    async fn call(
+        client: &Client,
+        session: &str,
+        action: &str,
+        arguments: Value,
+    ) -> anyhow::Result<CallToolResult> {
+        let result = client
+            .call_tool(request(
+                "dispatch",
+                session,
+                json!({"action":action,"arguments":arguments}),
+            ))
+            .await?;
+        anyhow::ensure!(
+            !result.is_error.unwrap_or(false),
+            "{action}: {}",
+            text(&result)
+        );
+        Ok(result)
+    }
+    let checks = async {
+        let url = "data:text/html,<title>Screenshot regression</title><style>body{font:16px system-ui}section{height:1800px}</style><h1>Screenshot marker</h1><a href='about:blank' target='_blank'>Details popup</a><section>Long page</section><p>Confirmation marker</p>";
+        for session in ["shots-a", "shots-b"] {
+            call(&client, session, "navigate_page", json!({"url":url})).await?;
+            let snapshot = call(&client, session, "take_snapshot", json!({})).await?;
+            let link = snapshot_uid(&snapshot, "link \"Details popup\"");
+            call(&client, session, "click", json!({"uid":link})).await?;
+            call(&client, session, "close_page", json!({"page":"p2"})).await?;
+            call(&client, session, "new_page", json!({"url":"about:blank"})).await?;
+        }
+        let mut captures = 0;
+        for format in ["png", "jpeg", "webp"] {
+            for session in ["shots-a", "shots-b"] {
+                let snapshot = call(&client, session, "take_snapshot", json!({"page":"p1"})).await?;
+                let heading = snapshot_uid(&snapshot, "heading \"Screenshot marker\"");
+                for extra in [json!({}), json!({"fullPage":true}), json!({"uid":heading})] {
+                    let mut arguments = extra.as_object().unwrap().clone();
+                    arguments.insert("page".into(), "p1".into());
+                    arguments.insert("format".into(), format.into());
+                    let result = call(&client, session, "take_screenshot", Value::Object(arguments)).await?;
+                    anyhow::ensure!(result.content.iter().any(|content| content.as_image().is_some_and(|image|
+                        image.mime_type == format!("image/{format}") && image.data.len() > 100)), "missing {format} image");
+                    captures += 1;
+                }
+                let pages = call(&client, session, "list_pages", json!({})).await?;
+                anyhow::ensure!(text(&pages).lines().any(|line| line.contains("about:blank") && line.contains("[current]")), "scoped capture changed current page");
+            }
+        }
+        // Separate workers share one headless renderer. Target creation and
+        // closure in another session must not steal a capture's active frame.
+        let capture_during_changes = async {
+            for _ in 0..6 {
+                let image = call(&client, "shots-a", "take_screenshot", json!({"page":"p1"})).await?;
+                anyhow::ensure!(image.content.iter().any(|content| content.as_image().is_some()), "missing concurrent capture");
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        let change_other_window = async {
+            for _ in 0..6 {
+                call(&client, "shots-b", "new_page", json!({"url":"about:blank"})).await?;
+                call(&client, "shots-b", "close_page", json!({})).await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        let (captured, changed) = tokio::join!(capture_during_changes, change_other_window);
+        captured?;
+        changed?;
+        captures += 6;
+        let file = root.join("export.png");
+        call(&client, "shots-a", "take_screenshot", json!({"page":"p1","filePath":file})).await?;
+        anyhow::ensure!(std::fs::read(&file)?.starts_with(b"\x89PNG\r\n\x1a\n"), "invalid PNG export");
+        let interrupted = client.call_tool(request("dispatch", "shots-a", json!({
+            "action":"evaluate_script", "arguments":{
+                "page":"p1", "function":"async () => await new Promise(() => {})"
+            }
+        }))).await?;
+        anyhow::ensure!(interrupted.is_error == Some(true) && text(&interrupted).contains("deadline"), "missing intentional timeout");
+        let pages = call(&client, "shots-a", "list_pages", json!({})).await?;
+        anyhow::ensure!(text(&pages).lines().any(|line| line.contains("about:blank") && line.contains("[current]")), "cancelled scoped call changed current page");
+        let recovered = call(&client, "shots-a", "take_screenshot", json!({"page":"p1"})).await?;
+        anyhow::ensure!(recovered.content.iter().any(|content| content.as_image().is_some()), "missing capture after worker replacement");
+        println!("{captures} inline screenshots, one PNG export, and capture after scoped cancellation passed");
+        Ok::<_, anyhow::Error>(())
+    }.await;
+    for session in ["shots-a", "shots-b"] {
+        assert!(
+            command()
+                .arg("release-session")
+                .arg(session)
+                .status()
+                .await
+                .unwrap()
+                .success()
+        );
+    }
+    client.cancel().await.unwrap();
+    wait_for_broker_exit(&socket, &profile).await;
+    wait_for_browser_exit(port).await;
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(runtime).unwrap();
+    checks.unwrap();
+}
+
+fn snapshot_uid(snapshot: &CallToolResult, label: &str) -> String {
+    text(snapshot)
+        .lines()
+        .find(|line| line.contains(label))
+        .unwrap_or_else(|| panic!("missing {label} in {}", text(snapshot)))
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .strip_prefix("uid=")
+        .expect("snapshot reference")
+        .to_owned()
+}
+
+#[tokio::test]
+#[ignore = "requires a real Chromium browser and Chrome DevTools MCP worker"]
+async fn compact_workflows_bound_context_and_preserve_references() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(format!(".scratch/workflows-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let profile = root.join("profile");
+    let socket = broker_socket(&profile);
+    let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let workers = root.join("workers");
+    let launcher = root.join("downstream");
+    std::fs::write(
+        &launcher,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\nexec bunx \"$@\"\n",
+            workers.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut command = runtime_command(&root, &profile, port, "shared-window");
+    command.env("OPENCODE_BROWSER_DOWNSTREAM_COMMAND", &launcher);
+    let client = ().serve(TokioChildProcess::new(command).unwrap()).await.unwrap();
+    let (site, site_task) = start_test_site().await;
+    dispatch_ok(&client, "workflow", "status", json!({})).await;
+    call_ok(&client, "help", "workflow", json!({"action":"handoff"})).await;
+    assert!(
+        !workers.exists(),
+        "local help/status must not launch workers"
+    );
+    dispatch_ok(&client, "workflow", "navigate_page", json!({"url":site})).await;
+    dispatch_ok(&client, "workflow", "evaluate_script", json!({"function":"() => { document.body.innerHTML = '<label>Name <input id=name></label><button id=save>Save</button><p id=result>Ready</p>'; document.getElementById('save').onclick = () => { document.getElementById('result').textContent = 'Saved'; }; return 'ready'; }"})).await;
+    let full = dispatch_ok(&client, "workflow", "take_snapshot", json!({})).await;
+    assert!(
+        full.structured_content.is_none(),
+        "snapshot context was duplicated"
+    );
+    let save = snapshot_uid(&full, "button \"Save\"");
+    let input = snapshot_uid(&full, "textbox");
+    let filtered = dispatch_ok(&client, "workflow", "take_snapshot", json!({"find":"Save"})).await;
+    assert_eq!(snapshot_uid(&filtered, "button \"Save\""), save);
+    assert!(!text(&filtered).contains("textbox"));
+    let original_workers = std::fs::read_to_string(&workers).unwrap();
+    let missing = format!("{}_999999999", save.rsplit_once('_').unwrap().0);
+    let bad = client
+        .call_tool(request(
+            "dispatch",
+            "workflow",
+            json!({"action":"click","arguments":{"uid":missing}}),
+        ))
+        .await
+        .unwrap();
+    assert!(bad.is_error.unwrap_or(false));
+    dispatch_ok(&client, "workflow", "click", json!({"uid":save})).await;
+    assert_eq!(
+        std::fs::read_to_string(&workers).unwrap(),
+        original_workers,
+        "ordinary tool error discarded useful references"
+    );
+    let changes = dispatch_ok(&client, "workflow", "take_snapshot", json!({"diff":true})).await;
+    assert!(text(&changes).contains("Saved"));
+    let rejected = client.call_tool(request("dispatch", "workflow", json!({"action":"batch","arguments":{"steps":[
+        {"action":"evaluate_script","arguments":{"function":"() => { window.shouldNotRun = true; }"}},
+        {"action":"click","arguments":{"uid":"v0000000000000:1_2"}}
+    ]}}))).await.unwrap();
+    assert!(rejected.is_error.unwrap_or(false));
+    let check = dispatch_ok(
+        &client,
+        "workflow",
+        "evaluate_script",
+        json!({"function":"() => window.shouldNotRun === undefined"}),
+    )
+    .await;
+    assert!(text(&check).contains("true"));
+    let partial = client.call_tool(request("dispatch", "workflow", json!({"action":"batch","arguments":{"steps":[
+        {"action":"evaluate_script","arguments":{"function":"() => { window.partial = 1; }"}},
+        {"action":"click","arguments":{"uid":missing}},
+        {"action":"evaluate_script","arguments":{"function":"() => { window.notRun = 1; }"}}
+    ]}}))).await.unwrap();
+    assert!(partial.is_error.unwrap_or(false));
+    assert!(
+        text(&partial).contains("1 completed; 1 not run"),
+        "{}",
+        text(&partial)
+    );
+    let check = dispatch_ok(
+        &client,
+        "workflow",
+        "evaluate_script",
+        json!({"function":"() => window.partial === 1 && window.notRun === undefined"}),
+    )
+    .await;
+    assert!(text(&check).contains("true"));
+    dispatch_ok(
+        &client,
+        "workflow",
+        "batch",
+        json!({"steps":[
+            {"action":"fill_form","arguments":{"elements":[{"uid":input,"value":"Ada"}]}},
+            {"action":"click","arguments":{"uid":save}},
+            {"action":"take_snapshot","arguments":{"maxLines":40}}
+        ]}),
+    )
+    .await;
+    dispatch_ok(
+        &client,
+        "workflow",
+        "new_page",
+        json!({"url":format!("{site}/#second")}),
+    )
+    .await;
+    dispatch_ok(&client, "workflow", "select_page", json!({"page":"p1"})).await;
+    let second = dispatch_ok(
+        &client,
+        "workflow",
+        "evaluate_script",
+        json!({"page":"p2","function":"() => location.hash"}),
+    )
+    .await;
+    assert!(text(&second).contains("#second"));
+    let pages = dispatch_ok(&client, "workflow", "list_pages", json!({})).await;
+    assert!(
+        text(&pages)
+            .lines()
+            .any(|line| line.contains("p1:") && line.contains("[current]"))
+    );
+    assert!(
+        !text(&pages)
+            .lines()
+            .any(|line| line.contains("p2:") && line.contains("[current]"))
+    );
+    let foreign = client.call_tool(request("dispatch", "other-workflow", json!({"action":"evaluate_script","arguments":{"page":"p2","function":"() => location.href"}}))).await.unwrap();
+    assert!(foreign.is_error.unwrap_or(false));
+    assert!(!text(&foreign).contains("#second"));
+    if std::env::var_os("DISPLAY").is_some() {
+        dispatch_ok(&client, "workflow", "handoff", json!({"mode":"start","page":"p1","message":"Test driver performs the user confirmation."})).await;
+        let paused = client.call_tool(request("dispatch", "workflow", json!({"action":"evaluate_script","arguments":{"page":"p1","function":"() => true"}}))).await.unwrap();
+        assert!(paused.is_error.unwrap_or(false));
+        dispatch_ok(
+            &client,
+            "workflow",
+            "evaluate_script",
+            json!({"page":"p2","function":"() => true"}),
+        )
+        .await;
+        dispatch_ok(&client, "workflow", "handoff", json!({"mode":"finish"})).await;
+    }
+    // The page was valid when last listed but is now closed outside this broker.
+    let second = browser_tabs(port)
+        .await
+        .into_iter()
+        .find(|tab| {
+            tab["url"]
+                .as_str()
+                .is_some_and(|url| url.ends_with("/#second"))
+        })
+        .unwrap();
+    let version = browser_json(port, "version").await;
+    cdp_request(
+        version["webSocketDebuggerUrl"].as_str().unwrap(),
+        "Target.closeTarget",
+        json!({"targetId":second["id"]}),
+    )
+    .await;
+    let rejected = client.call_tool(request("dispatch", "workflow", json!({"action":"batch","arguments":{"steps":[
+        {"action":"evaluate_script","arguments":{"page":"p1","function":"() => { window.closedPagePreflight = true; }"}},
+        {"action":"evaluate_script","arguments":{"page":"p2","function":"() => true"}}
+    ]}}))).await.unwrap();
+    assert!(rejected.is_error.unwrap_or(false));
+    assert!(
+        text(&rejected).contains("Batch rejected before any step"),
+        "{}",
+        text(&rejected)
+    );
+    let untouched = dispatch_ok(
+        &client,
+        "workflow",
+        "evaluate_script",
+        json!({
+            "page":"p1", "function":"() => window.closedPagePreflight === undefined"
+        }),
+    )
+    .await;
+    assert!(text(&untouched).contains("true"));
+    let pid: i32 = std::fs::read_to_string(&workers)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    kill_process_tree(pid);
+    let fresh = client
+        .call_tool(request(
+            "dispatch",
+            "workflow",
+            json!({"action":"take_snapshot"}),
+        ))
+        .await
+        .unwrap();
+    let fresh = if fresh.is_error.unwrap_or(false) {
+        eprintln!("worker interruption was reported; explicitly requesting a new snapshot");
+        dispatch_ok(&client, "workflow", "take_snapshot", json!({})).await
+    } else {
+        fresh
+    };
+    assert_ne!(snapshot_uid(&fresh, "button \"Save\""), save);
+    let stale = client
+        .call_tool(request(
+            "dispatch",
+            "workflow",
+            json!({"action":"click","arguments":{"uid":save}}),
+        ))
+        .await
+        .unwrap();
+    assert!(stale.is_error.unwrap_or(false));
+    assert!(text(&stale).contains("earlier browser worker"));
+    println!(
+        "workflow response bytes: full={}, filtered={}, diff={}",
+        text(&full).len(),
+        text(&filtered).len(),
+        text(&changes).len()
+    );
+    for session in ["workflow", "other-workflow"] {
+        let status = runtime_command(&root, &profile, port, "shared-window")
+            .env("OPENCODE_BROWSER_DOWNSTREAM_COMMAND", &launcher)
+            .arg("release-session")
+            .arg(session)
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success());
+    }
+    client.cancel().await.unwrap();
+    wait_for_broker_exit(&socket, &profile).await;
+    wait_for_browser_exit(port).await;
+    site_task.abort();
+    let _ = site_task.await;
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium, Python, OpenSSL and ffmpeg"]
+async fn opt_in_secrets_and_recording_preserve_origin_and_artifact_contracts() {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(format!(".scratch/opt-in-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let cert = Command::new("openssl")
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-days",
+            "1",
+            "-subj",
+            "/CN=localhost",
+            "-keyout",
+            "key.pem",
+            "-out",
+            "cert.pem",
+        ])
+        .current_dir(&root)
+        .output()
+        .await
+        .unwrap();
+    assert!(cert.status.success());
+    let mut server = Command::new("python3").arg("-u").arg("-c").arg(r#"
+import http.server, ssl
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b'<label>Frame secret<input type=password></label>' if self.path == '/frame' else b'<title>Secret fixture</title><label>Main secret<input type=password></label><iframe src=/frame></iframe>'
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html')
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *args): pass
+server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+context.load_cert_chain('cert.pem', 'key.pem')
+server.socket = context.wrap_socket(server.socket, server_side=True)
+print(server.server_port, flush=True)
+server.serve_forever()
+"#).current_dir(&root).stdout(Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+    let mut server_port = String::new();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        BufReader::new(server.stdout.take().unwrap()).read_line(&mut server_port),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let origin = format!("https://127.0.0.1:{}", server_port.trim());
+    let secret = "fixture-insertion-value-7b3d";
+    let secrets = root.join("secrets.json");
+    std::fs::write(
+        &secrets,
+        json!({"fixture":{"value":secret,"origins":[origin]}}).to_string(),
+    )
+    .unwrap();
+    std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o600)).unwrap();
+    // The certificate bypass belongs only to this self-signed local fixture.
+    let browser = root.join("browser");
+    let chromium =
+        std::env::var("OPENCODE_BROWSER_EXECUTABLE").unwrap_or_else(|_| "chromium".into());
+    std::fs::write(
+        &browser,
+        format!(
+            "#!/bin/sh\nexec '{}' --ignore-certificate-errors \"$@\"\n",
+            chromium.replace('\'', "'\\''")
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&browser, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let ffmpeg = root.join("ffmpeg");
+    std::fs::write(
+        &ffmpeg,
+        format!(
+            "#!/bin/sh\nexec /usr/bin/ffmpeg \"$@\" 2>>'{}'\n",
+            root.join("encoder.log").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&ffmpeg, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let profile = root.join("profile");
+    let socket = broker_socket(&profile);
+    let command = || {
+        let mut command = runtime_command(&root, &profile, port, "shared-window");
+        command
+            .current_dir(&root)
+            .env("OPENCODE_BROWSER_EXECUTABLE", &browser)
+            .env("OPENCODE_BROWSER_SECRETS_FILE", &secrets)
+            .env("OPENCODE_BROWSER_RECORDING", "true")
+            .env("OPENCODE_BROWSER_FFMPEG", &ffmpeg)
+            .env("XDG_STATE_HOME", root.join("state"));
+        command
+    };
+    let client = ().serve(TokioChildProcess::new(command()).unwrap()).await.unwrap();
+    dispatch_ok(&client, "opt-in", "navigate_page", json!({"url":origin})).await;
+    let snapshot = dispatch_ok(&client, "opt-in", "take_snapshot", json!({})).await;
+    let uid = snapshot_uid(&snapshot, "textbox \"Main secret\"");
+    let frame = snapshot_uid(&snapshot, "textbox \"Frame secret\"");
+    let result = dispatch_ok(
+        &client,
+        "opt-in",
+        "fill_secret",
+        json!({"name":"fixture","uid":uid}),
+    )
+    .await;
+    assert!(!text(&result).contains(secret));
+    let result = dispatch_ok(
+        &client,
+        "opt-in",
+        "evaluate_script",
+        json!({"function":format!("() => document.querySelector('input').value === {secret:?}")}),
+    )
+    .await;
+    assert!(text(&result).contains("true"));
+    assert!(!text(&result).contains(secret));
+    let denied = client
+        .call_tool(request(
+            "dispatch",
+            "opt-in",
+            json!({"action":"fill_secret","arguments":{"name":"fixture","uid":frame}}),
+        ))
+        .await
+        .unwrap();
+    assert!(denied.is_error.unwrap_or(false));
+    dispatch_ok(
+        &client,
+        "opt-in",
+        "select_page",
+        json!({"page":"p1","bringToFront":true}),
+    )
+    .await;
+    dispatch_ok(
+        &client,
+        "opt-in",
+        "resize_page",
+        json!({"width":1280,"height":720}),
+    )
+    .await;
+    dispatch_ok(&client, "opt-in", "screencast_start", json!({})).await;
+    let duplicate = client
+        .call_tool(request(
+            "dispatch",
+            "opt-in",
+            json!({"action":"screencast_start"}),
+        ))
+        .await
+        .unwrap();
+    assert!(duplicate.is_error.unwrap_or(false));
+    dispatch_ok(&client, "opt-in", "evaluate_script", json!({"function":"async () => { for (let i = 0; i < 20; i++) { document.body.style.background = i % 2 ? 'orange' : 'blue'; await new Promise(resolve => setTimeout(resolve, 50)); } return true; }"})).await;
+    let stopped = dispatch_ok(&client, "opt-in", "screencast_stop", json!({})).await;
+    eprintln!("{}", text(&stopped));
+    let files: Vec<_> = std::fs::read_dir(root.join(".scratch/browser-mcp"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(files.len(), 1);
+    assert!(std::fs::metadata(&files[0]).unwrap().len() > 0);
+    assert_eq!(
+        std::fs::metadata(&files[0]).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let stop = client
+        .call_tool(request(
+            "dispatch",
+            "opt-in",
+            json!({"action":"screencast_stop"}),
+        ))
+        .await
+        .unwrap();
+    assert!(stop.is_error.unwrap_or(false));
+    // A different top-level origin cannot defeat the guard by replacing includes.
+    let denied_origin = origin.replacen("127.0.0.1", "localhost", 1);
+    dispatch_ok(
+        &client,
+        "opt-in",
+        "navigate_page",
+        json!({"url":denied_origin}),
+    )
+    .await;
+    dispatch_ok(
+        &client,
+        "opt-in",
+        "evaluate_script",
+        json!({"function":"() => { Array.prototype.includes = () => true; return true; }"}),
+    )
+    .await;
+    let snapshot = dispatch_ok(&client, "opt-in", "take_snapshot", json!({})).await;
+    let uid = snapshot_uid(&snapshot, "textbox \"Main secret\"");
+    let denied = client
+        .call_tool(request(
+            "dispatch",
+            "opt-in",
+            json!({"action":"fill_secret","arguments":{"name":"fixture","uid":uid}}),
+        ))
+        .await
+        .unwrap();
+    assert!(denied.is_error.unwrap_or(false));
+    let unchanged = dispatch_ok(
+        &client,
+        "opt-in",
+        "evaluate_script",
+        json!({"function":"() => document.querySelector('input').value === ''"}),
+    )
+    .await;
+    assert!(text(&unchanged).contains("true"));
+    // Closing the final tab must retire its recorder, including worker-local state.
+    dispatch_ok(&client, "opt-in", "screencast_start", json!({})).await;
+    dispatch_ok(&client, "opt-in", "close_page", json!({})).await;
+    dispatch_ok(&client, "opt-in", "navigate_page", json!({"url":origin})).await;
+    dispatch_ok(&client, "opt-in", "screencast_start", json!({})).await;
+    dispatch_ok(&client, "opt-in", "evaluate_script", json!({"function":"async () => { for (let i = 0; i < 20; i++) { document.body.style.background = i % 2 ? 'green' : 'purple'; await new Promise(resolve => setTimeout(resolve, 50)); } return true; }"})).await;
+    dispatch_ok(&client, "opt-in", "screencast_stop", json!({})).await;
+    assert!(
+        command()
+            .arg("release-session")
+            .arg("opt-in")
+            .status()
+            .await
+            .unwrap()
+            .success()
+    );
+    client.cancel().await.unwrap();
+    wait_for_broker_exit(&socket, &profile).await;
+    wait_for_browser_exit(port).await;
+    server.kill().await.unwrap();
+    server.wait().await.unwrap();
+    for entry in std::fs::read_dir(root.join("state/browser-mcp")).unwrap() {
+        let file = entry.unwrap().path();
+        assert!(!std::fs::read_to_string(file).unwrap().contains(secret));
+    }
     std::fs::remove_dir_all(root).unwrap();
 }

@@ -30,6 +30,13 @@ cleanup, persistence, profile locking, or process shutdown:
 cargo test --release --test e2e -- --ignored --nocapture --test-threads=1
 ```
 
+For a headless Linux terminal, wrap the real-browser command in `xvfb-run -a`
+to exercise headed handoffs and window placement. The compact workflow case
+covers tab selection, UID lifetime, filtered snapshots, diffs, batch failure
+boundaries and human handoffs. `actions::tests::context_budgets_and_pinned_schema_dialect`
+prints static schema/help byte counts; these are not model-success measurements.
+The public pinned tool-schema fixture comes from Chrome DevTools MCP 1.6.0.
+
 The real-browser cases share Bunx's installation cache and run serially. Adapter
 and tool-call concurrency is exercised within each case.
 
@@ -76,6 +83,39 @@ npm pack --dry-run
   to finish before closing workers and the browser.
 - Window layout is best-effort presentation. Stable target ownership remains
   authoritative, and layout repair must not move, claim, or close tabs.
+
+## Model browser evaluation
+
+`scripts/browser-model-eval.ts` provides a local dummy shop, a transparent MCP
+trace adapter, prompts, configuration, and an independent scorer. It exercises
+a 221-product catalog, popup details, form entry, discount arithmetic, and a
+checkout that fails its first valid submission. No money or external account
+is involved. `bun test tests/model-eval.test.ts` checks the fixture's rejection
+and retry behavior.
+
+Use a fresh `.scratch/` directory per experiment. Build the baseline from a
+recorded commit in a separate source directory and copy the two release
+binaries to `<root>/bin/before` and `<root>/bin/after`. Keep each build's own
+browser skill. Start `bun scripts/browser-model-eval.ts site --root=<root>`
+under a known PID or held lock; stop and collect it when the experiment ends.
+
+Generate temporary project MCP configuration with `config --root=<root>
+--condition=before` (then `after`) and merge it without overwriting existing
+configuration. Generate each prompt with `prompt --run=before-1
+--skill=<baseline-skill-path>`, repeating for `before-2`, `after-1`, and
+`after-2`. Use separate model conversations with the same provider, model and
+effort. Run both baseline cases before switching configuration. The adapter
+preserves trusted OpenCode session metadata; the model never supplies routing.
+
+Save final answers to `<root>/answers.json` as objects containing `run`,
+`answer`, `elapsedSeconds`, and `thread`, then run `score --root=<root>`.
+Scoring checks one correct order and all reported facts and confirmation data.
+Traces retain tool calls, errors, text bytes, structured bytes, and total MCP
+response bytes. These byte counts are not tokenizer counts or provider billing.
+Inspect the agent traces for forbidden tools or source access before accepting
+a result. Exclude setup failures explicitly. Restore project configuration and
+stop only the experiment's adapters, workers and browsers afterward. Two cases
+per version are a smoke test, not a statistical reliability estimate.
 
 ## Releases
 

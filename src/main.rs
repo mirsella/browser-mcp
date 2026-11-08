@@ -140,11 +140,17 @@ fn browser_profile(config_home: &Path, executable: &Path) -> PathBuf {
     }
 }
 
+mod actions;
 mod broker;
 mod cdp;
 mod codex;
 mod logging;
 mod persistence;
+mod privacy;
+mod recording;
+mod responses;
+mod session_actions;
+mod views;
 use cdp::{SessionLayout, TargetId, TargetTracker};
 use persistence::{OwnershipPersistence, PersistedSession, RestoredState};
 
@@ -163,6 +169,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum ProcessMode {
+    /// Inspect configuration and local runtime state without starting services.
+    Doctor,
     #[command(hide = true)]
     ManagedBroker,
     #[command(hide = true)]
@@ -176,6 +184,15 @@ enum ProcessMode {
 
 #[derive(Clone, Debug, Args, Deserialize, Eq, PartialEq, Serialize)]
 struct Config {
+    #[arg(long, env = "OPENCODE_BROWSER_SECRETS_FILE")]
+    #[serde(default)]
+    secrets_file: Option<PathBuf>,
+    #[arg(long, env = "OPENCODE_BROWSER_RECORDING")]
+    #[serde(default)]
+    recording: bool,
+    #[arg(long, env = "OPENCODE_BROWSER_FFMPEG")]
+    #[serde(default)]
+    ffmpeg: Option<PathBuf>,
     #[arg(skip = current_graphical_environment())]
     graphical_environment: HashMap<String, OsString>,
     #[arg(
@@ -235,6 +252,14 @@ impl Config {
     }
 
     async fn resolve(&mut self, profile_override: Option<PathBuf>) -> Result<()> {
+        if self.recording {
+            self.ffmpeg = Some(resolve_executable(
+                self.ffmpeg.as_deref().unwrap_or(Path::new("ffmpeg")),
+                "recording ffmpeg",
+            )?);
+        } else if self.ffmpeg.is_some() {
+            bail!("--ffmpeg requires --recording");
+        }
         if self.headless {
             self.graphical_environment.clear();
         } else {
@@ -706,6 +731,10 @@ impl ClientHandler for DownstreamClient {
 type Downstream = RunningService<RoleClient, DownstreamClient>;
 type WorkerPool = Arc<Mutex<HashMap<PathBuf, Vec<Downstream>>>>;
 struct Session {
+    views: views::ViewState,
+    recording: Option<PathBuf>,
+    recording_lost: bool,
+    worker_epoch: u64,
     persisted: PersistedSession,
     /// Worker-local numeric IDs are merely routes.  TargetTracker is the
     /// ownership authority; this map is rebuilt from it on every reconcile.
@@ -717,6 +746,12 @@ struct Session {
 
 impl Session {
     async fn stop_worker(&mut self, id: &str) {
+        self.views = views::ViewState::default();
+        self.worker_epoch = self.worker_epoch.wrapping_add(1);
+        if self.recording.take().is_some() {
+            self.recording_lost = true;
+            warn!(session_id = %id, "worker stopped while recording; recording may be incomplete");
+        }
         self.pages.local_to_tab.clear();
         if let Some(worker) = self.downstream.take()
             && let Err(error) = stop_worker(worker).await
@@ -800,6 +835,10 @@ async fn restore_sessions(
                 pages: PageState::default(),
                 downstream: None,
                 action_pending: false,
+                views: views::ViewState::default(),
+                recording: None,
+                recording_lost: false,
+                worker_epoch: 0,
             },
         );
     }
@@ -846,6 +885,19 @@ async fn spawn_downstream(config: &Config, workspace: &std::path::Path) -> Resul
         .arg("--redact-network-headers")
         .current_dir(workspace)
         .env("CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS", "1");
+    command.env_remove("DEBUG");
+    if config.recording {
+        command
+            .arg("--experimental-screencast")
+            .arg("--experimental-ffmpeg-path")
+            .arg(recording::launcher(
+                &config.profile,
+                config
+                    .ffmpeg
+                    .as_ref()
+                    .context("recording enabled without resolved ffmpeg")?,
+            )?);
+    }
     // A surviving broker must not pass its disconnected host's stderr to workers.
     let (transport, stderr) = TokioChildProcess::builder(command)
         .stderr(Stdio::piped())
@@ -1055,11 +1107,14 @@ async fn discover_catalog(
                 page_scoped.insert(tool.name.to_string());
             }
             tool.input_schema = Arc::new(schema);
+            let scoped = page_scoped.contains(tool.name.as_ref());
+            actions::extend(&mut tool, scoped)?;
             tools.push(tool);
         }
         if !has_get_tab_id {
             bail!("Chrome DevTools MCP does not provide required get_tab_id capability");
         }
+        tools.extend(actions::builtins(config.secrets_file.is_some()));
         Ok(ToolCatalog { tools, page_scoped })
     }.await;
     match catalog {
@@ -1078,12 +1133,16 @@ async fn discover_catalog(
 
 #[derive(Clone)]
 struct BrowserProxy {
+    secrets: Arc<privacy::Secrets>,
     config: Arc<Config>,
     supervisor: Arc<BrowserSupervisor>,
     catalog: Arc<CatalogLoader>,
     sessions: Arc<Sessions>,
     worker_pool: WorkerPool,
     tracker: Arc<RwLock<Option<TargetTracker>>>,
+    // Independent workers must not change the active headless tab during a
+    // capture. Ordinary calls share this gate; captures take it exclusively.
+    headless_rendering: Arc<RwLock<()>>,
     idle: Duration,
     operation_timeout: Duration,
     persistence: Arc<OwnershipPersistence>,
@@ -1097,6 +1156,7 @@ impl BrowserProxy {
         let worker_pool = Arc::new(Mutex::new(HashMap::new()));
         let (catalog_cancel, _) = watch::channel(false);
         Ok(Self {
+            secrets: Arc::new(privacy::Secrets::load(config.secrets_file.as_deref())?),
             config: config.clone(),
             supervisor,
             catalog: Arc::new(CatalogLoader {
@@ -1108,6 +1168,7 @@ impl BrowserProxy {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             worker_pool,
             tracker: Arc::new(RwLock::new(None)),
+            headless_rendering: Arc::new(RwLock::new(())),
             idle: Duration::from_secs(config.idle_minutes.saturating_mul(60)),
             operation_timeout: Duration::from_secs(config.operation_seconds),
             persistence,
@@ -1336,7 +1397,7 @@ impl BrowserProxy {
             if tracker.owned_tabs(id).await?.is_empty() {
                 drop(guard);
                 self.prune_slot(id, &slot).await;
-                let mut result = CallToolResult::success(vec![ContentBlock::text("## Pages")]);
+                let mut result = CallToolResult::success(vec![ContentBlock::text("## Pages\n-")]);
                 result.structured_content = Some(json!({"pages": []}));
                 return Ok(result);
             }
@@ -1353,6 +1414,7 @@ impl BrowserProxy {
             };
             let mut session = Session {
                 persisted: PersistedSession {
+                    controls: Default::default(),
                     workspace: workspace.to_path_buf(),
                     current_tab: None,
                     last_activity_unix_seconds: unix_time_seconds()?,
@@ -1361,6 +1423,10 @@ impl BrowserProxy {
                 pages: PageState::default(),
                 downstream: Some(downstream),
                 action_pending: false,
+                views: views::ViewState::default(),
+                recording: None,
+                recording_lost: false,
+                worker_epoch: 0,
             };
             if let Err(error) = self.persist_session(id, &session) {
                 session.stop_worker(id).await;
@@ -1416,11 +1482,23 @@ impl BrowserProxy {
         {
             result = Err(error.context("failed to finalize closed browser session"));
         }
-        if result
+        let replace = if result.is_err() {
+            true
+        } else if result
             .as_ref()
-            .map_or(true, |result| result.is_error.unwrap_or(false))
-            && let Some(session) = guard.as_mut()
+            .is_ok_and(|result| result.is_error.unwrap_or(false))
         {
+            match guard
+                .as_ref()
+                .and_then(|session| session.downstream.as_ref())
+            {
+                Some(worker) => !worker_is_healthy(worker).await,
+                None => true,
+            }
+        } else {
+            false
+        };
+        if replace && let Some(session) = guard.as_mut() {
             warn!(session_id = %id, "browser call failed; resetting worker without replaying the call or closing owned tabs");
             session.stop_worker(id).await;
         }
@@ -1522,7 +1600,7 @@ impl BrowserProxy {
         if session.action_pending {
             warn!(session_id = %id, "discarding interrupted worker during session retirement");
         }
-        if reuse_worker && !session.action_pending {
+        if reuse_worker && !session.action_pending && session.recording.is_none() {
             if let Some(worker) = session.downstream.take() {
                 recycle_worker(
                     &self.worker_pool,
@@ -1550,7 +1628,7 @@ impl BrowserProxy {
         let mut session = slot
             .take()
             .ok_or_else(|| anyhow!("browser session disappeared during finalization"))?;
-        if reuse_worker && !session.action_pending {
+        if reuse_worker && !session.action_pending && session.recording.is_none() {
             if let Some(worker) = session.downstream {
                 recycle_worker(&self.worker_pool, session.persisted.workspace, worker).await;
             }
@@ -1575,7 +1653,7 @@ impl BrowserProxy {
         result
     }
 
-    async fn call_session(
+    async fn call_upstream_session(
         &self,
         catalog: &ToolCatalog,
         tracker: &TargetTracker,
@@ -1612,10 +1690,7 @@ impl BrowserProxy {
                 result
             }
         };
-        filter_page_content(
-            result,
-            &session.pages.local_to_tab.keys().copied().collect(),
-        )
+        Ok(result)
     }
 
     async fn call_downstream(
@@ -1712,6 +1787,7 @@ impl BrowserProxy {
             // Chrome DevTools MCP has no valid page listing before the first tab exists.
             session.pages.local_to_tab.clear();
             session.persisted.current_tab = None;
+            session.update_handles()?;
             return Ok(());
         }
         let (pages, selected) = self.list_snapshot(session).await?;
@@ -1734,6 +1810,7 @@ impl BrowserProxy {
             .as_ref()
             .is_some_and(|tab| mappings.values().any(|mapped| mapped == tab));
         session.pages.local_to_tab = mappings;
+        session.update_handles()?;
         session.persisted.current_tab = explicit_current
             .filter(|tab| {
                 session
@@ -1773,7 +1850,7 @@ impl BrowserProxy {
                 tracker,
                 id,
                 session,
-                json!({"url": INTERNAL_URL, "background": false})
+                json!({"url": INTERNAL_URL, "background": true})
                     .as_object()
                     .expect("object")
                     .clone(),
@@ -1809,7 +1886,7 @@ impl BrowserProxy {
         let background = match arguments.get("background") {
             Some(Value::Bool(background)) => *background,
             Some(_) => bail!("new_page background must be a boolean"),
-            None => false,
+            None => true,
         };
         let tab = tracker
             .create_owned_tab(
@@ -1899,6 +1976,11 @@ impl BrowserProxy {
         )]))
     }
     async fn close_owned_pages(&self, id: &str, tracker: &TargetTracker) -> Result<()> {
+        let _rendering = if self.config.headless {
+            Some(self.headless_rendering.read().await)
+        } else {
+            None
+        };
         let tabs = tracker.owned_tabs(id).await?;
         let mut failed = false;
         for tab in tabs {
@@ -2116,8 +2198,15 @@ fn filter_page_content(
                 } else {
                     format!("- {label}")
                 };
+                if let Some(handle) = page.get("page").and_then(Value::as_str) {
+                    line = format!("- {handle}: {label}");
+                }
                 if selected {
-                    line.push_str(" [selected]");
+                    line.push_str(if page.contains_key("page") {
+                        " [current]"
+                    } else {
+                        " [selected]"
+                    });
                 }
                 if let Some(context) = page.get("isolatedContext") {
                     let context = context.as_str().ok_or_else(|| {
@@ -2166,6 +2255,12 @@ fn filter_page_content(
 }
 
 fn main() -> Result<()> {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "__recording-ffmpeg")
+    {
+        return recording::exec(std::env::args_os().skip(2).collect());
+    }
     let cli = Cli::parse();
     if let Some(ProcessMode::BrowserStderr { path }) = &cli.command {
         return logging::run_browser_stderr(path);
@@ -2416,6 +2511,7 @@ mod tests {
     async fn replacing_a_worker_preserves_an_active_request_marker() {
         let mut session = Session {
             persisted: PersistedSession {
+                controls: Default::default(),
                 workspace: PathBuf::new(),
                 current_tab: None,
                 last_activity_unix_seconds: 0,
@@ -2424,6 +2520,10 @@ mod tests {
             pages: PageState::default(),
             downstream: None,
             action_pending: true,
+            views: views::ViewState::default(),
+            recording: None,
+            recording_lost: false,
+            worker_epoch: 0,
         };
         session.stop_worker("active-request").await;
         assert!(

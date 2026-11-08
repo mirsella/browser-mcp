@@ -36,6 +36,13 @@ test("preserves individual tool permissions with direct tools", async () => {
   try { expect(h.registration.command.at(-1)).toBe("--direct-tools"); }
   finally { await h.cleanup?.(); }
 });
+test("new per-action permissions also require direct tools", async () => {
+  for (const action of ["browser_handoff", "browser_batch", "browser_fill_secret", "browser_screencast_start"]) {
+    const h = await setup({}, [{action,resource:"*",effect:"deny"}]);
+    try { expect(h.registration.command.at(-1)).toBe("--direct-tools"); }
+    finally { await h.cleanup?.(); }
+  }
+});
 test("disabled adapters do not register skills", async () => {
   const h = await setup({enabled:false});
   try { expect(h.registration.disabled).toBe(true); expect(h.skills).toEqual([]); }

@@ -21,16 +21,43 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct PersistedSession {
+    #[serde(default)]
+    pub controls: SessionControls,
     pub workspace: PathBuf,
     pub current_tab: Option<String>,
     pub last_activity_unix_seconds: u64,
     pub cleanup_pending: bool,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SessionControls {
+    pub handles: std::collections::BTreeMap<String, String>,
+    pub next_handle: u64,
+    pub handoff: Option<Handoff>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Handoff {
+    pub tab: String,
+    pub generation: String,
+    pub started: u64,
+}
+
+impl Handoff {
+    pub fn expired(&self, now: u64) -> bool {
+        now.saturating_sub(self.started) >= 24 * 60 * 60
+    }
+}
+
 impl PersistedSession {
     pub fn needs_cleanup(&self, now: u64, idle: Duration) -> bool {
         self.cleanup_pending
-            || (!idle.is_zero()
+            || (self
+                .controls
+                .handoff
+                .as_ref()
+                .is_none_or(|handoff| handoff.expired(now))
+                && !idle.is_zero()
                 && now.saturating_sub(self.last_activity_unix_seconds) >= idle.as_secs())
     }
 }
@@ -267,6 +294,34 @@ impl OwnershipPersistence {
 mod tests {
     use super::*;
 
+    #[test]
+    fn handoff_only_delays_idle_cleanup_for_a_bounded_time() {
+        let mut session = PersistedSession {
+            workspace: PathBuf::from("/workspace"),
+            current_tab: Some("tab".into()),
+            last_activity_unix_seconds: 1,
+            cleanup_pending: false,
+            controls: SessionControls {
+                handoff: Some(Handoff {
+                    tab: "tab".into(),
+                    generation: "generation".into(),
+                    started: 100,
+                }),
+                ..Default::default()
+            },
+        };
+        assert!(!session.needs_cleanup(1000, Duration::from_secs(60)));
+        assert!(session.needs_cleanup(86500, Duration::from_secs(60)));
+        session.cleanup_pending = true;
+        assert!(session.needs_cleanup(101, Duration::from_secs(60)));
+        let restored: PersistedSession = serde_json::from_value(serde_json::json!({
+            "workspace":"/workspace", "current_tab":null,
+            "last_activity_unix_seconds":1, "cleanup_pending":false
+        }))
+        .unwrap();
+        assert_eq!(restored.controls, SessionControls::default());
+    }
+
     fn state_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "opencode-browser-state-{}-{}-{name}.json",
@@ -284,6 +339,7 @@ mod tests {
             .update_session(
                 "session-a",
                 PersistedSession {
+                    controls: Default::default(),
                     workspace: PathBuf::from("/workspace"),
                     current_tab: Some("tab-a".into()),
                     last_activity_unix_seconds: 10,
@@ -295,6 +351,7 @@ mod tests {
             .update_session(
                 "orphan-session",
                 PersistedSession {
+                    controls: Default::default(),
                     workspace: PathBuf::from("/workspace"),
                     current_tab: None,
                     last_activity_unix_seconds: 10,
@@ -340,6 +397,7 @@ mod tests {
                 .update_session(
                     id,
                     PersistedSession {
+                        controls: Default::default(),
                         workspace: PathBuf::from("/workspace"),
                         current_tab: None,
                         last_activity_unix_seconds: 1,
@@ -377,6 +435,7 @@ mod tests {
         let store = OwnershipPersistence::open(path.clone()).unwrap();
         store.activate_generation("generation").unwrap();
         let session = PersistedSession {
+            controls: Default::default(),
             workspace: PathBuf::from("/workspace"),
             current_tab: Some("tab-a".into()),
             last_activity_unix_seconds: 1,

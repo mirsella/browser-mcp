@@ -5,41 +5,42 @@ description: Use browser automation to inspect or interact with websites, test r
 
 # Browser Automation
 
-Use the browser tools when the task requires rendered state, authentication,
-client-side behavior, layout, accessibility, console output, or network traffic.
+Use these tools for rendered state, authentication, interaction, accessibility,
+layout, screenshots, console output and network traffic.
 
-OpenCode and Codex expose two compact tools: `help` and `dispatch`. OpenCode
-names them `browser_help` and `browser_dispatch`; Codex namespaces them under
-this plugin's browser MCP server.
+OpenCode exposes `browser_help` and `browser_dispatch`; Codex namespaces `help`
+and `dispatch` under this plugin. First call help without an action to discover
+available names; use only listed actions. Help also loads one argument schema.
+Dispatch takes `{ "action": "navigate_page", "arguments": { "url": "https://example.com" } }`.
+Put every action field inside `arguments`. Load help when a signature is unclear.
+Direct action tools, when present, use the same workflow. `batch` is compact-only.
 
-- `browser_help` lists action names or loads the current schema for one action.
-- `browser_dispatch` executes an action with `{ action, arguments }`.
+The host supplies conversation identity. Never add routing fields. Codex
+subagents share their parent's tabs; coordinate using explicit `page` handles.
 
-For compact `browser_dispatch`, put every action-specific field inside `arguments`,
-not beside it. For example, use `{ "action": "navigate_page", "arguments": { "url": "https://example.com" } }`.
+1. Reuse the current page. Open `new_page` only for simultaneous work (default cap 5), and close temporary pages when done. New pages default to background.
+2. Inspect before acting. `take_snapshot` supports `find`, `within` a UID, `interactive`, `diff`, and `maxLines` (default 300, maximum 2000). Search or scope large pages instead of repeatedly requesting the full tree. Diff cannot be combined with filters.
+3. Copy UIDs exactly. They include a worker prefix; refresh after navigation, worker replacement or missing elements. File exports are diagnostic dumps with upstream UIDs; obtain actionable UIDs from an inline snapshot.
+4. Prefer `fill_form` for several inputs: `arguments: {"elements":[{"uid":"<snapshot UID>","value":"text"}]}`. Values are strings; use the displayed option text for selects. Load help before guessing other argument shapes. Use `batch` for up to 8 already-understood steps, with a snapshot only on the last step. It stops on error; inspect completed/not-run counts and never replay a partially completed batch blindly.
+5. Verify the observable result. A successful tool call alone does not prove the intended effect. Input actions omit snapshots unless requested; inspect when the result matters. When the visible confirmation supplies the requested facts, stop. An order ID and total in a confirmation are receipt data; a separate page labelled "Receipt" is unnecessary. Use `wait_for` for an expected change, not a guessed extra section or success screen.
 
-Common actions include `navigate_page`, `take_snapshot`, `click`, `fill_form`,
-`take_screenshot`, `evaluate_script`, `list_console_messages`, and
-`list_network_requests`. Call `browser_help` for an action before using it when
-its exact arguments are not already clear. Do not guess argument shapes.
+`list_pages` shows session-local `p1`, `p2`, etc. `select_page` changes current;
+`page` on scoped actions targets an owned page without changing current. Unknown
+or closed handles fail. Selecting does not focus the window unless requested.
 
-Direct `browser_*` action tools may appear when compact tools are disabled. Use
-them directly with the same workflow.
+Scroll with `press_key` (`PageDown`, `PageUp`, `Home`, `End`). Use screenshots for visual work. Console and network lists default to 50 entries;
+paginate or narrow them. Export large request/response bodies to workspace files.
+Text responses are bounded to 32 KiB; truncation is explicit. Images remain intact.
 
-The host injects conversation identity automatically. Never add hidden routing
-fields. Browser tabs belong to the conversation; Codex subagents share their
-parent conversation's tabs, so coordinate concurrent work using separate pages.
+For login or other user work, `handoff` start focuses the exact headed page and
+pauses automation on it. End the turn and request the user's work. Finish only
+after confirmation, then take a fresh snapshot. Other owned pages remain usable.
 
-## Workflow
+`status` observes without launching a browser or worker. CLI `doctor` diagnoses
+configuration. Ordinary action errors retain healthy workers; interrupted actions
+may have happened and are never replayed automatically.
 
-1. Reuse the current page by default. Use `navigate_page` to change URLs or reload after code or deployment changes. Use `new_page` only when simultaneous pages are necessary (max 5 owned pages per session; extra `new_page` calls fail, so `close_page` a finished page first), and close temporary pages when finished.
-2. Navigate, then inspect the page before interacting.
-3. Use the latest snapshot to identify elements and references. Refresh it after navigation or meaningful DOM changes.
-4. Perform the smallest interaction needed, then inspect the result.
-5. Verify consequential actions from visible state or relevant diagnostics.
-
-Use screenshots when visual appearance, responsive layout, rendering, or image output matters. Prefer snapshots for locating elements and understanding page structure.
-
-Inspect console messages for client-side exceptions and warnings. Inspect network requests when diagnosing API failures, redirects, authentication, caching, or unexpected response data.
-
-Do not claim an interaction succeeded solely because a tool call returned without an error; verify its observable result.
+`fill_secret`, when configured, accepts a secret name and input UID; it checks an
+allowed HTTPS top-level origin and returns no value. Do not read the filled value.
+Recording tools appear only when explicitly enabled; stop recordings before
+cleanup. There is no automatic capture, HAR export, or rolling recorder.
