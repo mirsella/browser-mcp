@@ -30,6 +30,8 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - name: Prepare real browser routing
         run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ffmpeg
           chrome_version=155.0.8059.39
           curl --fail --location --silent --show-error \
             "https://storage.googleapis.com/chrome-for-testing-public/${chrome_version}/linux64/chrome-linux64.zip" \

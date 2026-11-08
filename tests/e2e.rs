@@ -2584,6 +2584,10 @@ async fn compact_workflows_bound_context_and_preserve_references() {
 #[ignore = "requires Chromium, Python, OpenSSL and ffmpeg"]
 async fn opt_in_secrets_and_recording_preserve_origin_and_artifact_contracts() {
     use tokio::io::{AsyncBufReadExt, BufReader};
+    assert!(
+        Path::new("/usr/bin/ffmpeg").is_file(),
+        "recording fixture requires /usr/bin/ffmpeg; install FFmpeg before running browser tests"
+    );
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join(format!(".scratch/opt-in-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
