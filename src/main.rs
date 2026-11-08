@@ -1721,14 +1721,19 @@ impl BrowserProxy {
             _ => bail!("Chrome DevTools returned an unexpected tool response"),
         }
     }
-    async fn list_snapshot(&self, session: &Session) -> Result<(HashSet<u64>, Option<u64>)> {
+    async fn list_snapshot(
+        &self,
+        session: &Session,
+        awaiting_created_tab: bool,
+    ) -> Result<(HashSet<u64>, Option<u64>)> {
         let result = self
             .call_downstream(
                 session,
                 CallToolRequestParams::new("list_pages").with_arguments(JsonObject::new()),
             )
             .await?;
-        parse_pages(&result).with_context(|| format!("invalid list_pages response: {result:?}"))
+        parse_pages(&result, awaiting_created_tab)
+            .with_context(|| format!("invalid list_pages response: {result:?}"))
     }
     async fn tab_id(&self, session: &Session, page: u64) -> Result<Option<TargetId>> {
         let result = self
@@ -1790,7 +1795,14 @@ impl BrowserProxy {
             session.update_handles()?;
             return Ok(());
         }
-        let (pages, selected) = self.list_snapshot(session).await?;
+        let awaiting_created_tab = explicit_current.is_some_and(|tab| {
+            !session
+                .pages
+                .local_to_tab
+                .values()
+                .any(|mapped| mapped == tab)
+        });
+        let (pages, selected) = self.list_snapshot(session, awaiting_created_tab).await?;
         let mut mappings = std::mem::take(&mut session.pages.local_to_tab);
         mappings.clear();
         for page in pages {
@@ -2122,7 +2134,24 @@ fn parse_tab_id(result: &CallToolResult) -> Result<TargetId> {
         .ok_or_else(|| anyhow!("missing nonempty structured_content.tabId"))
 }
 
-fn parse_pages(result: &CallToolResult) -> Result<(HashSet<u64>, Option<u64>)> {
+fn parse_pages(
+    result: &CallToolResult,
+    awaiting_created_tab: bool,
+) -> Result<(HashSet<u64>, Option<u64>)> {
+    // The pinned worker omits `pages` when it has not discovered any tabs yet.
+    // Accept only its exact empty success response inside the bounded creation wait.
+    if awaiting_created_tab
+        && !result.is_error.unwrap_or(false)
+        && result
+            .structured_content
+            .as_ref()
+            .and_then(Value::as_object)
+            .is_some_and(JsonObject::is_empty)
+        && matches!(result.content.as_slice(), [ContentBlock::Text(text)] if text.text.is_empty())
+    {
+        info!("worker has not discovered the CDP-created tab; waiting for page discovery");
+        return Ok((HashSet::new(), None));
+    }
     let pages = result
         .structured_content
         .as_ref()
@@ -2428,15 +2457,30 @@ mod tests {
                 {"id": 2, "url": "https://two.test/", "selected": true}
             ]
         }));
-        let (pages, selected) = parse_pages(&result).unwrap();
+        let (pages, selected) = parse_pages(&result, false).unwrap();
         assert_eq!(pages, HashSet::from([1, 2]));
         assert_eq!(selected, Some(2));
     }
     #[test]
     fn page_text_without_structured_data_fails_closed() {
         let result = CallToolResult::success(vec![ContentBlock::text("## Pages\nnot a page")]);
-        assert!(parse_pages(&result).is_err());
+        assert!(parse_pages(&result, false).is_err());
         assert!(filter_page_content(result, &HashSet::new()).is_err());
+    }
+    #[test]
+    fn accepts_empty_worker_listing_only_while_awaiting_created_tab() {
+        let mut result = CallToolResult::success(vec![ContentBlock::text("")]);
+        result.structured_content = Some(json!({}));
+        assert!(parse_pages(&result, false).is_err());
+        assert_eq!(parse_pages(&result, true).unwrap(), (HashSet::new(), None));
+        result.is_error = Some(true);
+        assert!(parse_pages(&result, true).is_err());
+        result.is_error = Some(false);
+        result.content = vec![ContentBlock::text("unexpected worker output")];
+        assert!(parse_pages(&result, true).is_err());
+        result.content = vec![ContentBlock::text("")];
+        result.structured_content = None;
+        assert!(parse_pages(&result, true).is_err());
     }
     #[test]
     fn filters_unowned_pages_and_redacts_ids() {
