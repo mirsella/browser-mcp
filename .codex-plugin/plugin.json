@@ -1,6 +1,6 @@
 {
   "name": "browser",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "description": "Shared Chromium profile with isolated conversation tabs for Codex and OpenCode.",
   "author": {
     "name": "mirsella"

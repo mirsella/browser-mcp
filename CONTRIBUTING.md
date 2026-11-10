@@ -93,29 +93,71 @@ checkout that fails its first valid submission. No money or external account
 is involved. `bun test tests/model-eval.test.ts` checks the fixture's rejection
 and retry behavior.
 
-Use a fresh `.scratch/` directory per experiment. Build the baseline from a
-recorded commit in a separate source directory and copy the two release
-binaries to `<root>/bin/before` and `<root>/bin/after`. Keep each build's own
-browser skill. Start `bun scripts/browser-model-eval.ts site --root=<root>`
-under a known PID or held lock; stop and collect it when the experiment ends.
+Use a fresh `.scratch/` directory per experiment. Record the source commit,
+binary checksum, browser version, provider, exact model, and reasoning
+setting. For source comparisons, give each checkout its own Cargo build
+directory and reuse the shared Kache cache. Keep each condition's browser
+skill.
 
-Generate temporary project MCP configuration with `config --root=<root>
---condition=before` (then `after`) and merge it without overwriting existing
-configuration. Generate each prompt with `prompt --run=before-1
---skill=<baseline-skill-path>`, repeating for `before-2`, `after-1`, and
-`after-2`. Use separate model conversations with the same provider, model and
-effort. Run both baseline cases before switching configuration. The adapter
-preserves trusted OpenCode session metadata; the model never supplies routing.
+Start `bun scripts/browser-model-eval.ts site --root=<root> --port=0` under a
+known PID or held lock. Its `site.json` records the listening URL and PID. The
+browser origin exposes no scoring endpoint. The host scorer reads order state
+from files in the experiment directory; agents must not read those files.
+
+Run names have a condition label and seed, such as `ours-current-1`,
+`ours-guidance-2`, or `browser-use-1`. Seeds 1 and 2 select paired fixture
+cases. Generate temporary project configuration with `config --root=<root>
+--labels=ours-current,ours-guidance --condition=ours-guidance --seed=1
+--ours-current=<binary> --ours-guidance=<binary>`. Merge it without
+overwriting existing configuration. Each run gets its own profile and an
+allocated CDP port. Restore the configuration and collect the fixture process
+when finished.
+
+For browser-use 1.0.0, install `browser-use==1.0.0` in a task-local Python
+virtual environment. Keep the interpreter's virtual-environment path; do not
+resolve its symlink. Write a JSON argv array containing that Python
+executable, `scripts/browser-use-eval.py`, `--profile`, a fresh profile path,
+`--ipc`, and a short task-local IPC path. Pass its path as
+`--command=<argv.json> --backend=browser-use` to `config` or `mcp`.
+External-command configurations require `--seed=1` or `--seed=2` to avoid
+sharing one profile between active trials. The wrapper runs the official MCP
+implementation with local headless Chromium and explicitly stops its browser.
+Use a separate command file and profile for each seed. This dependency is for
+evaluation only and is not part of the published server.
+
+Generate each task with `prompt --root=<root> --run=ours-guidance-1
+--port=<fixture-port> --skill=<condition-skill>`. Omit `--skill` for a server
+that supplies its own packaged instructions. Page JavaScript, DOM operations
+and normal page requests through the assigned browser MCP are permitted for
+every condition. Host file/network access, fixture implementation (including
+inline script contents), scoring data and other tools are forbidden. A
+code-based server may use host code to orchestrate its browser helpers and
+process observed page data, but cannot use it as a shortcut to the fixture's
+private state.
+
+Use separate model conversations with the same provider, model, reasoning,
+harness and budgets. Counterbalance condition order across seeds. Compare the
+current and candidate guidance on the same server binary before attributing
+any difference to a runtime change. Test multi-harness routing separately from
+single-agent task quality.
 
 Save final answers to `<root>/answers.json` as objects containing `run`,
-`answer`, `elapsedSeconds`, and `thread`, then run `score --root=<root>`.
-Scoring checks one correct order and all reported facts and confirmation data.
-Traces retain tool calls, errors, text bytes, structured bytes, and total MCP
-response bytes. These byte counts are not tokenizer counts or provider billing.
-Inspect the agent traces for forbidden tools or source access before accepting
-a result. Exclude setup failures explicitly. Restore project configuration and
-stop only the experiment's adapters, workers and browsers afterward. Two cases
-per version are a smoke test, not a statistical reliability estimate.
+`answer`, `elapsedSeconds`, `thread`, optional provider `usage`, and `valid`.
+Set `valid: true` only after inspecting the agent trace for forbidden tools,
+source or oracle access. Run `score --root=<root>
+--runs=ours-current-1,ours-guidance-1,browser-use-1`. A passing score requires
+that audit, a complete trace of issued tool calls within the 50-call and
+10-minute budgets, one correct order, all facts, and matching receipt data.
+Setup failures and unaudited trials do not establish reliability.
+
+The adapter records run identities independently of tool names and navigation,
+so Python `browser_exec` calls and compact `dispatch` calls use the same
+scorer. Reports include tool responses, client request bytes, initialization
+and catalog response bytes, images, errors and supplied provider usage. Byte
+counts are not tokens or billing. Include task/skill inputs and provider
+token/cache/reasoning usage when available; do not infer total context or cost
+from response bytes. Two paired cases are a smoke test, not a statistical
+reliability estimate.
 
 ## Releases
 

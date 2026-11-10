@@ -2,6 +2,7 @@
 // Model calls are made by the host/delegation UI, never by this script.
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { createServer } from "node:net";
 
 const [mode, ...argv] = process.argv.slice(2);
 const options = Object.fromEntries(argv.map(value => {
@@ -14,7 +15,7 @@ mkdirSync(root, { recursive: true, mode: 0o700 });
 const save = (name: string, value: unknown) => writeFileSync(`${root}/${name}`, JSON.stringify(value, null, 2));
 
 function fixture(run: string) {
-  if (!/^(before|after)-[12]$/.test(run)) throw new Error("Unknown evaluation run");
+  if (!/^[a-z][a-z0-9-]{0,60}-[12]$/.test(run)) throw new Error("Unknown evaluation run");
   const second = run.endsWith("2");
   return { name: second ? "Indigo Hinge" : "Saffron Relay", sku: second ? "IH-274" : "SR-318",
     cents: second ? 1840 : 3700, stock: second ? 14 : 17, warranty: second ? 24 : 30,
@@ -27,7 +28,7 @@ if (mode === "site") {
     async fetch(request) {
       const url = new URL(request.url);
       if (url.pathname === "/health") return Response.json({ ok: true });
-      const match = url.pathname.match(/^\/run\/((?:before|after)-[12])(?:\/(details|order|score))?$/);
+      const match = url.pathname.match(/^\/run\/([a-z][a-z0-9-]{0,60}-[12])(?:\/(details|order|score))?$/);
       if (!match) return new Response("Not found", { status: 404 });
       const [, run, action] = match;
       const product = fixture(run);
@@ -36,7 +37,7 @@ if (mode === "site") {
         current = { attempts: [], orders: [], validAttempts: 0 };
         states.set(run, current);
       }
-      if (action === "score") return Response.json({ run, expected: product, ...current });
+      if (action === "score") return new Response("Not found", { status: 404 });
       if (action === "order") {
         if (request.method !== "POST") return new Response("POST required", { status: 405 });
         const data = await request.json() as Record<string, unknown>;
@@ -68,16 +69,34 @@ if (mode === "site") {
   console.log(`Fixture ready: ${server.url}`);
   for (const signal of ["SIGTERM", "SIGINT"] as const) process.on(signal, () => { server.stop(true); process.exit(0); });
 } else if (mode === "mcp") {
-  if (!options.binary || !options.run || !/^(before|after)$/.test(options.label ?? "")) throw new Error("mcp requires binary, label, and run");
+  if ((!options.binary && !options.command) || !options.run || !/^[a-z][a-z0-9-]{0,60}$/.test(options.label ?? "")) throw new Error("mcp requires binary or command, label, and run");
   fixture(options.run);
   const label = options.label;
-  if (!options.run.startsWith(`${label}-`)) throw new Error("MCP run does not match its build label");
+  if (options.run.slice(0, -2) !== label) throw new Error("MCP run does not match its condition label");
   const trace = `${root}/${label}-trace.jsonl`;
   const record = (event: Record<string, unknown>) => appendFileSync(trace, JSON.stringify({ time: Date.now(), ...event }) + "\n");
-  const child = Bun.spawn([resolve(options.binary), "--profile", `${root}/${label}-profile`, "--headless",
-    "--browser-executable", options.browser ?? "/usr/bin/chromium", "--cdp-port", label === "before" ? "19341" : "19342",
-    "--operation-seconds", "45", "--idle-minutes", "5"], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
-  record({ kind: "launch", label, bridgePid: process.pid, childPid: child.pid, binary: resolve(options.binary) });
+  const backend = options.backend ?? "ours";
+  if (backend !== "ours" && backend !== "browser-use") throw new Error("Unknown backend");
+  let command: unknown;
+  if (options.command) {
+    command = JSON.parse(readFileSync(options.command, "utf8"));
+  } else {
+    const port = await new Promise<number>((accept, reject) => {
+      const socket = createServer();
+      socket.once("error", reject);
+      socket.listen(0, "127.0.0.1", () => {
+        const address = socket.address();
+        if (!address || typeof address === "string") throw new Error("Expected a TCP address");
+        socket.close(error => error ? reject(error) : accept(address.port));
+      });
+    });
+    command = [resolve(options.binary), "--profile", `${root}/${options.run}-profile`, "--headless",
+      "--browser-executable", options.browser ?? "/usr/bin/chromium", "--cdp-port", String(port),
+      "--operation-seconds", "45", "--idle-minutes", "5"];
+  }
+  if (!Array.isArray(command) || !command.length || command.some(arg => typeof arg !== "string")) throw new Error("command must contain a JSON argv array");
+  const child = Bun.spawn(command, { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+  record({ kind: "launch", label, run: options.run, backend, bridgePid: process.pid, childPid: child.pid, command });
   const pending = new Map<unknown, { at: number; method: string; action?: string; session?: string }>();
   async function forward(stream: ReadableStream<Uint8Array>, output: (line: string) => void) {
     let rest = "";
@@ -94,22 +113,22 @@ if (mode === "site") {
       const params = message.params ?? {};
       const args = params.arguments ?? {};
       const session = params._meta?.["ai.opencode/sessionID"] ?? args.__opencode_session_id;
-      if (message.method === "tools/call") {
+      if (message.method === "tools/call" && backend === "ours") {
         if (typeof session !== "string" || !session) throw new Error("Trusted host session identity is missing");
         if (args.__opencode_session_id && args.__opencode_session_id !== session) throw new Error("Conflicting host session identities");
       }
       pending.set(message.id, { at: Date.now(), method: message.method, action: params.name === "dispatch" ? args.action : params.name,
         session });
-      record({ kind: "request", message });
+      record({ kind: "request", run: options.run, wireBytes: Buffer.byteLength(line), message });
     }
     child.stdin.write(JSON.stringify(message) + "\n");
     child.stdin.flush();
   });
   const output = forward(child.stdout, line => {
     const message = JSON.parse(line);
-    const call = pending.get(message.id);
-    pending.delete(message.id);
-    record({ kind: "response", ...call, durationMs: call ? Date.now() - call.at : undefined,
+    const call = message.method === undefined ? pending.get(message.id) : undefined;
+    if (message.method === undefined) pending.delete(message.id);
+    record({ kind: "response", run: options.run, ...call, durationMs: call ? Date.now() - call.at : undefined,
       wireBytes: Buffer.byteLength(line), message });
     process.stdout.write(line + "\n");
   });
@@ -132,30 +151,36 @@ if (mode === "site") {
   }
 } else if (mode === "config") {
   const condition = options.condition;
-  if (condition !== "before" && condition !== "after") throw new Error("config requires --condition=before|after");
+  if (!condition || !/^[a-z][a-z0-9-]{0,60}$/.test(condition)) throw new Error("config requires a condition label");
+  const labels = (options.labels ?? "before,after").split(",");
+  labels.forEach(label => fixture(`${label}-1`));
+  if (!labels.includes(condition)) throw new Error("condition must be included in labels");
+  if (options.seed && options.seed !== "1" && options.seed !== "2") throw new Error("seed must be 1 or 2");
+  if (options.command && !options.seed) throw new Error("External commands require one --seed and a fresh profile for that run");
   const servers: Record<string, unknown> = { browser: { disabled: true }, "context7-broker": { disabled: true }, composio: { disabled: true } };
-  for (const label of ["before", "after"]) for (const seed of [1, 2]) {
-    servers[`browser_trial_${label}_${seed}`] = { type: "local", codemode: false, disabled: label !== condition,
+  for (const label of labels) for (const seed of [1, 2]) {
+    servers[`browser_trial_${label.replaceAll("-", "_")}_${seed}`] = { type: "local", codemode: false, disabled: label !== condition || !!options.seed && options.seed !== String(seed),
       command: ["bun", resolve(process.argv[1]), "mcp", `--root=${root}`, `--binary=${resolve(options[label] ?? `${root}/bin/${label}`)}`,
-        `--label=${label}`, `--run=${label}-${seed}`], timeout: { startup: 30_000, catalog: 30_000, execution: 60_000 } };
+        `--label=${label}`, `--run=${label}-${seed}`, ...(options.command ? [`--command=${resolve(options.command)}`, `--backend=${options.backend ?? "ours"}`] : [])], timeout: { startup: 30_000, catalog: 30_000, execution: 60_000 } };
   }
   console.log(JSON.stringify({ $schema: "https://opencode.ai/v2/config.json", mcp: { servers } }, null, 2));
 } else if (mode === "prompt") {
-  if (!options.run || !options.skill) throw new Error("prompt requires --run and --skill");
+  if (!options.run) throw new Error("prompt requires --run");
   const product = fixture(options.run);
-  const server = `browser_trial_${options.run.replace("-", "_")}`;
-  console.log(`You are a browser-MCP usability test subject. Do the task yourself; do not delegate or implement anything. Use ONLY the MCP server "${server}" and its help/dispatch tools for site interaction. The host may expose these as ${server}_help/${server}_dispatch or tools["${server}"].help/dispatch; either spelling/wrapper is permitted. Discover them using the tool catalog if needed. Do not use other browser servers, shell/files, web/fetch tools, evaluate_script, CDP, DOM changes, or source inspection. Do not edit files. If this server is missing or broken, stop and report it without fallback.
+  const server = `browser_trial_${options.run.replaceAll("-", "_")}`;
+  console.log(`You are a browser-MCP usability test subject. Do the task yourself; do not delegate or implement anything. Use ONLY the MCP server "${server}" for site interaction. The host may prefix tool names with the server name or expose them under tools["${server}"]. Discover them using the tool catalog if needed. Do not use other browser servers, shell/files, web/fetch tools, host Python/file/network access, score endpoints, or fixture implementation inspection (including inline script contents). JavaScript, DOM operations, normal page requests, and native browser inputs through the assigned MCP are permitted. If using Python browser_exec, use Python only to orchestrate its browser helpers and process observed page data. Do not edit files. If this server is missing or broken, stop and report it without fallback.
 
-Open http://127.0.0.1:${options.port ?? "19340"}/run/${options.run}. Find ${product.name}. Read its SKU, unit price, and stock. Open its Details link in its new tab, read the warranty length, and return to the shop (closing the details tab is fine). Order ${product.quantity} units as customer Ada Example with coupon ORBIT10 and Express shipping. The dummy checkout intentionally fails the first valid submission without placing an order: inspect the page, retry once, and verify one confirmed order. Read the receipt and final total. Use UI controls and fresh snapshot UIDs. Limit: 50 browser calls.
+Open http://127.0.0.1:${options.port ?? "19340"}/run/${options.run}. Find ${product.name}. Read its SKU, unit price, and stock. Open its Details link in its new tab, read the warranty length, and return to the shop (closing the details tab is fine). Order ${product.quantity} units as customer Ada Example with coupon ORBIT10 and Express shipping. The dummy checkout intentionally fails the first valid submission without placing an order: inspect the page, retry once, and verify one confirmed order. Read the receipt and final total. Use observed page elements or fresh snapshot UIDs. Limit: 50 MCP tool calls and 10 minutes.
 
 Return ONLY JSON: {run,completed,sku,unitPrice,stock,warrantyMonths,receipt,total,blockers}. Prices are numeric euros. Do not guess or claim completion without UI confirmation.
 
-In this installed-version skill, browser_help/browser_dispatch refer to this condition's server:
-${readFileSync(options.skill, "utf8")}`);
+Browser guidance for this condition (any browser_help/browser_dispatch names refer to the assigned server):
+${options.skill ? readFileSync(options.skill, "utf8") : "Use the assigned server’s packaged instructions and tool schemas."}`);
 } else if (mode === "score") {
-  const runs = ["before-1", "before-2", "after-1", "after-2"];
+  const runs = (options.runs ?? "before-1,before-2,after-1,after-2").split(",");
+  runs.forEach(fixture);
   const answers = existsSync(`${root}/answers.json`) ? JSON.parse(readFileSync(`${root}/answers.json`, "utf8")) : [];
-  const traces = new Map(["before", "after"].map(label => {
+  const traces = new Map([...new Set(runs.map(run => run.slice(0, -2)))].map(label => {
     const path = `${root}/${label}-trace.jsonl`;
     const trace = existsSync(path) ? readFileSync(path, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)) : [];
     return [label, trace] as const;
@@ -173,11 +198,12 @@ ${readFileSync(options.skill, "utf8")}`);
       answer?.answer?.warrantyMonths === expected.warranty && Math.round(answer?.answer?.unitPrice * 100) === expected.cents;
     const confirmed = answer?.answer?.completed === true && !!order && answer?.answer?.receipt === order.receipt &&
       Math.round(answer?.answer?.total * 100) === expected.total;
-    const label = run.split("-")[0];
+    const label = run.slice(0, -2);
     const trace = traces.get(label)!;
-    const navigation = trace.find(row => row.kind === "request" && row.message?.params?.arguments?.arguments?.url?.endsWith(`/run/${run}`));
-    const session = navigation?.message.params._meta?.["ai.opencode/sessionID"] ?? navigation?.message.params.arguments.__opencode_session_id;
-    const calls = session ? trace.filter(row => row.kind === "response" && row.method === "tools/call" && row.session === session) : [];
+    const events = trace.filter(row => row.run === run);
+    const requests = events.filter(row => row.kind === "request");
+    const toolRequests = requests.filter(row => row.message.method === "tools/call");
+    const calls = events.filter(row => row.kind === "response" && row.method === "tools/call");
     const metrics = { toolErrors: 0, responseBytes: 0, textBytes: 0, structuredBytes: 0, imageBase64Bytes: 0 };
     for (const call of calls) {
       const { result, error } = call.message;
@@ -189,9 +215,14 @@ ${readFileSync(options.skill, "utf8")}`);
         if (block.type === "image") metrics.imageBase64Bytes += Buffer.byteLength(block.data ?? "");
       }
     }
-    return { run, passed: correctOrder && correctFacts && confirmed, correctOrder, correctFacts, confirmed,
+    const completeTrace = toolRequests.length > 0 && calls.length === toolRequests.length;
+    const withinBudget = toolRequests.length <= 50 && Number.isFinite(answer?.elapsedSeconds) && answer.elapsedSeconds >= 0 && answer.elapsedSeconds <= 600;
+    return { run, passed: correctOrder && correctFacts && confirmed && answer?.valid === true && completeTrace && withinBudget, correctOrder, correctFacts, confirmed,
       attempts: actual.attempts.length, orders: actual.orders.length, total: order?.total,
-      session, calls: calls.length, ...metrics,
+      calls: toolRequests.length, responses: calls.length, completeTrace, requestBytes: requests.reduce((n, row) => n + (row.wireBytes ?? 0), 0),
+      catalogBytes: events.filter(row => row.kind === "response" && row.method === "tools/list").reduce((n, row) => n + row.wireBytes, 0),
+      initializationBytes: events.filter(row => row.kind === "response" && row.method === "initialize").reduce((n, row) => n + row.wireBytes, 0),
+      trialValid: answer?.valid === true, withinBudget, usage: answer?.usage, callsRecorded: calls.length > 0, ...metrics,
       elapsedSeconds: answer?.elapsedSeconds, answer: answer?.answer, thread: answer?.thread };
   });
   save("scores.json", scores);
