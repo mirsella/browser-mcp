@@ -22,8 +22,8 @@ use rmcp::{
     model::{
         CallToolRequest, CallToolRequestParams, CallToolResponse, CallToolResult,
         CancelledNotificationParam, ClientRequest, ContentBlock, Implementation, ListToolsRequest,
-        ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, ServerResult,
-        Tool, ToolAnnotations,
+        ListToolsResult, PaginatedRequestParams, RequestMetaObject, RequestParamsMeta,
+        ServerCapabilities, ServerInfo, ServerResult, Tool, ToolAnnotations,
     },
     service::{PeerRequestOptions, RequestContext, RunningService, ServiceError},
 };
@@ -62,6 +62,7 @@ static PACKAGE_VERSION: LazyLock<Version> = LazyLock::new(|| {
 
 pub(super) const SESSION_KEY: &str = "__opencode_session_id";
 pub(super) const CODEX_SESSION_KEY: &str = "__codex_session_id";
+pub(super) const OPENCODE_SESSION_META: &str = "ai.opencode/sessionID";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SessionClient {
@@ -327,9 +328,12 @@ impl ServerHandler for Adapter {
 
     async fn call_tool(
         &self,
-        request: CallToolRequestParams,
+        mut request: CallToolRequestParams,
         context: RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResponse, rmcp::ErrorData> {
+        // rmcp lifts the wire `params._meta` into the request context; re-attach it so the
+        // broker can route the forwarded call by the session id it carries.
+        request.set_meta(context.meta.clone());
         match self
             .forward(
                 ClientRequest::CallToolRequest(CallToolRequest::new(request)),
@@ -882,21 +886,46 @@ impl Drop for ConnectionLease {
     }
 }
 
-fn route_request(mut request: CallToolRequestParams) -> Result<(String, CallToolRequestParams)> {
+/// OpenCode attaches the session id as MCP request metadata; strict tool argument schemas drop
+/// the undeclared `SESSION_KEY` field its older releases injected. Codex (and those older
+/// releases) still inject the id into the arguments, so both channels stay accepted, preferring
+/// the metadata.
+///
+/// rmcp lifts the wire `params._meta` into the request context before dispatch, so the metadata
+/// arrives through the context parameter rather than the typed request.
+fn route_request(
+    mut request: CallToolRequestParams,
+    context_meta: &RequestMetaObject,
+) -> Result<(String, CallToolRequestParams)> {
+    fn session_id(value: &Value) -> Result<&str> {
+        value
+            .as_str()
+            .context("browser session identifier must be a string")
+    }
+    let meta_id = context_meta
+        .get(OPENCODE_SESSION_META)
+        .map(session_id)
+        .transpose()?;
     let arguments = request.arguments.get_or_insert_default();
-    let (client, id) = match (
-        arguments.remove(SESSION_KEY),
-        arguments.remove(CODEX_SESSION_KEY),
-    ) {
+    let injected_id = arguments.remove(SESSION_KEY);
+    let injected_id = injected_id.as_ref().map(session_id).transpose()?;
+    let codex_id = arguments.remove(CODEX_SESSION_KEY);
+    let codex_id = codex_id.as_ref().map(session_id).transpose()?;
+    let opencode_id = match (meta_id, injected_id) {
+        (Some(meta), Some(injected)) if meta != injected => {
+            bail!("browser call contains conflicting agent session identifiers")
+        }
+        (Some(meta), _) => Some(meta),
+        (None, injected) => injected,
+    };
+    let (client, id) = match (opencode_id, codex_id) {
+        (Some(_), Some(_)) => bail!("browser call contains conflicting agent session identifiers"),
         (Some(id), None) => (SessionClient::OpenCode, id),
         (None, Some(id)) => (SessionClient::Codex, id),
-        (Some(_), Some(_)) => bail!("browser call contains conflicting agent session identifiers"),
         (None, None) => bail!("browser call is missing the OpenCode or Codex session identifier"),
     };
-    let id = id
-        .as_str()
-        .context("browser session identifier must be a string")?;
-    Ok((client.owner_id(id)?, request))
+    let id = client.owner_id(id)?;
+    Ok((id, request))
 }
 
 fn compact_tools() -> Vec<Tool> {
@@ -1053,7 +1082,7 @@ impl ServerHandler for Connection {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _: RequestContext<rmcp::RoleServer>,
+        context: RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResponse, rmcp::ErrorData> {
         if self.compact && request.name != "dispatch" && request.name != "help" {
             return Err(rmcp::ErrorData::invalid_params(
@@ -1071,7 +1100,7 @@ impl ServerHandler for Connection {
             }
         };
         let result: Result<_> = async {
-            let (id, mut request) = route_request(request)?;
+            let (id, mut request) = route_request(request, &context.meta)?;
             let catalog = self.proxy.catalog.get(&self.workspace).await?;
             if self.compact {
                 match request.name.as_ref() {
@@ -1595,14 +1624,21 @@ mod tests {
                 .expect("request arguments")
                 .clone(),
         );
-        let (id, request) = route_request(request).expect("route OpenCode request");
+        let (id, request) =
+            route_request(request, &RequestMetaObject::new()).expect("route OpenCode request");
         assert_eq!(id, "opencode:session-a");
         assert!(
             request
                 .arguments
                 .is_some_and(|arguments| !arguments.contains_key(SESSION_KEY))
         );
-        assert!(route_request(CallToolRequestParams::new("list_pages")).is_err());
+        assert!(
+            route_request(
+                CallToolRequestParams::new("list_pages"),
+                &RequestMetaObject::new()
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1613,7 +1649,7 @@ mod tests {
                 .unwrap()
                 .clone(),
         );
-        let (id, request) = route_request(request).unwrap();
+        let (id, request) = route_request(request, &RequestMetaObject::new()).unwrap();
         assert_eq!(id, "codex:session-a");
         assert!(request.arguments.unwrap().is_empty());
         for arguments in [
@@ -1624,10 +1660,53 @@ mod tests {
             assert!(
                 route_request(
                     CallToolRequestParams::new("help")
-                        .with_arguments(arguments.as_object().unwrap().clone())
+                        .with_arguments(arguments.as_object().unwrap().clone()),
+                    &RequestMetaObject::new(),
                 )
                 .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn opencode_metadata_session_ids_route_and_strip_injected_keys() {
+        let context_meta = |id: Value| {
+            let mut meta = RequestMetaObject::new();
+            meta.insert(OPENCODE_SESSION_META.to_owned(), id);
+            meta
+        };
+        let request = |arguments: Value| {
+            CallToolRequestParams::new("dispatch")
+                .with_arguments(arguments.as_object().unwrap().clone())
+        };
+        let routed = |request, meta: &RequestMetaObject| {
+            let (id, request) = route_request(request, meta).expect("route request");
+            (id, request.arguments.unwrap())
+        };
+        let (id, arguments) = routed(
+            request(json!({"action": "list_pages"})),
+            &context_meta(json!("session-a")),
+        );
+        assert_eq!(id, "opencode:session-a");
+        assert!(arguments.contains_key("action"));
+        let (id, arguments) = routed(
+            request(json!({"action": "list_pages", (SESSION_KEY): "session-a"})),
+            &context_meta(json!("session-a")),
+        );
+        assert_eq!(id, "opencode:session-a");
+        assert!(!arguments.contains_key(SESSION_KEY));
+        for (meta, arguments) in [
+            (
+                context_meta(json!("session-a")),
+                json!({(SESSION_KEY): "session-b"}),
+            ),
+            (
+                context_meta(json!("session-a")),
+                json!({(CODEX_SESSION_KEY): "session-a"}),
+            ),
+            (context_meta(json!(42)), json!({"action": "list_pages"})),
+        ] {
+            assert!(route_request(request(arguments), &meta).is_err());
         }
     }
 

@@ -1,6 +1,6 @@
 [package]
 name = "browser-mcp"
-version = "0.9.2"
+version = "2.0.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Session-isolated browser automation over MCP and Chrome DevTools Protocol"
