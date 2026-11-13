@@ -357,16 +357,23 @@ fn live_chromium_profile_owner(profile: &Path) -> Option<u32> {
     (!cmdline.is_empty()).then_some(pid)
 }
 
-/// A changed browser UUID is safe to reconnect only when the profile's actual
-/// local owner also owns this loopback listening socket. A responsive CDP port
-/// or a stale singleton symlink alone is not enough evidence.
-fn listening_profile_owner(config: &Config) -> Option<u32> {
-    let pid = live_chromium_profile_owner(&config.profile)?;
-    if std::fs::metadata(format!("/proc/{pid}")).ok()?.uid() != unsafe { libc::geteuid() } {
-        return None;
+fn process_profile_arg(cmdline: &[u8]) -> Option<(&str, bool)> {
+    let args = cmdline
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .collect::<Vec<_>>();
+    if args.len() == 1 {
+        // Chromium can rewrite argv into one process-title string. It is not
+        // shell syntax; accept only one unambiguous equals-form profile flag.
+        let title = std::str::from_utf8(args[0]).ok()?;
+        let mut parts = title.split(" --user-data-dir");
+        parts.next()?;
+        let value = parts.next()?.strip_prefix('=')?;
+        if parts.next().is_some() {
+            return None;
+        }
+        return Some((value.split(" --").next()?, true));
     }
-    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-    let args = cmdline.split(|byte| *byte == 0).collect::<Vec<_>>();
     let mut profiles = args.iter().enumerate().filter_map(|(index, arg)| {
         arg.strip_prefix(b"--user-data-dir=").or_else(|| {
             if *arg == b"--user-data-dir" {
@@ -377,7 +384,20 @@ fn listening_profile_owner(config: &Config) -> Option<u32> {
         })
     });
     let profile = std::str::from_utf8(profiles.next()?).ok()?;
-    if profiles.next().is_some() || canonicalize_path(Path::new(profile)).ok()? != config.profile {
+    profiles.next().is_none().then_some((profile, false))
+}
+
+/// A changed browser UUID is safe to reconnect only when the profile's actual
+/// local owner also owns this loopback listening socket. A responsive CDP port
+/// or a stale singleton symlink alone is not enough evidence.
+fn listening_profile_owner(config: &Config) -> Option<u32> {
+    let pid = live_chromium_profile_owner(&config.profile)?;
+    if std::fs::metadata(format!("/proc/{pid}")).ok()?.uid() != unsafe { libc::geteuid() } {
+        return None;
+    }
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let (profile, flattened) = process_profile_arg(&cmdline)?;
+    if canonicalize_path(Path::new(profile)).ok()? != config.profile {
         return None;
     }
     let sockets = std::fs::read_dir(format!("/proc/{pid}/fd"))
@@ -385,6 +405,9 @@ fn listening_profile_owner(config: &Config) -> Option<u32> {
         .filter_map(Result::ok)
         .filter_map(|entry| std::fs::read_link(entry.path()).ok())
         .collect::<HashSet<_>>();
+    if flattened && !sockets.iter().any(|path| path.starts_with(&config.profile)) {
+        return None;
+    }
     let address = format!("0100007F:{:04X}", config.cdp_port);
     let tcp = std::fs::read_to_string("/proc/self/net/tcp").ok()?;
     tcp.lines().skip(1).find_map(|line| {
@@ -2712,9 +2735,17 @@ mod tests {
         let profile = profile_diagnostic_fixture();
         let other_profile = profile_diagnostic_fixture();
         let script = r#"
-import http.server, json
+import ctypes, http.server, json, sys
+# Match Chromium's process-title rewrite, retaining an open profile file as
+# kernel evidence of the ambiguous title's actual profile.
+profile_file = open(sys.argv[-1].split('=', 1)[1] + '/profile-owned.lock', 'w')
+fields = open('/proc/self/stat').read().rsplit(')', 1)[1].split()
+start, end = int(fields[45]), int(fields[46])
+title = ctypes.string_at(start, end - start).rstrip(b'\0').replace(b'\0', b' ') + b'\0'
+ctypes.memmove(start, title, len(title))
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path == '/release-profile-file': profile_file.close()
         body = json.dumps({'webSocketDebuggerUrl': f'ws://127.0.0.1:{self.server.server_port}/devtools/browser/restarted'}).encode()
         self.send_response(200)
         self.send_header('Content-Length', str(len(body)))
@@ -2753,6 +2784,7 @@ server.serve_forever()
         config.profile = profile.clone();
         config.cdp_port = port;
         let config = Arc::new(config);
+        assert_eq!(listening_profile_owner(&config), child.id());
         let stale = format!("ws://127.0.0.1:{port}/devtools/browser/previous");
         let actual = format!("ws://127.0.0.1:{port}/devtools/browser/restarted");
         let selected = BrowserSupervisor::select_config(config.clone(), Some(&stale))
@@ -2799,9 +2831,37 @@ server.serve_forever()
                 .contains("refusing to adopt")
         );
         server.abort();
+        supervisor
+            .client
+            .get(format!("http://127.0.0.1:{port}/release-profile-file"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        assert!(listening_profile_owner(&config).is_none());
         child.kill().await.unwrap();
         std::fs::remove_dir_all(profile).unwrap();
         std::fs::remove_dir_all(other_profile).unwrap();
+    }
+
+    #[test]
+    fn profile_arguments_handle_chromium_titles_without_guessing_duplicates() {
+        assert_eq!(
+            process_profile_arg(b"chrome\0--user-data-dir=/Profile A\0--flag\0"),
+            Some(("/Profile A", false))
+        );
+        assert_eq!(
+            process_profile_arg(b"chrome\0--user-data-dir\0/Profile A\0"),
+            Some(("/Profile A", false))
+        );
+        assert_eq!(
+            process_profile_arg(b"chrome --user-data-dir=/Profile A --flag\0"),
+            Some(("/Profile A", true))
+        );
+        assert!(process_profile_arg(b"chrome --user-data-dir=/a --user-data-dir=/b\0").is_none());
+        assert!(process_profile_arg(b"chrome\0--user-data-dir=/a\0--user-data-dir=/b\0").is_none());
+        assert!(process_profile_arg(b"chrome --user-data-directory=/a\0").is_none());
     }
 
     #[tokio::test]

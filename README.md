@@ -50,8 +50,11 @@ then closes the browser and exits shortly after the final adapter disconnects.
 The CDP port defaults to `9222`. If that port is occupied, the broker logs the
 collision and selects a free loopback port without adopting or stopping the
 other listener. Adapters keep the same configuration and share the selected
-endpoint. A replacement broker reuses that port only when the exact persisted
-browser generation is still running.
+endpoint. A replacement broker also reconnects a restarted profile owner when
+its Unix UID, profile argument and actual loopback socket ownership match.
+Chromium's flattened process titles additionally require an open file under
+that profile. A changed browser generation clears old tab ownership; unrelated
+listeners and browsers without a previously trusted generation are not adopted.
 
 OpenCode loads the JavaScript `./server` package export. Codex uses the
 plugin and MCP manifests plus the session hooks. Both integrations launch
