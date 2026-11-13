@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
     future::Future,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
     process::Stdio,
@@ -357,6 +357,45 @@ fn live_chromium_profile_owner(profile: &Path) -> Option<u32> {
     (!cmdline.is_empty()).then_some(pid)
 }
 
+/// A changed browser UUID is safe to reconnect only when the profile's actual
+/// local owner also owns this loopback listening socket. A responsive CDP port
+/// or a stale singleton symlink alone is not enough evidence.
+fn listening_profile_owner(config: &Config) -> Option<u32> {
+    let pid = live_chromium_profile_owner(&config.profile)?;
+    if std::fs::metadata(format!("/proc/{pid}")).ok()?.uid() != unsafe { libc::geteuid() } {
+        return None;
+    }
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let args = cmdline.split(|byte| *byte == 0).collect::<Vec<_>>();
+    let mut profiles = args.iter().enumerate().filter_map(|(index, arg)| {
+        arg.strip_prefix(b"--user-data-dir=").or_else(|| {
+            if *arg == b"--user-data-dir" {
+                args.get(index + 1).copied()
+            } else {
+                None
+            }
+        })
+    });
+    let profile = std::str::from_utf8(profiles.next()?).ok()?;
+    if profiles.next().is_some() || canonicalize_path(Path::new(profile)).ok()? != config.profile {
+        return None;
+    }
+    let sockets = std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+        .collect::<HashSet<_>>();
+    let address = format!("0100007F:{:04X}", config.cdp_port);
+    let tcp = std::fs::read_to_string("/proc/self/net/tcp").ok()?;
+    tcp.lines().skip(1).find_map(|line| {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        (fields.get(1) == Some(&address.as_str())
+            && fields.get(3) == Some(&"0A")
+            && sockets.contains(&PathBuf::from(format!("socket:[{}]", fields.get(9)?))))
+        .then_some(pid)
+    })
+}
+
 struct BrowserSupervisor {
     config: Arc<Config>,
     client: Client,
@@ -384,7 +423,8 @@ impl SupervisorState {
 
 impl BrowserSupervisor {
     /// Keep the configured port as a preference, not a claim on another process.
-    /// Only an exact persisted browser generation may be reused after a restart.
+    /// Reconnect an exact generation, or a restarted browser whose profile and
+    /// listening socket can both be verified against its live local process.
     async fn select_config(
         config: Arc<Config>,
         trusted_generation: Option<&str>,
@@ -399,6 +439,12 @@ impl BrowserSupervisor {
             let supervisor = Self::new(restored.clone(), Some(identity.to_owned()))?;
             match supervisor.endpoint_identity().await {
                 Ok(Some(actual)) if actual == identity => return Ok(restored),
+                Ok(Some(_)) if listening_profile_owner(&restored).is_some() => {
+                    warn!(
+                        "reconnecting the verified profile owner after its browser generation changed"
+                    );
+                    return Ok(restored);
+                }
                 Ok(_) => {
                     warn!(
                         "persisted browser generation is no longer reachable; selecting a new endpoint"
@@ -542,10 +588,19 @@ impl BrowserSupervisor {
             && state.process.is_none()
             && state.trusted_generation.as_deref() != Some(identity)
         {
-            bail!(
-                "refusing to adopt an unrecognized browser CDP endpoint at {}",
-                self.config.browser_url()
-            );
+            if state.trusted_generation.is_some()
+                && let Some(pid) = listening_profile_owner(&self.config)
+            {
+                warn!(
+                    pid,
+                    "reconnecting the verified profile owner; old tab ownership will not be reused"
+                );
+            } else {
+                bail!(
+                    "refusing to adopt an unrecognized browser CDP endpoint at {}",
+                    self.config.browser_url()
+                );
+            }
         }
         Ok(endpoint)
     }
@@ -2649,6 +2704,104 @@ mod tests {
                 .contains("refusing to adopt")
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn restarted_profile_owner_reconnects_without_adopting_other_profiles_or_listeners() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let profile = profile_diagnostic_fixture();
+        let other_profile = profile_diagnostic_fixture();
+        let script = r#"
+import http.server, json
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = json.dumps({'webSocketDebuggerUrl': f'ws://127.0.0.1:{self.server.server_port}/devtools/browser/restarted'}).encode()
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *args): pass
+server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+print(server.server_port, flush=True)
+server.serve_forever()
+"#;
+        let mut child = Command::new("python3")
+            .args(["-u", "-c", script])
+            .arg(format!("--user-data-dir={}", profile.display()))
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let mut lines = BufReader::new(stdout).lines();
+        let port: u16 = timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap();
+        for path in [&profile, &other_profile] {
+            std::os::unix::fs::symlink(
+                format!("{}-{}", hostname.trim_end(), child.id().unwrap()),
+                path.join("SingletonLock"),
+            )
+            .unwrap();
+        }
+        let mut config = broker_config(&[]);
+        config.profile = profile.clone();
+        config.cdp_port = port;
+        let config = Arc::new(config);
+        let stale = format!("ws://127.0.0.1:{port}/devtools/browser/previous");
+        let actual = format!("ws://127.0.0.1:{port}/devtools/browser/restarted");
+        let selected = BrowserSupervisor::select_config(config.clone(), Some(&stale))
+            .await
+            .unwrap();
+        assert_eq!(selected.cdp_port, port);
+        let supervisor = BrowserSupervisor::new(selected, Some(stale.clone())).unwrap();
+        assert_eq!(supervisor.ensure_running().await.unwrap(), actual);
+        assert!(supervisor.state.lock().await.process.is_none());
+
+        let unrecognized = BrowserSupervisor::new(config.clone(), None).unwrap();
+        assert!(
+            unrecognized
+                .ensure_running()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("refusing to adopt")
+        );
+
+        let mut wrong_profile = (*config).clone();
+        wrong_profile.profile = other_profile.clone();
+        assert!(listening_profile_owner(&wrong_profile).is_none());
+        let selected = BrowserSupervisor::select_config(Arc::new(wrong_profile), Some(&stale))
+            .await
+            .unwrap();
+        assert_ne!(selected.cdp_port, port);
+
+        let (unrelated_port, unrelated_identity, server) = mock_browser_endpoint().await;
+        let mut unrelated = (*config).clone();
+        unrelated.cdp_port = unrelated_port;
+        assert!(listening_profile_owner(&unrelated).is_none());
+        let supervisor = BrowserSupervisor::new(
+            Arc::new(unrelated),
+            Some(unrelated_identity.replace("trusted", "previous")),
+        )
+        .unwrap();
+        assert!(
+            supervisor
+                .ensure_running()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("refusing to adopt")
+        );
+        server.abort();
+        child.kill().await.unwrap();
+        std::fs::remove_dir_all(profile).unwrap();
+        std::fs::remove_dir_all(other_profile).unwrap();
     }
 
     #[tokio::test]
