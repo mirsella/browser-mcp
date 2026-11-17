@@ -66,7 +66,9 @@ Each browser action has one deadline for catalog discovery, browser startup,
 session locking, execution, and reconciliation. `OPENCODE_BROWSER_OPERATION_SECONDS`
 sets that deadline and defaults to 540 seconds. Catalog discovery and compact
 help have a separate 70-second limit. A failed or panicking catalog discovery
-can be retried without restarting the broker.
+can be retried without restarting the broker. A newly created tab is closed
+if completed worker page listings keep omitting it for 30 seconds. Listings
+slowed by an unresponsive unowned tab count only against the action deadline.
 
 After an interrupted action, the next call replaces that session's worker and
 reconciles its existing owned tabs. Actions are never replayed automatically.

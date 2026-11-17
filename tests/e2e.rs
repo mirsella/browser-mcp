@@ -1978,6 +1978,83 @@ async fn interrupted_worker_is_replaced_without_replaying_the_action() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Chromium and the real Chrome DevTools MCP worker"]
+async fn fresh_session_creates_pages_beside_a_busy_unowned_tab() {
+    let root = std::env::temp_dir().join(format!("browser-mcp-busy-tab-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let profile = root.join("profile");
+    let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let client = client(&root, true, &profile, port, "shared-window").await;
+    call_ok(
+        &client,
+        "new_page",
+        "busy-warm",
+        json!({"url": "data:text/html,<title>Warm</title>"}),
+    )
+    .await;
+    // A user tab whose renderer answers CDP only between long main-thread tasks.
+    let browser = browser_json(port, "version").await["webSocketDebuggerUrl"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let busy = cdp_request(
+        &browser,
+        "Target.createTarget",
+        json!({
+            "url": "data:text/html,<title>Busy</title><script>const c=new MessageChannel();c.port1.onmessage=()=>{const end=performance.now()+2500;while(performance.now()<end){}c.port2.postMessage(0)};c.port2.postMessage(0)</script>",
+            "background": true
+        }),
+    )
+    .await["targetId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let started = Instant::now();
+    let created = call_ok(
+        &client,
+        "new_page",
+        "busy-fresh",
+        json!({"url": "data:text/html,<title>Fresh</title>"}),
+    )
+    .await;
+    // Precondition: the busy tab must still stall the fresh worker's listing
+    // past the old fixed five-second creation deadline.
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed > Duration::from_secs(5),
+        "busy tab no longer delays a fresh worker ({elapsed:?}); the regression is not exercised"
+    );
+    assert!(!text(&created).contains("Busy"), "{}", text(&created));
+    let title = call_ok(
+        &client,
+        "evaluate_script",
+        "busy-fresh",
+        json!({"function": "() => document.title"}),
+    )
+    .await;
+    assert!(text(&title).contains("Fresh"), "{}", text(&title));
+    assert!(
+        browser_tabs(port).await.iter().any(|tab| tab["id"] == busy),
+        "busy unowned tab was closed"
+    );
+
+    cdp_request(&browser, "Target.closeTarget", json!({"targetId": busy})).await;
+    release_session(&root, &profile, port, "shared-window", "busy-fresh").await;
+    release_session(&root, &profile, port, "shared-window", "busy-warm").await;
+    client.cancel().await.unwrap();
+    wait_for_broker_exit(&broker_socket(&profile), &profile).await;
+    wait_for_browser_exit(port).await;
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Chromium and the real Chrome DevTools MCP worker"]
 async fn exports_allow_workspace_and_scratch_but_reject_outside_paths() {
     let root = std::env::temp_dir().join(format!("browser-mcp-exports-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();

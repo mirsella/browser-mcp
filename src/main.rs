@@ -40,6 +40,11 @@ use tracing::{error, info, warn};
 const INTERNAL_URL: &str = "about:blank";
 const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const WORKER_START_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the worker may keep omitting an exact CDP-created tab from
+/// completed listings. A slow listing never expires this deadline on its own:
+/// one busy unrelated tab can stall every listing, which stays bounded by the
+/// action deadline instead.
+const CREATED_PAGE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const CATALOG_TIMEOUT: Duration = Duration::from_secs(70);
 const WORKER_HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_SESSION_ID_BYTES: usize = 256;
@@ -1988,32 +1993,36 @@ impl BrowserProxy {
                 self.config.max_pages_per_session,
             )
             .await?;
-        let established = timeout(WORKER_STOP_TIMEOUT, async {
-            loop {
-                self.reconcile_with_current(tracker, id, session, Some(&tab))
-                    .await?;
-                if session
-                    .pages
-                    .local_to_tab
-                    .values()
-                    .any(|mapped| mapped == &tab)
-                    && session.persisted.current_tab.as_deref() == Some(&tab)
-                {
-                    return Ok(());
-                }
-                sleep(Duration::from_millis(100)).await;
+        let discovery_deadline = Instant::now() + CREATED_PAGE_DISCOVERY_TIMEOUT;
+        let established = loop {
+            if let Err(error) = self
+                .reconcile_with_current(tracker, id, session, Some(&tab))
+                .await
+            {
+                break Err(error);
             }
-        })
-        .await;
-        if established.is_err() || established.as_ref().is_ok_and(|result| result.is_err()) {
+            if session
+                .pages
+                .local_to_tab
+                .values()
+                .any(|mapped| mapped == &tab)
+                && session.persisted.current_tab.as_deref() == Some(&tab)
+            {
+                break Ok(());
+            }
+            if Instant::now() >= discovery_deadline {
+                break Err(anyhow!(
+                    "Chrome DevTools did not report the exact CDP-created page within {} seconds",
+                    CREATED_PAGE_DISCOVERY_TIMEOUT.as_secs()
+                ));
+            }
+            sleep(Duration::from_millis(100)).await;
+        };
+        if let Err(error) = established {
             if let Err(error) = tracker.close_owned_target(id, &tab).await {
                 warn!(%error, tab, "failed to clean up unreported newly created tab");
             }
-            match established {
-                Ok(Err(error)) => return Err(error),
-                Err(_) => bail!("timed out reconciling exact CDP-created page"),
-                Ok(Ok(())) => unreachable!("successful reconciliation was handled above"),
-            }
+            return Err(error);
         }
         if url != INTERNAL_URL {
             let page = session
