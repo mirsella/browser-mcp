@@ -38,6 +38,7 @@ use tokio::{
 use tracing::{error, info, warn};
 
 const INTERNAL_URL: &str = "about:blank";
+const DEVTOOLS_PACKAGE: &str = "chrome-devtools-mcp@1.13.0";
 const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const WORKER_START_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the worker may keep omitting an exact CDP-created tab from
@@ -957,10 +958,10 @@ async fn spawn_downstream(config: &Config, workspace: &std::path::Path) -> Resul
         .collect::<Result<Vec<_>>>()?;
     let mut command = Command::new(&config.downstream_command);
     command
-        .arg("chrome-devtools-mcp@1.6.0")
+        .arg(DEVTOOLS_PACKAGE)
         .arg("--browser-url")
         .arg(config.browser_url())
-        .arg("--experimental-page-id-routing")
+        .arg("--page-id-routing")
         .arg("--experimental-interop-tools")
         .arg("--experimental-structured-content")
         .arg("--no-usage-statistics")
@@ -1181,6 +1182,11 @@ async fn discover_catalog(
         let mut has_get_tab_id = false;
         let mut tools = Vec::with_capacity(listed.len());
         for mut tool in listed {
+            // New upstream tools need a routing and permission review before
+            // exposing them. Recording is opt-in even if upstream defaults on.
+            if !actions::expose_upstream(&tool.name, config.recording) {
+                continue;
+            }
             if tool.name == "select_page" || tool.name == "get_tab_id" {
                 has_get_tab_id |= tool.name == "get_tab_id";
                 continue;

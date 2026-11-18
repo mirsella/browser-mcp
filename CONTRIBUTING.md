@@ -35,7 +35,7 @@ to exercise headed handoffs and window placement. The compact workflow case
 covers tab selection, UID lifetime, filtered snapshots, diffs, batch failure
 boundaries and human handoffs. `actions::tests::context_budgets_and_pinned_schema_dialect`
 prints static schema/help byte counts; these are not model-success measurements.
-The public pinned tool-schema fixture comes from Chrome DevTools MCP 1.6.0.
+The public pinned tool-schema fixture comes from Chrome DevTools MCP 1.13.0.
 
 The real-browser cases share Bunx's installation cache and run serially. Adapter
 and tool-call concurrency is exercised within each case.

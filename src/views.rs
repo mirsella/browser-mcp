@@ -113,6 +113,8 @@ struct Node {
     matches_find: bool,
     /// Physical lines in the unescaped upstream node, including its final newline.
     source_lines: usize,
+    /// DevTools can omit these leaves from text while preserving them in JSON.
+    redundant_text_children: bool,
     parent: Option<usize>,
     children: Vec<usize>,
     depth: usize,
@@ -244,7 +246,9 @@ impl ViewState {
             .iter()
             .enumerate()
             .find_map(|(index, block)| match block {
-                ContentBlock::Text(text) => locate(&text.text, &tree).map(|range| (index, range)),
+                ContentBlock::Text(text) => {
+                    locate(&text.text, &tree, request.verbose).map(|range| (index, range))
+                }
                 _ => None,
             })
             .ok_or_else(|| anyhow!("page snapshot text does not match its structured snapshot"))?;
@@ -657,6 +661,10 @@ impl Tree {
                 content_hash: xxhash_rust::xxh3::xxh3_128(source.as_bytes()),
                 matches_find: find.is_some_and(|needle| source.to_lowercase().contains(needle)),
                 source_lines: 1 + source.bytes().filter(|&byte| byte == b'\n').count(),
+                redundant_text_children: redundant_text_children(
+                    object.get("name").and_then(Value::as_str),
+                    children,
+                ),
                 parent,
                 children: Vec::new(),
                 depth,
@@ -789,7 +797,7 @@ fn push_field(out: &mut String, value: &str, bounded: bool) {
 
 /// Byte range of the upstream snapshot section, anchored on the structured
 /// root uid and verified line by line against the structured tree.
-fn locate(text: &str, tree: &Tree) -> Option<Range<usize>> {
+fn locate(text: &str, tree: &Tree, verbose: bool) -> Option<Range<usize>> {
     let mut from = 0;
     while let Some(offset) = text[from..].find(MARKER) {
         let start = from + offset;
@@ -805,8 +813,9 @@ fn locate(text: &str, tree: &Tree) -> Option<Range<usize>> {
         if body.starts_with(SELECTED_NOTE) {
             at = find_node_line(text, at, &tree.nodes[0])?;
         }
-        for node in &tree.nodes {
-            if find_node_line(text, at, node)? != at {
+        let mut index = 0;
+        while let Some(node) = tree.nodes.get(index) {
+            if !starts_node_line(text, at, node) {
                 return None;
             }
             // A name or attribute can contain newlines, fake UIDs, and section
@@ -814,10 +823,47 @@ fn locate(text: &str, tree: &Tree) -> Option<Range<usize>> {
             for _ in 0..node.source_lines {
                 at += 1 + text[at + 1..].find('\n')?;
             }
+            index += 1;
+            // DevTools 1.13 leaves redundant StaticText nodes in the structured
+            // tree but can omit them from the non-verbose text. If the first
+            // child is present, all of them still have to match.
+            if !verbose
+                && node.redundant_text_children
+                && !starts_node_line(text, at, &tree.nodes[index])
+            {
+                index = node.end;
+            }
         }
         return Some(start..at + 1);
     }
     None
+}
+
+fn redundant_text_children(name: Option<&str>, children: &[Value]) -> bool {
+    let Some(name) = name.filter(|name| !name.is_empty() && !children.is_empty()) else {
+        return false;
+    };
+    // JavaScript's \s includes BOM and excludes NEL; keep the upstream
+    // whitespace comparison exact so only expected omissions are accepted.
+    let significant = |c: &char| *c != '\u{feff}' && (!c.is_whitespace() || *c == '\u{0085}');
+    children.iter().all(|child| {
+        child.get("role").and_then(Value::as_str) == Some("StaticText")
+            && child
+                .get("children")
+                .is_none_or(|value| value.as_array().is_some_and(Vec::is_empty))
+    }) && children
+        .iter()
+        .filter_map(|child| child.get("name").and_then(Value::as_str))
+        .flat_map(str::chars)
+        .filter(significant)
+        .eq(name.chars().filter(significant))
+}
+
+fn starts_node_line(text: &str, at: usize, node: &Node) -> bool {
+    text[at..]
+        .strip_prefix('\n')
+        .and_then(|line| line.strip_prefix(&"  ".repeat(node.depth)))
+        .is_some_and(|line| starts_with_uid(line, &node.id))
 }
 
 fn find_node_line(text: &str, from: usize, node: &Node) -> Option<usize> {
@@ -927,6 +973,31 @@ fn new_nonce() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_text_may_omit_redundant_leaves_only_in_non_verbose_mode() {
+        let tree = Tree::parse(
+            &json!({
+                "id":"1_0","role":"RootWebArea","children":[
+                    {"id":"1_1","role":"link","name":"Details popup","children":[
+                        {"id":"1_2","role":"StaticText","name":"Details"},
+                        {"id":"1_3","role":"StaticText","name":"popup"}
+                    ]},
+                    {"id":"1_4","role":"heading","name":"Confirmation"}
+                ]
+            }),
+            None,
+        )
+        .unwrap();
+        let text = format!(
+            "{MARKER}uid=1_0 RootWebArea\n  uid=1_1 link \"Details popup\"\n  uid=1_4 heading \"Confirmation\"\n"
+        );
+        let with_suffix = format!("{text}\nOther output");
+        assert_eq!(locate(&with_suffix, &tree, false), Some(0..text.len()));
+        assert_eq!(locate(&text, &tree, true), None);
+        let partial = text.replace("  uid=1_4", "    uid=1_2 \"Details\"\n  uid=1_4");
+        assert_eq!(locate(&partial, &tree, false), None);
+    }
     use serde_json::json;
 
     fn upstream_lines(node: &Value, depth: usize, out: &mut String) {

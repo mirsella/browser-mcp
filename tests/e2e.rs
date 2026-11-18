@@ -2523,6 +2523,32 @@ async fn compact_workflows_bound_context_and_preserve_references() {
     dispatch_ok(
         &client,
         "workflow",
+        "evaluate_script",
+        json!({"function":"() => { document.body.insertAdjacentHTML('beforeend', '<label>Attachment <input type=file></label>'); }"}),
+    )
+    .await;
+    let attachment = dispatch_ok(&client, "workflow", "take_snapshot", json!({})).await;
+    let uid = snapshot_uid(&attachment, "button \"Attachment\"");
+    let file = root.join("attachment.txt");
+    std::fs::write(&file, "upload compatibility marker").unwrap();
+    dispatch_ok(
+        &client,
+        "workflow",
+        "upload_file",
+        json!({"uid":uid,"filePath":file}),
+    )
+    .await;
+    let uploaded = dispatch_ok(
+        &client,
+        "workflow",
+        "evaluate_script",
+        json!({"function":"() => document.querySelector('input[type=file]').files[0].text()"}),
+    )
+    .await;
+    assert!(text(&uploaded).contains("upload compatibility marker"));
+    dispatch_ok(
+        &client,
+        "workflow",
         "new_page",
         json!({"url":format!("{site}/#second")}),
     )

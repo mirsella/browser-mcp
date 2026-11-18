@@ -454,6 +454,12 @@ impl BrowserProxy {
         ) {
             arguments.entry("pageSize").or_insert(50.into());
         }
+        if action == "upload_file" {
+            let path = arguments
+                .remove("filePath")
+                .context("upload filePath missing")?;
+            arguments.insert("filePaths".into(), json!([path]));
+        }
         let epoch = session.worker_epoch;
         let recording_action = matches!(action.as_str(), "screencast_start" | "screencast_stop");
         let (result, target) = {

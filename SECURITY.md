@@ -7,7 +7,7 @@ Do not open a public issue for a vulnerability that exposes browser data,
 credentials, local files, or cross-session tabs.
 
 Include the package version, browser and version, MCP host, reproduction steps,
-and whether the issue also reproduces with `chrome-devtools-mcp@1.6.0` directly.
+and whether the issue also reproduces with `chrome-devtools-mcp@1.13.0` directly.
 
 ## Security boundary
 

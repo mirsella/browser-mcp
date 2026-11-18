@@ -1,7 +1,7 @@
 //! Broker-owned actions and the deliberately small, pinned JSON-schema dialect.
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use rmcp::model::{Tool, ToolAnnotations};
 use serde_json::{Map, Value, json};
 
@@ -53,6 +53,14 @@ pub fn builtins(secrets: bool) -> Vec<Tool> {
     tools
 }
 
+pub fn expose_upstream(name: &str, recording: bool) -> bool {
+    match name {
+        "get_css_styles" | "set_logpoints" => false,
+        "screencast_start" | "screencast_stop" => recording,
+        _ => true,
+    }
+}
+
 pub fn extend(tool: &mut Tool, page_scoped: bool) -> Result<()> {
     if tool.output_schema.is_some() {
         bail!(
@@ -63,6 +71,14 @@ pub fn extend(tool: &mut Tool, page_scoped: bool) -> Result<()> {
     let mut schema = (*tool.input_schema).clone();
     check_schema(&Value::Object(schema.clone()))?;
     schema.insert("additionalProperties".into(), false.into());
+    let required = match tool.name.as_ref() {
+        "evaluate_script" => Some(json!(["function"])),
+        "upload_file" => Some(json!(["uid", "filePath"])),
+        _ => None,
+    };
+    if let Some(required) = required {
+        schema.insert("required".into(), required);
+    }
     let props = schema
         .get_mut("properties")
         .and_then(Value::as_object_mut)
@@ -74,6 +90,46 @@ pub fn extend(tool: &mut Tool, page_scoped: bool) -> Result<()> {
     if tool.name == "screencast_start" {
         props.remove("filePath");
         tool.description = Some("Start an explicitly enabled recording to a broker-assigned workspace artifact. Stop it before cleanup.".into());
+    }
+    let descriptions: &[(&str, &str)] = match tool.name.as_ref() {
+        "evaluate_script" => {
+            props.remove("sourcePath");
+            props.remove("format");
+            &[(
+                "function",
+                "A JavaScript function declaration to execute in the target page, e.g. `() => document.title`.",
+            )]
+        }
+        "upload_file" => {
+            let paths = props
+                .remove("filePaths")
+                .context("upstream upload_file is missing filePaths")?;
+            let path = paths
+                .get("items")
+                .filter(|item| item.get("type").and_then(Value::as_str) == Some("string"))
+                .context("upstream upload_file must accept an array of paths")?;
+            props.insert("filePath".into(), path.clone());
+            &[("filePath", "The local path of the file to upload")]
+        }
+        "emulate" => &[
+            (
+                "viewport",
+                "Viewport as widthxheightxdevicePixelRatio[,mobile][,touch][,landscape].",
+            ),
+            (
+                "extraHttpHeaders",
+                "JSON object of request headers, persisted across navigations. Pass an empty string to clear.",
+            ),
+            ("geolocation", "Latitude,longitude; omit to clear."),
+        ],
+        _ => &[],
+    };
+    for &(key, description) in descriptions {
+        let parameter = props
+            .get_mut(key)
+            .and_then(Value::as_object_mut)
+            .with_context(|| format!("upstream {} is missing parameter {key}", tool.name))?;
+        parameter.insert("description".into(), description.into());
     }
     if tool.name == "new_page" {
         props.remove("isolatedContext");
@@ -407,10 +463,13 @@ mod tests {
 
     fn catalog() -> Vec<Tool> {
         let mut tools: Vec<Tool> = serde_json::from_str(include_str!(
-            "../tests/fixtures/chrome-devtools-mcp-1.6.0.json"
+            "../tests/fixtures/chrome-devtools-mcp-1.13.0.json"
         ))
         .unwrap();
-        tools.retain(|tool| !matches!(tool.name.as_ref(), "select_page" | "get_tab_id"));
+        tools.retain(|tool| {
+            !matches!(tool.name.as_ref(), "select_page" | "get_tab_id")
+                && expose_upstream(&tool.name, false)
+        });
         for tool in &mut tools {
             let mut schema = (*tool.input_schema).clone();
             let scoped = crate::remove_schema_property(&mut schema, "pageId");
@@ -433,10 +492,11 @@ mod tests {
             .collect::<Vec<_>>()
             .join(", ")
             .len();
-        let mut maximum = 0;
-        for tool in &tools {
-            maximum = maximum.max(help(tool).len());
-        }
+        let (maximum, longest) = tools
+            .iter()
+            .map(|tool| (help(tool).len(), tool.name.as_ref()))
+            .max()
+            .unwrap();
         println!(
             "context bytes: initial={initial}, names={action_names}, largest action help={maximum}, full direct={}",
             serde_json::to_vec(&tools).unwrap().len()
@@ -444,13 +504,25 @@ mod tests {
         assert_eq!(crate::broker::compact_tools().len(), 2);
         assert!(initial <= 1800, "initial context grew: {initial}");
         assert!(action_names <= 1200);
-        assert!(maximum <= 2400, "action help grew: {maximum}");
+        assert!(maximum <= 2400, "{longest} action help grew: {maximum}");
         assert!(include_str!("../skills/browser-automation/SKILL.md").len() <= 4000);
         let evaluate = tools
             .iter()
             .find(|tool| tool.name == "evaluate_script")
             .unwrap();
-        assert!(help(evaluate).contains("The uid of an element"));
+        assert!(help(evaluate).contains("uid of an element"));
+        assert!(validate(evaluate, &Map::new()).is_err());
+        let upload = tools
+            .iter()
+            .find(|tool| tool.name == "upload_file")
+            .unwrap();
+        assert!(
+            validate(
+                upload,
+                json!({"uid":"1_2","filePath":"a.txt"}).as_object().unwrap()
+            )
+            .is_ok()
+        );
     }
 
     #[test]

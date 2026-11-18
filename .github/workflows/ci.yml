@@ -45,7 +45,7 @@ jobs:
             --user-data-dir="$RUNNER_TEMP/chrome-preflight" --dump-dom about:blank \
             > "$RUNNER_TEMP/chrome-preflight.html"
           echo "OPENCODE_BROWSER_EXECUTABLE=$RUNNER_TEMP/chrome-linux64/chrome" >> "$GITHUB_ENV"
-          bunx chrome-devtools-mcp@1.6.0 --help >/dev/null
+          bunx chrome-devtools-mcp@1.13.0 --help >/dev/null
       - name: Test real browser routing
         run: xvfb-run -a cargo test --release --test e2e -- --ignored --nocapture --test-threads=1
       - name: Save recording diagnostics on failure
