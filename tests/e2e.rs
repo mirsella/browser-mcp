@@ -335,15 +335,24 @@ async fn connected_adapters_recover_from_killed_and_segfaulted_brokers() {
             );
         }
         wait_for_profile_lease(&profile).await;
-        let (tools_a, tools_b) = tokio::join!(
-            a.send_request(rmcp::model::ClientRequest::ListToolsRequest(
-                Default::default()
-            )),
-            b.send_request(rmcp::model::ClientRequest::ListToolsRequest(
-                Default::default()
-            )),
-        );
-        for result in [tools_a, tools_b] {
+        // One read-only request may race the adapter noticing that its
+        // socket closed. The following request must use a new broker.
+        async fn check(client: &Client) {
+            let list = || {
+                client.send_request(rmcp::model::ClientRequest::ListToolsRequest(
+                    Default::default(),
+                ))
+            };
+            let result = match list().await {
+                Err(error)
+                    if error
+                        .to_string()
+                        .contains("Browser broker request interrupted") =>
+                {
+                    list().await
+                }
+                result => result,
+            };
             let rmcp::model::ServerResult::ListToolsResult(result) =
                 result.expect("adapter recovered")
             else {
@@ -351,6 +360,7 @@ async fn connected_adapters_recover_from_killed_and_segfaulted_brokers() {
             };
             assert_eq!(result.tools.len(), 2);
         }
+        tokio::join!(check(&a), check(&b));
         assert_ne!(broker_pid(&socket).await, old_pid);
     }
     a.cancel().await.unwrap();
@@ -2321,7 +2331,8 @@ async fn headless_screenshots_survive_background_tabs_and_popup_closure() {
             call(&client, session, "navigate_page", json!({"url":url})).await?;
             let snapshot = call(&client, session, "take_snapshot", json!({})).await?;
             let link = snapshot_uid(&snapshot, "link \"Details popup\"");
-            call(&client, session, "click", json!({"uid":link})).await?;
+            let popup = call(&client, session, "click", json!({"uid":link})).await?;
+            anyhow::ensure!(!text(&popup).contains("## Opened pages"), "raw worker popup notice");
             call(&client, session, "close_page", json!({"page":"p2"})).await?;
             call(&client, session, "new_page", json!({"url":"about:blank"})).await?;
         }
@@ -2546,6 +2557,19 @@ async fn compact_workflows_bound_context_and_preserve_references() {
     )
     .await;
     assert!(text(&uploaded).contains("upload compatibility marker"));
+    let attachment = dispatch_ok(&client, "workflow", "take_snapshot", json!({})).await;
+    let outside = client
+        .call_tool(request(
+            "dispatch",
+            "workflow",
+            json!({"action":"upload_file","arguments":{
+                "uid":snapshot_uid(&attachment, "button \"Attachment\""),
+                "filePath":"/etc/hosts"
+            }}),
+        ))
+        .await
+        .unwrap();
+    assert!(outside.is_error.unwrap_or(false), "upload escaped roots");
     dispatch_ok(
         &client,
         "workflow",

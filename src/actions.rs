@@ -55,9 +55,36 @@ pub fn builtins(secrets: bool) -> Vec<Tool> {
 
 pub fn expose_upstream(name: &str, recording: bool) -> bool {
     match name {
-        "get_css_styles" | "set_logpoints" => false,
         "screencast_start" | "screencast_stop" => recording,
-        _ => true,
+        "click"
+        | "close_page"
+        | "drag"
+        | "emulate"
+        | "evaluate_script"
+        | "fill"
+        | "fill_form"
+        | "get_console_message"
+        | "get_network_request"
+        | "handle_dialog"
+        | "hover"
+        | "lighthouse_audit"
+        | "list_console_messages"
+        | "list_network_requests"
+        | "list_pages"
+        | "navigate_page"
+        | "new_page"
+        | "performance_analyze_insight"
+        | "performance_start_trace"
+        | "performance_stop_trace"
+        | "press_key"
+        | "resize_page"
+        | "take_heapsnapshot"
+        | "take_screenshot"
+        | "take_snapshot"
+        | "type_text"
+        | "upload_file"
+        | "wait_for" => true,
+        _ => false,
     }
 }
 
@@ -227,7 +254,7 @@ fn validate_value(schema: &Map<String, Value>, value: &Value, path: &str) -> Res
             "string" => value.is_string(),
             "boolean" => value.is_boolean(),
             "number" => value.is_number(),
-            "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+            "integer" => value.as_f64().is_some_and(|number| number.fract() == 0.0),
             "null" => value.is_null(),
             _ => bail!("unsupported schema type {kind}"),
         };
@@ -466,10 +493,7 @@ mod tests {
             "../tests/fixtures/chrome-devtools-mcp-1.13.0.json"
         ))
         .unwrap();
-        tools.retain(|tool| {
-            !matches!(tool.name.as_ref(), "select_page" | "get_tab_id")
-                && expose_upstream(&tool.name, false)
-        });
+        tools.retain(|tool| expose_upstream(&tool.name, false));
         for tool in &mut tools {
             let mut schema = (*tool.input_schema).clone();
             let scoped = crate::remove_schema_property(&mut schema, "pageId");
@@ -512,6 +536,26 @@ mod tests {
             .unwrap();
         assert!(help(evaluate).contains("uid of an element"));
         assert!(validate(evaluate, &Map::new()).is_err());
+        assert!(!expose_upstream("unreviewed_tool", true));
+        assert!(!expose_upstream("screencast_start", false));
+        let resize = tools
+            .iter()
+            .find(|tool| tool.name == "resize_page")
+            .unwrap();
+        assert!(
+            validate(
+                resize,
+                json!({"width":800.0,"height":600}).as_object().unwrap()
+            )
+            .is_ok()
+        );
+        assert!(
+            validate(
+                resize,
+                json!({"width":800.5,"height":600}).as_object().unwrap()
+            )
+            .is_err()
+        );
         let upload = tools
             .iter()
             .find(|tool| tool.name == "upload_file")

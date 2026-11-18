@@ -968,6 +968,7 @@ async fn spawn_downstream(config: &Config, workspace: &std::path::Path) -> Resul
         .arg("--no-performance-crux")
         .arg("--redact-network-headers")
         .current_dir(workspace)
+        .env("CHROME_DEVTOOLS_MCP_NO_CONFIG_DISCOVERY", "1")
         .env("CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS", "1");
     command.env_remove("DEBUG");
     if config.recording {
@@ -1182,13 +1183,12 @@ async fn discover_catalog(
         let mut has_get_tab_id = false;
         let mut tools = Vec::with_capacity(listed.len());
         for mut tool in listed {
-            // New upstream tools need a routing and permission review before
-            // exposing them. Recording is opt-in even if upstream defaults on.
-            if !actions::expose_upstream(&tool.name, config.recording) {
-                continue;
-            }
             if tool.name == "select_page" || tool.name == "get_tab_id" {
                 has_get_tab_id |= tool.name == "get_tab_id";
+                continue;
+            }
+            // Keep this allowlist aligned with OpenCode's per-action policies.
+            if !actions::expose_upstream(&tool.name, config.recording) {
                 continue;
             }
             let mut schema = (*tool.input_schema).clone();

@@ -233,7 +233,9 @@ sensitive; see [SECURITY.md](SECURITY.md).
 
 HAR export is deferred: the current worker does not expose the timing data needed
 for an accurate HAR. Use paginated network lists and `get_network_request` with
-`requestFilePath` / `responseFilePath` for focused diagnostics instead.
+`requestFilePath` / `responseFilePath` for focused diagnostics instead. The
+DevTools worker no longer accepts `websocket` as a `list_network_requests`
+resource-type filter.
 
 ## Architecture
 

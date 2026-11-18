@@ -546,6 +546,8 @@ impl BrowserProxy {
                 "worker replaced during reconciliation; discard old references and take a fresh snapshot (action was not replayed)"
             );
         }
+        // The broker reports opened pages using its reconciled, scoped handles.
+        responses::attached_page_notices(&mut result)?;
         if let Some(tab) = target {
             if action == "navigate_page" {
                 session.views.invalidate_tab(&tab);

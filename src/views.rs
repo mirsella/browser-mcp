@@ -759,6 +759,13 @@ fn describe(object: &Map<String, Value>, bounded: bool) -> String {
         .collect();
     keys.sort();
     for key in keys {
+        // DevTools omits an option's value when it duplicates the name.
+        if key == "value"
+            && object.get("role").and_then(Value::as_str) == Some("option")
+            && object.get("name") == object.get("value")
+        {
+            continue;
+        }
         match &object[key] {
             Value::Bool(true) => {
                 rest.push(' ');
@@ -973,6 +980,7 @@ fn new_nonce() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn snapshot_text_may_omit_redundant_leaves_only_in_non_verbose_mode() {
@@ -998,7 +1006,17 @@ mod tests {
         let partial = text.replace("  uid=1_4", "    uid=1_2 \"Details\"\n  uid=1_4");
         assert_eq!(locate(&partial, &tree, false), None);
     }
-    use serde_json::json;
+    #[test]
+    fn snapshot_matches_multiline_option_with_redundant_value() {
+        let tree = Tree::parse(
+            &json!({"id":"1_0","role":"option","name":"line one\nline two","value":"line one\nline two"}),
+            None,
+        )
+        .unwrap();
+        let snapshot = format!("{MARKER}uid=1_0 option \"line one\nline two\"\n");
+        let text = format!("{snapshot}\n## Next section\n");
+        assert_eq!(locate(&text, &tree, false), Some(0..snapshot.len()));
+    }
 
     fn upstream_lines(node: &Value, depth: usize, out: &mut String) {
         out.push_str(&format!(
