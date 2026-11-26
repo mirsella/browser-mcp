@@ -21,7 +21,7 @@ use futures_util::FutureExt;
 use rmcp::{
     RoleClient, ServerHandler, ServiceExt,
     model::{
-        CallToolRequest, CallToolRequestParams, CallToolResponse, CallToolResult,
+        CacheScope, CallToolRequest, CallToolRequestParams, CallToolResponse, CallToolResult,
         CancelledNotificationParam, ClientRequest, ContentBlock, Implementation, ListToolsRequest,
         ListToolsResult, PaginatedRequestParams, RequestMetaObject, ServerCapabilities, ServerInfo,
         ServerResult, Tool, ToolAnnotations,
@@ -1160,7 +1160,11 @@ impl ServerHandler for Connection {
             .cloned()
             .collect()
         };
-        Ok(ListToolsResult::with_all_items(tools))
+        // Protocol 2026-07-28 requires both cache fields on list results; the
+        // catalog follows this connection's workspace and DevTools version.
+        Ok(ListToolsResult::with_all_items(tools)
+            .with_ttl_ms(0)
+            .with_cache_scope(CacheScope::Private))
     }
     async fn call_tool(
         &self,
@@ -1805,6 +1809,37 @@ mod tests {
         request.meta = Some(session_meta("session-a"));
         let result = client.call_tool(request).await.unwrap();
         assert!(!result.is_error.unwrap_or(false));
+        client.cancel().await.unwrap();
+        server.cancel().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tool_list_carries_required_cache_fields() {
+        let path = std::env::temp_dir().join(format!(
+            "browser-mcp-list-cache-{}.json",
+            std::process::id()
+        ));
+        let config = Arc::new(
+            Cli::try_parse_from(["browser-mcp", "--headless=true"])
+                .unwrap()
+                .config,
+        );
+        let proxy = BrowserProxy::new(config, OwnershipPersistence::open(path).unwrap())
+            .await
+            .unwrap();
+        let connection = Connection {
+            proxy,
+            workspace: PathBuf::from("/"),
+            compact: true,
+            lifecycle: Arc::default(),
+        };
+        let (server_io, client_io) = tokio::io::duplex(4096);
+        let (server, client) = tokio::join!(connection.serve(server_io), ().serve(client_io));
+        let server = server.unwrap();
+        let client = client.unwrap();
+        let result = client.list_tools(None).await.unwrap();
+        assert_eq!(result.ttl_ms, Some(0));
+        assert_eq!(result.cache_scope, Some(CacheScope::Private));
         client.cancel().await.unwrap();
         server.cancel().await.unwrap();
     }
