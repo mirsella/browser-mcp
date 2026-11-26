@@ -23,8 +23,8 @@ use rmcp::{
     model::{
         CacheScope, CallToolRequest, CallToolRequestParams, CallToolResponse, CallToolResult,
         CancelledNotificationParam, ClientRequest, ContentBlock, Implementation, ListToolsRequest,
-        ListToolsResult, PaginatedRequestParams, RequestMetaObject, ServerCapabilities, ServerInfo,
-        ServerResult, Tool, ToolAnnotations,
+        ListToolsResult, PaginatedRequestParams, RequestMetaObject, ResultType, ServerCapabilities,
+        ServerInfo, ServerResult, Tool, ToolAnnotations,
     },
     service::{PeerRequestOptions, RequestContext, RunningService, ServiceError},
 };
@@ -411,7 +411,11 @@ impl ServerHandler for Adapter {
             )
             .await?
         {
-            ServerResult::ListToolsResult(result) => Ok(result),
+            ServerResult::ListToolsResult(mut result) => {
+                // The internal legacy link omits the completion discriminator.
+                result.result_type.get_or_insert(ResultType::COMPLETE);
+                Ok(result)
+            }
             _ => Err(rmcp::ErrorData::internal_error(
                 "unexpected broker tool list",
                 None,
@@ -431,7 +435,12 @@ impl ServerHandler for Adapter {
             )
             .await
         {
-            Ok(ServerResult::CallToolResult(result)) => Ok(result.into()),
+            Ok(ServerResult::CallToolResult(mut result)) => {
+                // The internal broker link can negotiate a legacy protocol. Restore
+                // its implicit completion before rmcp encodes for the external peer.
+                result.result_type.get_or_insert(ResultType::COMPLETE);
+                Ok(result.into())
+            }
             Ok(_) => Err(rmcp::ErrorData::internal_error(
                 "unexpected broker tool response",
                 None,
@@ -1755,6 +1764,85 @@ mod tests {
         let mut meta = RequestMetaObject::default();
         meta.insert(SESSION_META_KEY.to_owned(), id.into());
         meta
+    }
+
+    #[tokio::test]
+    async fn adapter_restores_list_and_call_completion_for_modern_clients_only() {
+        struct Broker;
+        impl ServerHandler for Broker {
+            async fn list_tools(
+                &self,
+                _request: Option<PaginatedRequestParams>,
+                _context: RequestContext<rmcp::RoleServer>,
+            ) -> Result<ListToolsResult, rmcp::ErrorData> {
+                Ok(ListToolsResult::default()
+                    .with_ttl_ms(0)
+                    .with_cache_scope(rmcp::model::CacheScope::Private))
+            }
+
+            async fn call_tool(
+                &self,
+                _request: CallToolRequestParams,
+                _context: RequestContext<rmcp::RoleServer>,
+            ) -> Result<CallToolResponse, rmcp::ErrorData> {
+                Ok(CallToolResult::error(vec![ContentBlock::text("test error")]).into())
+            }
+        }
+        struct ModernClient;
+        impl rmcp::ClientHandler for ModernClient {
+            fn get_info(&self) -> rmcp::model::ClientInfo {
+                ().get_info()
+                    .with_protocol_version(rmcp::model::ProtocolVersion::V_2026_07_28)
+            }
+        }
+        let (server_io, client_io) = tokio::io::duplex(4096);
+        let (broker, internal) = tokio::join!(Broker.serve(server_io), ().serve(client_io));
+        let broker = broker.unwrap();
+        let internal = Arc::new(internal.unwrap());
+        let call = || CallToolRequestParams::new("dispatch");
+        assert_eq!(internal.call_tool(call()).await.unwrap().result_type, None);
+        let adapter = || Adapter {
+            paths: RuntimePaths {
+                socket: PathBuf::new(),
+                lock: PathBuf::new(),
+            },
+            direct_tools: false,
+            config: Cli::try_parse_from(["browser-mcp", "--headless=true"])
+                .unwrap()
+                .config,
+            broker: Mutex::new(Some(internal.clone())),
+        };
+        let (modern_io, adapter_io) = tokio::io::duplex(4096);
+        let (legacy_io, legacy_adapter_io) = tokio::io::duplex(4096);
+        let (server, modern, legacy_server, legacy) = tokio::join!(
+            adapter().serve(adapter_io),
+            ModernClient.serve(modern_io),
+            adapter().serve(legacy_adapter_io),
+            ().serve(legacy_io),
+        );
+        let modern = modern.unwrap();
+        let legacy = legacy.unwrap();
+        let list = modern.list_tools(None).await.unwrap();
+        assert_eq!(list.result_type, Some(ResultType::COMPLETE));
+        assert_eq!(list.ttl_ms, Some(0));
+        assert_eq!(list.cache_scope, Some(rmcp::model::CacheScope::Private));
+        assert_eq!(legacy.list_tools(None).await.unwrap().result_type, None);
+        for (result, expected) in [
+            (
+                modern.call_tool(call()).await.unwrap(),
+                Some(ResultType::COMPLETE),
+            ),
+            (legacy.call_tool(call()).await.unwrap(), None),
+        ] {
+            assert_eq!(result.result_type, expected);
+            assert_eq!(result.is_error, Some(true));
+            assert_eq!(result.content[0].as_text().unwrap().text, "test error");
+        }
+        modern.cancel().await.unwrap();
+        legacy.cancel().await.unwrap();
+        server.unwrap().cancel().await.unwrap();
+        legacy_server.unwrap().cancel().await.unwrap();
+        broker.cancel().await.unwrap();
     }
 
     #[tokio::test]
