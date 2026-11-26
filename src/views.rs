@@ -92,6 +92,7 @@ struct Baseline {
 #[derive(Debug)]
 struct BaseNode {
     id: String,
+    addressable: bool,
     rest: String,
     content_hash: u128,
     parent: Option<u32>,
@@ -106,7 +107,11 @@ struct Tree {
 }
 
 struct Node {
+    /// Snapshot uid, or a diff key derived from the parent for a node
+    /// DevTools exposes without one (e.g. icon-font StaticText).
     id: String,
+    /// Whether `id` is a DevTools uid that actions can target.
+    addressable: bool,
     /// Rendered line after `uid=…`.
     rest: String,
     content_hash: u128,
@@ -383,7 +388,7 @@ impl ViewState {
             Some(raw) => tree
                 .nodes
                 .iter()
-                .position(|node| &node.id == raw)
+                .position(|node| node.addressable && &node.id == raw)
                 .ok_or_else(|| {
                     anyhow!("`within` uid is not in the current snapshot; take a new snapshot")
                 })?,
@@ -441,7 +446,7 @@ impl ViewState {
             if !include(index) {
                 return false;
             }
-            lines.push(|| self.line("", depth, &tree.nodes[index].id, &tree.nodes[index].rest));
+            lines.push(|| self.line("", depth, tree.nodes[index].uid(), &tree.nodes[index].rest));
             true
         });
     }
@@ -515,7 +520,7 @@ impl ViewState {
                 MOVED => "> ",
                 _ => "~>",
             };
-            lines.push(|| self.line(marker, depth, &node.id, &node.rest));
+            lines.push(|| self.line(marker, depth, node.uid(), &node.rest));
             if flags & CHANGED != 0
                 && let Some(old) = base_of[index]
             {
@@ -529,12 +534,8 @@ impl ViewState {
         for (index, old) in base.nodes.iter().enumerate() {
             if !seen[index] && old.parent.is_none_or(|parent| seen[parent as usize]) {
                 top_removed += 1;
-                lines.push(|| {
-                    format!(
-                        "- uid={}{}{} [removed; not actionable]",
-                        self.prefix, old.id, old.rest
-                    )
-                });
+                let uid = old.addressable.then_some(old.id.as_str());
+                lines.push(|| self.line("- ", 0, uid, &old.rest) + " [removed; not actionable]");
             }
         }
         if removed > top_removed {
@@ -550,12 +551,13 @@ impl ViewState {
         )
     }
 
-    fn line(&self, marker: &str, depth: usize, id: &str, rest: &str) -> String {
-        format!(
-            "{marker}{}uid={}{id}{rest}",
-            "  ".repeat(depth),
-            self.prefix
-        )
+    /// Like DevTools, a node without a uid is shown without `uid=`.
+    fn line(&self, marker: &str, depth: usize, uid: Option<&str>, rest: &str) -> String {
+        let indent = "  ".repeat(depth);
+        match uid {
+            Some(uid) => format!("{marker}{indent}uid={}{uid}{rest}", self.prefix),
+            None => format!("{marker}{indent}{}", rest.trim_start()),
+        }
     }
 
     fn retain(&mut self, tab: &str, verbose: bool, tree: Tree) {
@@ -600,6 +602,7 @@ impl ViewState {
                 index.insert(node.id.clone(), order as u32);
                 BaseNode {
                     id: node.id,
+                    addressable: node.addressable,
                     rest: node.rest,
                     content_hash: node.content_hash,
                     parent: node.parent.map(|parent| parent as u32),
@@ -622,21 +625,42 @@ impl ViewState {
     }
 }
 
+impl Node {
+    fn uid(&self) -> Option<&str> {
+        self.addressable.then_some(self.id.as_str())
+    }
+}
+
 impl Tree {
     fn parse(root: &Value, find: Option<&str>) -> Result<Self> {
         let mut nodes: Vec<Node> = Vec::new();
         let mut ids = HashSet::new();
         let mut duplicate = false;
+        // Per node: how many of its children so far have no uid.
+        let mut uidless = Vec::new();
         let mut stack = vec![(root, None::<usize>, 0usize)];
         while let Some((value, parent, depth)) = stack.pop() {
             let object = value
                 .as_object()
                 .ok_or_else(|| anyhow!("snapshot node is not an object"))?;
-            let id = object
-                .get("id")
-                .and_then(Value::as_str)
-                .filter(|id| !id.is_empty() && !id.contains(char::is_whitespace))
-                .ok_or_else(|| anyhow!("snapshot node has no valid uid"))?;
+            let (id, addressable) = match (object.get("id"), parent) {
+                (Some(id), _) => {
+                    let id = id
+                        .as_str()
+                        .filter(|id| !id.is_empty() && !id.contains(char::is_whitespace))
+                        .ok_or_else(|| anyhow!("snapshot node has an invalid uid"))?;
+                    duplicate |= !ids.insert(id);
+                    (id.to_owned(), true)
+                }
+                // DevTools omits the uid of nodes without a DOM node, such as
+                // icon-font text. Key them by parent and order for diffs; the
+                // space keeps the key distinct from every real uid.
+                (None, Some(parent)) => {
+                    uidless[parent] += 1;
+                    (format!("{} {}", nodes[parent].id, uidless[parent]), false)
+                }
+                (None, None) => bail!("snapshot root has no uid"),
+            };
             for key in ["role", "name"] {
                 if object.get(key).is_some_and(|value| !value.is_string()) {
                     bail!("snapshot node {key} is not a string");
@@ -647,7 +671,6 @@ impl Tree {
                 Some(Value::Array(children)) => children.as_slice(),
                 Some(_) => bail!("snapshot node children is not an array"),
             };
-            duplicate |= !ids.insert(id);
             let index = nodes.len();
             if let Some(parent) = parent {
                 nodes[parent].children.push(index);
@@ -655,8 +678,10 @@ impl Tree {
             let role = object.get("role").and_then(Value::as_str).unwrap_or("");
             // Search and compare full fields; truncate only the displayed copy.
             let source = describe(object, false);
+            uidless.push(0u32);
             nodes.push(Node {
-                id: id.to_owned(),
+                id,
+                addressable,
                 rest: describe(object, true),
                 content_hash: xxhash_rust::xxh3::xxh3_128(source.as_bytes()),
                 matches_find: find.is_some_and(|needle| source.to_lowercase().contains(needle)),
@@ -870,7 +895,11 @@ fn starts_node_line(text: &str, at: usize, node: &Node) -> bool {
     text[at..]
         .strip_prefix('\n')
         .and_then(|line| line.strip_prefix(&"  ".repeat(node.depth)))
-        .is_some_and(|line| starts_with_uid(line, &node.id))
+        .is_some_and(|line| match node.uid() {
+            Some(uid) => starts_with_uid(line, uid),
+            // DevTools prints a uid-less node as its bare description.
+            None => !line.starts_with("uid=") && !line.starts_with(' '),
+        })
 }
 
 fn find_node_line(text: &str, from: usize, node: &Node) -> Option<usize> {
@@ -1019,28 +1048,29 @@ mod tests {
     }
 
     fn upstream_lines(node: &Value, depth: usize, out: &mut String) {
-        out.push_str(&format!(
-            "{}uid={}",
-            "  ".repeat(depth),
-            node["id"].as_str().unwrap()
-        ));
+        let mut parts = Vec::new();
+        if let Some(id) = node.get("id").and_then(Value::as_str) {
+            parts.push(format!("uid={id}"));
+        }
         if let Some(role) = node.get("role").and_then(Value::as_str) {
-            out.push_str(&format!(" {role}"));
+            parts.push(role.to_owned());
         }
         if let Some(name) = node.get("name").and_then(Value::as_str) {
-            out.push_str(&format!(" \"{name}\""));
+            parts.push(format!("\"{name}\""));
         }
         for (key, value) in node.as_object().unwrap() {
             if matches!(key.as_str(), "id" | "role" | "name" | "children") {
                 continue;
             }
             match value {
-                Value::Bool(true) => out.push_str(&format!(" {key}")),
-                Value::String(value) => out.push_str(&format!(" {key}=\"{value}\"")),
-                Value::Number(value) => out.push_str(&format!(" {key}=\"{value}\"")),
+                Value::Bool(true) => parts.push(key.clone()),
+                Value::String(value) => parts.push(format!("{key}=\"{value}\"")),
+                Value::Number(value) => parts.push(format!("{key}=\"{value}\"")),
                 _ => {}
             }
         }
+        out.push_str(&"  ".repeat(depth));
+        out.push_str(&parts.join(" "));
         out.push('\n');
         for child in node
             .get("children")
@@ -1531,18 +1561,87 @@ mod tests {
     }
 
     #[test]
+    fn uidless_nodes_show_without_uid_and_diff_by_position() {
+        // Real DevTools 1.13 output: icon-font StaticText has no uid.
+        let fixture: CallToolResult = serde_json::from_str(include_str!(
+            "../tests/fixtures/uidless-snapshot-nodes.json"
+        ))
+        .unwrap();
+        let mut state = ViewState::default();
+        let p = state.prefix.clone();
+        let request = state.prepare("take_snapshot", &mut Map::new()).unwrap();
+        let mut result = fixture.clone();
+        state.finish(&request, &mut result, "tab").unwrap();
+        let view = text(&result);
+        assert!(
+            view.contains(&format!(
+                "  uid={p}1_14 link \"\u{f020} alpha 6 checks, 2 integrations user@example.com\" url=\"https://healthchecks.io/projects/00000000-0000-4000-8000-000000000001/checks/\"\n    StaticText \"\u{f020}\"\n    uid={p}1_15 heading \"alpha\" level=\"4\"\n"
+            )),
+            "{view}"
+        );
+        assert!(
+            view.contains(&format!("    uid={p}1_40 link \"Status\"")),
+            "{view}"
+        );
+        let mut snapshot = fixture.structured_content.unwrap()["snapshot"].clone();
+        let found = run(
+            &mut state,
+            "take_snapshot",
+            json!({"find": "\u{f004}"}),
+            snapshot.clone(),
+        )
+        .unwrap();
+        assert!(
+            found.contains("2 find matches")
+                && found.contains(&format!("\n  uid={p}1_18 link"))
+                && found.contains("\n    StaticText \"\u{f004}\"\n"),
+            "{found}"
+        );
+        let error = run(
+            &mut state,
+            "take_snapshot",
+            json!({"within": format!("{p}1_14 1")}),
+            snapshot.clone(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("not in the current snapshot"));
+        snapshot["children"][2]["children"][0]["name"] = "\u{f021}".into();
+        snapshot["children"][3]["children"]
+            .as_array_mut()
+            .unwrap()
+            .remove(0);
+        let diff = run(&mut state, "take_snapshot", json!({"diff": true}), snapshot).unwrap();
+        assert!(
+            diff.contains("0 added (+), 1 changed (~), 0 moved (>), 1 removed")
+                && diff.contains("\n~     StaticText \"\u{f021}\"\n")
+                && diff.contains("\n- StaticText \"\u{f004}\" [removed; not actionable]\n"),
+            "{diff}"
+        );
+    }
+
+    #[test]
     fn invalid_or_missing_structure_is_an_error() {
         let mut state = ViewState::default();
         let request = state.prepare("click", &mut Map::new()).unwrap();
         let mut result = response(page());
         result.structured_content = Some(json!({"snapshot": {"role": "RootWebArea"}}));
-        assert!(
-            state
-                .finish(&request, &mut result, "tab")
-                .unwrap_err()
-                .to_string()
-                .contains("invalid structured")
+        let error = format!(
+            "{:#}",
+            state.finish(&request, &mut result, "tab").unwrap_err()
         );
+        assert!(
+            error.contains("invalid structured") && error.contains("root has no uid"),
+            "{error}"
+        );
+        let mut result = response(page());
+        result.structured_content = Some(
+            json!({"snapshot": node("1_0", "RootWebArea", "", vec![node("", "link", "", vec![])])}),
+        );
+        let error = format!(
+            "{:#}",
+            state.finish(&request, &mut result, "tab").unwrap_err()
+        );
+        assert!(error.contains("invalid uid"), "{error}");
         let mut result = response(page());
         result.structured_content = None;
         assert!(state.finish(&request, &mut result, "tab").is_err());

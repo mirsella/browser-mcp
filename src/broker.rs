@@ -1281,7 +1281,7 @@ impl ServerHandler for Connection {
         .await;
         Ok(
             super::responses::model_result(result.unwrap_or_else(|error| {
-                CallToolResult::error(vec![ContentBlock::text(error.to_string())])
+                CallToolResult::error(vec![ContentBlock::text(format!("{error:#}"))])
             }))
             .into(),
         )

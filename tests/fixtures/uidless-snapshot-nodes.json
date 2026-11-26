@@ -1,0 +1,285 @@
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "## Latest page snapshot\nuid=1_0 RootWebArea \"Healthchecks.io\" url=\"https://healthchecks.io/\"\n  uid=1_1 navigation\n    uid=1_2 link \"Healthchecks.io\" url=\"https://healthchecks.io/\"\n      uid=1_3 image \"Healthchecks.io\" url=\"https://healthchecks.io/static/img/logo-rounded-ua2.svg\"\n    uid=1_4 link \"Pricing\" url=\"https://healthchecks.io/pricing/\"\n    uid=1_6 link \"Docs\" url=\"https://healthchecks.io/docs/\"\n    uid=1_8 link \"Blog\" url=\"https://blog.healthchecks.io/\"\n    uid=1_10 link \"About\" url=\"https://healthchecks.io/about/\"\n    uid=1_12 button \"Account \"\n  uid=1_13 heading \"My Projects\" level=\"1\"\n  uid=1_14 link \" alpha 6 checks, 2 integrations user@example.com\" url=\"https://healthchecks.io/projects/00000000-0000-4000-8000-000000000001/checks/\"\n    \"\"\n    uid=1_15 heading \"alpha\" level=\"4\"\n    uid=1_16 \"6 checks, 2 integrations\"\n    uid=1_17 \"user@example.com\"\n  uid=1_18 link \" beta 8 checks, 3 integrations user@example.com\" url=\"https://healthchecks.io/projects/00000000-0000-4000-8000-000000000002/checks/\"\n    \"\"\n    uid=1_19 heading \"beta\" level=\"4\"\n    uid=1_20 \"8 checks, 3 integrations\"\n    uid=1_21 \"user@example.com\"\n  uid=1_22 link \"New Project…\" url=\"https://healthchecks.io/#\"\n  uid=1_24 contentinfo\n    uid=1_25 \"© 2015-2026 SIA Monkey See Monkey Do\"\n    uid=1_26 link \"Terms\" url=\"https://healthchecks.io/terms/\"\n    uid=1_28 link \"Privacy\" url=\"https://healthchecks.io/privacy/\"\n    uid=1_30 link \"Pricing\" url=\"https://healthchecks.io/pricing/\"\n    uid=1_32 link \"FAQ\" url=\"https://healthchecks.io/faq/\"\n    uid=1_34 link \"API\" url=\"https://healthchecks.io/docs/api/\"\n    uid=1_36 link \"Blog\" url=\"https://blog.healthchecks.io/\"\n    uid=1_38 link \"Contact\" url=\"https://healthchecks.io/about/\"\n    uid=1_40 link \"Status\" url=\"https://status.healthchecks.io/\"\n"
+    }
+  ],
+  "structuredContent": {
+    "snapshot": {
+      "id": "1_0",
+      "role": "RootWebArea",
+      "name": "Healthchecks.io",
+      "url": "https://healthchecks.io/",
+      "children": [
+        {
+          "id": "1_1",
+          "role": "navigation",
+          "children": [
+            {
+              "id": "1_2",
+              "role": "link",
+              "name": "Healthchecks.io",
+              "url": "https://healthchecks.io/",
+              "children": [
+                {
+                  "id": "1_3",
+                  "role": "image",
+                  "name": "Healthchecks.io",
+                  "url": "https://healthchecks.io/static/img/logo-rounded-ua2.svg"
+                }
+              ]
+            },
+            {
+              "id": "1_4",
+              "role": "link",
+              "name": "Pricing",
+              "url": "https://healthchecks.io/pricing/",
+              "children": [
+                {
+                  "id": "1_5",
+                  "role": "StaticText",
+                  "name": "Pricing"
+                }
+              ]
+            },
+            {
+              "id": "1_6",
+              "role": "link",
+              "name": "Docs",
+              "url": "https://healthchecks.io/docs/",
+              "children": [
+                {
+                  "id": "1_7",
+                  "role": "StaticText",
+                  "name": "Docs"
+                }
+              ]
+            },
+            {
+              "id": "1_8",
+              "role": "link",
+              "name": "Blog",
+              "url": "https://blog.healthchecks.io/",
+              "children": [
+                {
+                  "id": "1_9",
+                  "role": "StaticText",
+                  "name": "Blog"
+                }
+              ]
+            },
+            {
+              "id": "1_10",
+              "role": "link",
+              "name": "About",
+              "url": "https://healthchecks.io/about/",
+              "children": [
+                {
+                  "id": "1_11",
+                  "role": "StaticText",
+                  "name": "About"
+                }
+              ]
+            },
+            {
+              "id": "1_12",
+              "role": "button",
+              "name": "Account "
+            }
+          ]
+        },
+        {
+          "id": "1_13",
+          "role": "heading",
+          "name": "My Projects",
+          "level": 1
+        },
+        {
+          "id": "1_14",
+          "role": "link",
+          "name": " alpha 6 checks, 2 integrations user@example.com",
+          "url": "https://healthchecks.io/projects/00000000-0000-4000-8000-000000000001/checks/",
+          "children": [
+            {
+              "role": "StaticText",
+              "name": ""
+            },
+            {
+              "id": "1_15",
+              "role": "heading",
+              "name": "alpha",
+              "level": 4
+            },
+            {
+              "id": "1_16",
+              "role": "StaticText",
+              "name": "6 checks, 2 integrations"
+            },
+            {
+              "id": "1_17",
+              "role": "StaticText",
+              "name": "user@example.com"
+            }
+          ]
+        },
+        {
+          "id": "1_18",
+          "role": "link",
+          "name": " beta 8 checks, 3 integrations user@example.com",
+          "url": "https://healthchecks.io/projects/00000000-0000-4000-8000-000000000002/checks/",
+          "children": [
+            {
+              "role": "StaticText",
+              "name": ""
+            },
+            {
+              "id": "1_19",
+              "role": "heading",
+              "name": "beta",
+              "level": 4
+            },
+            {
+              "id": "1_20",
+              "role": "StaticText",
+              "name": "8 checks, 3 integrations"
+            },
+            {
+              "id": "1_21",
+              "role": "StaticText",
+              "name": "user@example.com"
+            }
+          ]
+        },
+        {
+          "id": "1_22",
+          "role": "link",
+          "name": "New Project…",
+          "url": "https://healthchecks.io/#",
+          "children": [
+            {
+              "id": "1_23",
+              "role": "StaticText",
+              "name": "New Project…"
+            }
+          ]
+        },
+        {
+          "id": "1_24",
+          "role": "contentinfo",
+          "children": [
+            {
+              "id": "1_25",
+              "role": "StaticText",
+              "name": "© 2015-2026 SIA Monkey See Monkey Do"
+            },
+            {
+              "id": "1_26",
+              "role": "link",
+              "name": "Terms",
+              "url": "https://healthchecks.io/terms/",
+              "children": [
+                {
+                  "id": "1_27",
+                  "role": "StaticText",
+                  "name": "Terms"
+                }
+              ]
+            },
+            {
+              "id": "1_28",
+              "role": "link",
+              "name": "Privacy",
+              "url": "https://healthchecks.io/privacy/",
+              "children": [
+                {
+                  "id": "1_29",
+                  "role": "StaticText",
+                  "name": "Privacy"
+                }
+              ]
+            },
+            {
+              "id": "1_30",
+              "role": "link",
+              "name": "Pricing",
+              "url": "https://healthchecks.io/pricing/",
+              "children": [
+                {
+                  "id": "1_31",
+                  "role": "StaticText",
+                  "name": "Pricing"
+                }
+              ]
+            },
+            {
+              "id": "1_32",
+              "role": "link",
+              "name": "FAQ",
+              "url": "https://healthchecks.io/faq/",
+              "children": [
+                {
+                  "id": "1_33",
+                  "role": "StaticText",
+                  "name": "FAQ"
+                }
+              ]
+            },
+            {
+              "id": "1_34",
+              "role": "link",
+              "name": "API",
+              "url": "https://healthchecks.io/docs/api/",
+              "children": [
+                {
+                  "id": "1_35",
+                  "role": "StaticText",
+                  "name": "API"
+                }
+              ]
+            },
+            {
+              "id": "1_36",
+              "role": "link",
+              "name": "Blog",
+              "url": "https://blog.healthchecks.io/",
+              "children": [
+                {
+                  "id": "1_37",
+                  "role": "StaticText",
+                  "name": "Blog"
+                }
+              ]
+            },
+            {
+              "id": "1_38",
+              "role": "link",
+              "name": "Contact",
+              "url": "https://healthchecks.io/about/",
+              "children": [
+                {
+                  "id": "1_39",
+                  "role": "StaticText",
+                  "name": "Contact"
+                }
+              ]
+            },
+            {
+              "id": "1_40",
+              "role": "link",
+              "name": "Status",
+              "url": "https://status.healthchecks.io/",
+              "children": [
+                {
+                  "id": "1_41",
+                  "role": "StaticText",
+                  "name": "Status"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  }
+}
